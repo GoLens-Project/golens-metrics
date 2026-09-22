@@ -273,6 +273,30 @@ Open `/metrics`. The dashboard is server-side rendered with HTMX polling (defaul
 - **Pause** halts polling.
 - **GoLens Internals** section shows per-metric cardinality stats (series counts, cap, dropped samples).
 - Programmatic JSON is available at `/metrics/data` (`Accept: application/json` or `?format=json`); a single metric at `/metrics/data?metric=<name>`.
+- Batch time series at `/metrics/history?name=<metric>&duration=<5m|30m|1h|4h|12h|24h|1w>`, or several at once with `?names=a,b,c` (returns `{name: HistorySeries}`).
+- Dashboard layout (pinned charts, section ordering) persists via `GET/PUT/DELETE /metrics/config` when `ui.dashboard_config` is set; otherwise it is memory-only and browsers fall back to localStorage.
+
+The `/metrics/data` snapshot JSON uses stable snake_case keys:
+
+```json
+{
+  "name": "http_request_duration_seconds",
+  "type": "histogram",
+  "description": "HTTP request latency",
+  "labels": ["method", "path"],
+  "label_values": [{"name": "path", "value": "/api/:id"}],
+  "value": 0.5,
+  "count": 100,
+  "sum": 12.5,
+  "avg": 0.125,
+  "buckets": [{"upper_bound": 0.005, "count": 40}, {"upper_bound": 0, "count": 2, "overflow": true}],
+  "updated_at": 1758500000,
+  "gauge_min": 0,
+  "gauge_max": 100
+}
+```
+
+Note: this release renames the snapshot JSON keys from Go field names to snake_case (`Name`→`name`, `LabelValues`→`label_values`, `UpperBound`→`upper_bound`, …) — a breaking change for clients written against the old shape. `omitempty` fields (`description`, `labels`, `label_values`, `count`, `sum`, `avg`, `buckets`, `gauge_min`, `gauge_max`, …) are omitted when zero/nil.
 
 ### Production export (OTLP)
 

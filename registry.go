@@ -44,6 +44,12 @@ type Registry struct {
 
 	auth authState
 
+	// Dashboard layout document (pinned panels + section order) and its
+	// optional on-disk persistence path. Guarded by dashMu.
+	dashMu   sync.Mutex
+	dash     *DashboardConfig
+	dashPath string
+
 	include []*regexp.Regexp
 	exclude []*regexp.Regexp
 
@@ -147,6 +153,11 @@ func New(cfg Config) (*Registry, error) {
 	if cfg.OTLP.Enabled {
 		r.exporter = newOTLPExporter(cfg.OTLP)
 	}
+
+	// Dashboard layout persistence: load the saved document, falling back to
+	// defaults when unset or unreadable.
+	r.dashPath = cfg.UI.DashboardConfig
+	r.dash = r.loadDashboardConfig()
 
 	// Pre-register the canonical RED metrics so they always exist.
 	r.mustRegister("http_requests_total", CounterType, "Total HTTP requests", []string{"method", "path", "status"}, nil)

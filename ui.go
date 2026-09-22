@@ -2,6 +2,7 @@ package golens
 
 import (
 	"bytes"
+	_ "embed"
 	"encoding/json"
 	"html/template"
 	"net/http"
@@ -45,6 +46,7 @@ func (r *Registry) MountUI(mux *http.ServeMux) {
 		writeJSON(w, r.CardinalitySnapshots())
 	}))
 	mux.Handle("/metrics/history", wrap(r.metricsHistoryHandler()))
+	mux.Handle("/metrics/config", wrap(r.dashboardConfigHandler()))
 	mux.Handle("/favicon.ico", wrap(r.faviconHandler))
 
 	// Alert subsystem routes.
@@ -180,12 +182,12 @@ func (r *Registry) metricsPageHandler() http.Handler {
 			intervalMs = 5000
 		}
 		data := map[string]interface{}{
-			"PollMs":         intervalMs,
-			"PollSec":        intervalMs / 1000,
-			"Cards":          buildCards(r.Snapshots()),
-			"HookCards":      buildHookCards(r.Snapshots()),
-			"Interval":       r.cfg.UI.PollInterval.String(),
-			"RuntimeEnabled": r.cfg.RuntimeMetrics.Enabled,
+			"PollMs":            intervalMs,
+			"PollSec":           intervalMs / 1000,
+			"Cards":             buildCards(r.Snapshots()),
+			"HookCards":         buildHookCards(r.Snapshots()),
+			"Interval":          r.cfg.UI.PollInterval.String(),
+			"RuntimeEnabled":    r.cfg.RuntimeMetrics.Enabled,
 			"ProjectName":       r.cfg.ProjectName,
 			"DashboardSubtitle": r.cfg.DashboardSubtitle,
 			"MaxLabelSeries":    r.cfg.MaxLabelSeriesPerMetric,
@@ -239,18 +241,31 @@ var defaultDurations = map[string]time.Duration{
 
 func (r *Registry) metricsHistoryHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, req *http.Request) {
-		name := req.URL.Query().Get("name")
-		if name == "" {
-			http.Error(w, "missing ?name= parameter", http.StatusBadRequest)
-			return
-		}
-		durStr := req.URL.Query().Get("duration")
+		q := req.URL.Query()
+		durStr := q.Get("duration")
 		if durStr == "" {
 			durStr = "1h"
 		}
 		dur, ok := defaultDurations[durStr]
 		if !ok {
 			http.Error(w, "invalid duration; use 5m,30m,1h,4h,12h,24h,1w", http.StatusBadRequest)
+			return
+		}
+		// Batch form: /metrics/history?names=a,b,c returns {name: HistorySeries}
+		// so a panel grid costs one request per refresh.
+		if namesParam := q.Get("names"); namesParam != "" {
+			out := make(map[string]HistorySeries)
+			for _, name := range strings.Split(namesParam, ",") {
+				if name = strings.TrimSpace(name); name != "" {
+					out[name] = r.History(name, dur)
+				}
+			}
+			writeJSON(w, out)
+			return
+		}
+		name := q.Get("name")
+		if name == "" {
+			http.Error(w, "missing ?name= parameter", http.StatusBadRequest)
 			return
 		}
 		writeJSON(w, r.History(name, dur))
@@ -270,14 +285,28 @@ func (r *Registry) hooksDataHandler() http.Handler {
 	})
 }
 
-// faviconHandler serves the favicon.ico file
+// faviconBytes is embedded so the favicon resolves regardless of the
+// process working directory.
+//
+//go:embed favicon.ico
+var faviconBytes []byte
+
+// faviconHandler serves the embedded favicon.ico
 func (r *Registry) faviconHandler(w http.ResponseWriter, req *http.Request) {
-	http.ServeFile(w, req, "favicon.ico")
+	http.ServeContent(w, req, "favicon.ico", time.Time{}, bytes.NewReader(faviconBytes))
 }
 
+// wantsJSON reports whether the request prefers a JSON payload over the HTMX
+// HTML fragment. Composite Accept headers ("application/json, */*" — the
+// axios/fetch default) are matched per media range; bare "*/*" does not select
+// JSON so browser navigations keep rendering HTML.
 func wantsJSON(req *http.Request) bool {
-	for _, a := range []string{req.Header.Get("Accept"), req.URL.Query().Get("format")} {
-		if a == "json" || a == "application/json" {
+	if req.URL.Query().Get("format") == "json" {
+		return true
+	}
+	for _, part := range strings.Split(req.Header.Get("Accept"), ",") {
+		media := strings.TrimSpace(strings.SplitN(part, ";", 2)[0])
+		if media == "json" || media == "application/json" {
 			return true
 		}
 	}
@@ -298,8 +327,8 @@ func (r *Registry) alertsPageHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, req *http.Request) {
 		hasNotifier := r.alerter != nil && r.alerter.HasNotifier()
 		data := map[string]interface{}{
-			"ProjectName":  r.cfg.ProjectName,
-			"HasNotifier":  hasNotifier,
+			"ProjectName": r.cfg.ProjectName,
+			"HasNotifier": hasNotifier,
 		}
 		var buf bytes.Buffer
 		if err := alertsPageTpl.Execute(&buf, data); err != nil {
@@ -411,6 +440,79 @@ type httpColumn struct {
 	ColorClass   string // tailwind color class
 }
 
+// applyCardDefaults fills the per-type badge, styling, and display fields of a
+// metric card. It is the single source of truth shared by the all-metrics
+// (buildCards) and hooks (buildHookCards) builders so their defaults can never
+// diverge per name-pattern.
+func applyCardDefaults(c *metricCard, s MetricSnapshot) {
+	switch s.Type {
+	case "counter":
+		c.Badge = "COUNTER"
+		c.BadgeClass = "bg-emerald-500/10 text-emerald-400 border-emerald-500/20"
+		c.BarClass = "bg-emerald-500 hover:bg-emerald-400"
+		c.DisplayValue = formatMetricValue(s.Name, s.Value)
+	case "gauge":
+		c.Badge = "GAUGE"
+		c.BadgeClass = "bg-sky-500/10 text-sky-400 border-sky-500/20"
+		c.BarClass = "bg-sky-500 hover:bg-sky-400"
+		c.DisplayValue = formatMetricValue(s.Name, s.Value)
+		applyGaugeScale(c, s)
+	case "histogram":
+		c.Badge = "HISTOGRAM"
+		c.BadgeClass = "bg-purple-500/10 text-purple-400 border-purple-500/20"
+		c.BarClass = "bg-purple-500 hover:bg-purple-400"
+		c.DisplayValue = fmtInt(float64(s.Count))
+		c.Unit = "samples"
+		c.Bars = buildBars(s.Buckets)
+	default:
+		c.Badge = "UNKNOWN"
+		c.BadgeClass = "bg-slate-500/10 text-slate-400 border-slate-500/20"
+		c.DisplayValue = formatMetricValue(s.Name, s.Value)
+	}
+}
+
+// applyGaugeScale resolves the gauge scale (configured GaugeMin/GaugeMax win,
+// otherwise smart defaults derived from the metric name) and computes the
+// needle position.
+func applyGaugeScale(c *metricCard, s MetricSnapshot) {
+	minVal := s.GaugeMin
+	maxVal := s.GaugeMax
+
+	// Smart defaults based on metric name patterns
+	if maxVal == 0 {
+		// Auto-detect reasonable max based on metric name
+		lowerName := strings.ToLower(s.Name)
+		switch {
+		case strings.Contains(lowerName, "percent") || strings.Contains(lowerName, "pct"):
+			maxVal = 100 // Percentage metrics
+		case strings.Contains(lowerName, "ratio") || strings.Contains(lowerName, "rate"):
+			maxVal = 1 // Ratio/rate metrics
+		case strings.Contains(lowerName, "bytes") || strings.Contains(lowerName, "mem"):
+			maxVal = s.Value * 2 // Memory metrics: 2x current value
+			if maxVal < 1024*1024 {
+				maxVal = 1024 * 1024
+			} // Min 1MB
+		default:
+			maxVal = s.Value * 1.5 // Default: 50% headroom
+			if maxVal < 10 {
+				maxVal = 10
+			} // Minimum scale
+		}
+	}
+
+	c.MaxValue = maxVal
+	c.MinValue = minVal
+	if maxVal > 0 {
+		c.NeedlePct = int((s.Value - minVal) / (maxVal - minVal) * 100)
+		if c.NeedlePct > 100 {
+			c.NeedlePct = 100
+		}
+		if c.NeedlePct < 0 {
+			c.NeedlePct = 0
+		}
+	}
+}
+
 func buildCards(snaps []MetricSnapshot) []metricCard {
 	// Filter out individual metrics that are shown in Runtime Health charts and hooks
 	excludedMetrics := map[string]bool{
@@ -424,81 +526,13 @@ func buildCards(snaps []MetricSnapshot) []metricCard {
 
 	cards := make([]metricCard, 0, len(snaps))
 	for _, s := range snaps {
-		// Skip HTTP metrics (they'll be grouped into a single card)
-		if isHTTPMetric(s.Name) {
-			continue
-		}
-		// Skip excluded metrics
-		if excludedMetrics[s.Name] {
-			continue
-		}
-		// Skip hook metrics (they go in the hooks section)
-		if isHookMetric(s.Name) {
+		// Skip HTTP metrics (they'll be grouped into a single card),
+		// excluded runtime metrics, and hook metrics (hooks section).
+		if isHTTPMetric(s.Name) || excludedMetrics[s.Name] || isHookMetric(s.Name) {
 			continue
 		}
 		c := metricCard{Snapshot: s}
-		switch s.Type {
-		case "counter":
-			c.Badge = "COUNTER"
-			c.BadgeClass = "bg-emerald-500/10 text-emerald-400 border-emerald-500/20"
-			c.BarClass = "bg-emerald-500 hover:bg-emerald-400"
-			c.DisplayValue = formatMetricValue(s.Name, s.Value)
-		case "gauge":
-			c.Badge = "GAUGE"
-			c.BadgeClass = "bg-sky-500/10 text-sky-400 border-sky-500/20"
-			c.BarClass = "bg-sky-500 hover:bg-sky-400"
-			c.DisplayValue = formatMetricValue(s.Name, s.Value)
-			// Use configured min/max or apply smart defaults
-			minVal := s.GaugeMin
-			maxVal := s.GaugeMax
-
-			// Smart defaults based on metric name patterns
-			if maxVal == 0 {
-				// Auto-detect reasonable max based on metric name
-				lowerName := strings.ToLower(s.Name)
-				if strings.Contains(lowerName, "percent") || strings.Contains(lowerName, "pct") || strings.Contains(lowerName, "_pct") {
-					maxVal = 100 // Percentage metrics
-				} else if strings.Contains(lowerName, "ratio") || strings.Contains(lowerName, "rate") {
-					maxVal = 1 // Ratio/rate metrics
-				} else if strings.Contains(lowerName, "bytes") || strings.Contains(lowerName, "mem") {
-					maxVal = s.Value * 2 // Memory metrics: 2x current value
-					if maxVal < 1024*1024 {
-						maxVal = 1024 * 1024
-					} // Min 1MB
-				} else {
-					maxVal = s.Value * 1.5 // Default: 50% headroom
-					if maxVal < 10 {
-						maxVal = 10
-					} // Minimum scale
-				}
-			}
-			if minVal == 0 && !strings.Contains(strings.ToLower(s.Name), "temp") {
-				minVal = 0 // Default to 0 unless it's a temperature-like metric
-			}
-
-			c.MaxValue = maxVal
-			c.MinValue = minVal
-			if maxVal > 0 {
-				c.NeedlePct = int((s.Value - minVal) / (maxVal - minVal) * 100)
-				if c.NeedlePct > 100 {
-					c.NeedlePct = 100
-				}
-				if c.NeedlePct < 0 {
-					c.NeedlePct = 0
-				}
-			}
-		case "histogram":
-			c.Badge = "HISTOGRAM"
-			c.BadgeClass = "bg-purple-500/10 text-purple-400 border-purple-500/20"
-			c.BarClass = "bg-purple-500 hover:bg-purple-400"
-			c.DisplayValue = fmtInt(float64(s.Count))
-			c.Unit = "samples"
-			c.Bars = buildBars(s.Buckets)
-		default:
-			c.Badge = "UNKNOWN"
-			c.BadgeClass = "bg-slate-500/10 text-slate-400 border-slate-500/20"
-			c.DisplayValue = formatMetricValue(s.Name, s.Value)
-		}
+		applyCardDefaults(&c, s)
 		cards = append(cards, c)
 	}
 
@@ -518,68 +552,7 @@ func buildHookCards(snaps []MetricSnapshot) []metricCard {
 			continue
 		}
 		c := metricCard{Snapshot: s}
-		switch s.Type {
-		case "counter":
-			c.Badge = "COUNTER"
-			c.BadgeClass = "bg-emerald-500/10 text-emerald-400 border-emerald-500/20"
-			c.BarClass = "bg-emerald-500 hover:bg-emerald-400"
-			c.DisplayValue = formatMetricValue(s.Name, s.Value)
-		case "gauge":
-			c.Badge = "GAUGE"
-			c.BadgeClass = "bg-sky-500/10 text-sky-400 border-sky-500/20"
-			c.BarClass = "bg-sky-500 hover:bg-sky-400"
-			c.DisplayValue = formatMetricValue(s.Name, s.Value)
-			// Use configured min/max or apply smart defaults
-			minVal := s.GaugeMin
-			maxVal := s.GaugeMax
-
-			// Smart defaults based on metric name patterns
-			if maxVal == 0 {
-				// Auto-detect reasonable max based on metric name
-				lowerName := strings.ToLower(s.Name)
-				if strings.Contains(lowerName, "percent") || strings.Contains(lowerName, "pct") || strings.Contains(lowerName, "_pct") {
-					maxVal = 100 // Percentage metrics
-				} else if strings.Contains(lowerName, "ratio") || strings.Contains(lowerName, "rate") {
-					maxVal = 1 // Ratio/rate metrics
-				} else if strings.Contains(lowerName, "bytes") || strings.Contains(lowerName, "mem") {
-					maxVal = s.Value * 2 // Memory metrics: 2x current value
-					if maxVal < 1024*1024 {
-						maxVal = 1024 * 1024
-					} // Min 1MB
-				} else {
-					maxVal = s.Value * 1.5 // Default: 50% headroom
-					if maxVal < 10 {
-						maxVal = 10
-					} // Minimum scale
-				}
-			}
-			if minVal == 0 && !strings.Contains(strings.ToLower(s.Name), "temp") {
-				minVal = 0 // Default to 0 unless it's a temperature-like metric
-			}
-
-			c.MaxValue = maxVal
-			c.MinValue = minVal
-			if maxVal > 0 {
-				c.NeedlePct = int((s.Value - minVal) / (maxVal - minVal) * 100)
-				if c.NeedlePct > 100 {
-					c.NeedlePct = 100
-				}
-				if c.NeedlePct < 0 {
-					c.NeedlePct = 0
-				}
-			}
-		case "histogram":
-			c.Badge = "HISTOGRAM"
-			c.BadgeClass = "bg-purple-500/10 text-purple-400 border-purple-500/20"
-			c.BarClass = "bg-purple-500 hover:bg-purple-400"
-			c.DisplayValue = fmtInt(float64(s.Count))
-			c.Unit = "samples"
-			c.Bars = buildBars(s.Buckets)
-		default:
-			c.Badge = "UNKNOWN"
-			c.BadgeClass = "bg-slate-500/10 text-slate-400 border-slate-500/20"
-			c.DisplayValue = formatMetricValue(s.Name, s.Value)
-		}
+		applyCardDefaults(&c, s)
 		cards = append(cards, c)
 	}
 	return cards
@@ -921,11 +894,13 @@ const dashboardSrc = `<!DOCTYPE html>
 
     <!-- Runtime charts container for drag-to-reorder -->
     <div id="runtime-charts" class="space-y-5">
+      <!-- Cards carry the rt-card class so the drop handler selects exactly
+           the card elements (never their inner header/legend divs). -->
       <!-- Memory Overview (full width) -->
       <div draggable="true"
            @dragstart="start(0)" @dragover.prevent @drop="drop(0)" @dragend="drag=null"
            :class="drag===0 ? 'opacity-40 ring-2 ring-emerald-500/60' : ''"
-           class="bg-slate-900 border border-slate-800 rounded-xl p-5 cursor-grab active:cursor-grabbing">
+           class="rt-card bg-slate-900 border border-slate-800 rounded-xl p-5 cursor-grab active:cursor-grabbing">
         <div class="flex items-center justify-between mb-1">
           <span class="text-xs font-mono text-slate-400">Memory Overview</span>
           <div class="flex gap-4">
@@ -950,7 +925,7 @@ const dashboardSrc = `<!DOCTYPE html>
         <div draggable="true"
              @dragstart="start(1)" @dragover.prevent @drop="drop(1)" @dragend="drag=null"
              :class="drag===1 ? 'opacity-40 ring-2 ring-emerald-500/60' : ''"
-             class="bg-slate-900 border border-slate-800 rounded-xl p-5 cursor-grab active:cursor-grabbing">
+             class="rt-card bg-slate-900 border border-slate-800 rounded-xl p-5 cursor-grab active:cursor-grabbing">
           <div class="flex items-center justify-between mb-1">
             <span class="text-xs font-mono text-slate-400">CPU Usage</span>
             <span class="text-xs font-mono text-slate-500" x-text="cpuPct.toFixed(1) + '%'"></span>
@@ -964,7 +939,7 @@ const dashboardSrc = `<!DOCTYPE html>
         <div draggable="true"
              @dragstart="start(2)" @dragover.prevent @drop="drop(2)" @dragend="drag=null"
              :class="drag===2 ? 'opacity-40 ring-2 ring-emerald-500/60' : ''"
-             class="bg-slate-900 border border-slate-800 rounded-xl p-5 cursor-grab active:cursor-grabbing">
+             class="rt-card bg-slate-900 border border-slate-800 rounded-xl p-5 cursor-grab active:cursor-grabbing">
           <div class="flex items-center justify-between mb-1">
             <span class="text-xs font-mono text-slate-400">App Goroutines</span>
             <span class="text-xs font-mono text-slate-500" x-text="currentGoro"></span>
@@ -1024,7 +999,7 @@ const dashboardSrc = `<!DOCTYPE html>
     </div>
     <div id="hooks"
          hx-get="/metrics/hooks"
-         hx-trigger="every {{.PollMs}}ms [!document.body.dataset.paused]"
+         hx-trigger="every {{.PollMs}}ms [!document.body.dataset.paused && !document.body.dataset.hidden]"
          hx-swap="innerHTML">
       <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
       {{range .HookCards}}
@@ -1107,8 +1082,9 @@ const dashboardSrc = `<!DOCTYPE html>
   </section>
   {{end}}
 
-  <!-- My Charts: pinned metrics, persisted in localStorage, drag-to-reorder,
-       kept live by cloning the matching server-rendered card from #charts. -->
+  <!-- My Charts: pinned metrics from the server-persisted dashboard config
+       (localStorage is a fallback cache), drag-to-reorder, kept live by
+       cloning the matching server-rendered card from #charts. -->
   <section x-show="$store.ui.charts.length" x-cloak
            x-data="{ drag: null,
                      start(i){ this.drag = i; },
@@ -1116,7 +1092,8 @@ const dashboardSrc = `<!DOCTYPE html>
                               const c = Alpine.store('ui').charts;
                               const m = c.splice(this.drag, 1)[0];
                               c.splice(i, 0, m);
-                              saveCharts(c);
+                              dashCfg.panels = chartsToPanels(c);
+                              persistDash();
                               this.drag = null;
                               this.$nextTick(() => renderPinned()); } }"
            x-effect="$store.ui.charts.length; renderPinned()"
@@ -1146,7 +1123,7 @@ const dashboardSrc = `<!DOCTYPE html>
   <h2 class="text-xs font-mono uppercase tracking-wider text-slate-500 mb-3">All Metrics</h2>
   <div id="charts"
        hx-get="/metrics/data"
-       hx-trigger="every {{.PollMs}}ms [!document.body.dataset.paused]"
+       hx-trigger="every {{.PollMs}}ms [!document.body.dataset.paused && !document.body.dataset.hidden]"
        hx-swap="innerHTML">
     {{template "cards" .}}
   </div>
@@ -1447,17 +1424,86 @@ const dashboardSrc = `<!DOCTYPE html>
     applyTheme(t);
   });
 
-  function loadCharts(){ try { return JSON.parse(localStorage.getItem('golens.charts') || '[]'); } catch(e){ return []; } }
-  function saveCharts(c){ try { localStorage.setItem('golens.charts', JSON.stringify(c)); } catch(e){} }
+  // --- Dashboard layout persistence ---
+  // The server-side document (/metrics/config) is the source of truth for
+  // pinned charts and section ordering; localStorage is only a write-through
+  // cache/fallback for when the server copy is unavailable (UI config disabled,
+  // read-only mount, failed PUT). golens.theme stays purely client-side.
+  function lsJSON(key){ try { return JSON.parse(localStorage.getItem(key) || '[]'); } catch(e){ return []; } }
+
+  // Boot from the localStorage cache; when the server document loads it
+  // replaces this state (loadDash).
+  var dashCfg = { version:1,
+    panels: lsJSON('golens.charts').map(function(n){ return { id:n, metric:n }; }),
+    order: { all_metrics: lsJSON('golens.order'), hooks: lsJSON('golens.hooksorder'), endpoints: lsJSON('golens.eporder') } };
+  var dashRemote = false;
+
+  // dashHasOrder reports whether a config document carries any section order.
+  function dashHasOrder(d){ var o = d.order || {}; return !!((o.all_metrics||[]).length || (o.hooks||[]).length || (o.endpoints||[]).length); }
+
+  // chartsToPanels re-derives the config's panel list from a chart-name list,
+  // preserving any per-panel config already saved for a metric.
+  function chartsToPanels(charts){
+    var byMetric = {};
+    dashCfg.panels.forEach(function(p){ byMetric[p.metric] = p; });
+    return charts.map(function(n){ return byMetric[n] || { id:n, metric:n }; });
+  }
+
+  function persistDash(){
+    // localStorage write-through cache first, so the layout survives even if
+    // the server PUT fails.
+    try {
+      localStorage.setItem('golens.charts', JSON.stringify(dashCfg.panels.map(function(p){ return p.metric; })));
+      localStorage.setItem('golens.order', JSON.stringify(dashCfg.order.all_metrics || []));
+      localStorage.setItem('golens.hooksorder', JSON.stringify(dashCfg.order.hooks || []));
+      localStorage.setItem('golens.eporder', JSON.stringify(dashCfg.order.endpoints || []));
+    } catch(e){}
+    if (!dashRemote) return;
+    fetch('/metrics/config', {
+      method: 'PUT',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(dashCfg)
+    }).then(function(r){
+      if (!r.ok) { dashRemote = false; showToast('changes are local only'); }
+    }).catch(function(){ dashRemote = false; showToast('changes are local only'); });
+  }
+
+  // applyDash re-hydrates the UI from the current config document.
+  function applyDash(){
+    if (window.Alpine && Alpine.store('ui')) {
+      Alpine.store('ui').charts = dashCfg.panels.map(function(p){ return p.metric; });
+    }
+    sortCharts(); applyFilter(); renderPinned(); applyHookOrder();
+  }
+
+  function loadDash(){
+    fetch('/metrics/config', {headers:{'Accept':'application/json'}})
+      .then(function(r){ if (!r.ok) throw 0; return r.json(); })
+      .then(function(d){
+        if (!d || d.version !== 1) return;
+        if (!d.panels) d.panels = [];
+        if (!d.order) d.order = { all_metrics:[], hooks:[], endpoints:[] };
+        // First connect against an empty server doc: promote the localStorage
+        // layout (still in dashCfg) so existing pins AND section orderings are
+        // migrated, even when only orderings exist.
+        var promoted = !(d.panels.length || dashHasOrder(d)) && (dashCfg.panels.length || dashHasOrder(dashCfg));
+        if (promoted) { d.panels = dashCfg.panels; d.order = dashCfg.order; }
+        dashCfg = d;
+        dashRemote = true;
+        if (promoted || d.panels.length) persistDash();
+        applyDash();
+      })
+      .catch(function(){}); // server copy unavailable: keep the localStorage boot state
+  }
 
   document.addEventListener('alpine:init', () => {
     Alpine.store('ui', {
       add: false,
       name: '',
-      charts: loadCharts(),
+      charts: dashCfg.panels.map(function(p){ return p.metric; }),
       has(n){ return this.charts.indexOf(n) >= 0; },
-      add(n){ if (n && !this.has(n)) { this.charts.push(n); saveCharts(this.charts); } },
-      remove(n){ this.charts = this.charts.filter(x => x !== n); saveCharts(this.charts); },
+      add(n){ if (n && !this.has(n)) { this.charts.push(n); dashCfg.panels = chartsToPanels(this.charts); persistDash(); } },
+      remove(n){ this.charts = this.charts.filter(x => x !== n); dashCfg.panels = chartsToPanels(this.charts); persistDash(); },
 
       // Alert modal state
       alertModal: false,
@@ -1476,7 +1522,7 @@ const dashboardSrc = `<!DOCTYPE html>
         var self = this;
         fetch('/metrics/data', {headers:{'Accept':'application/json'}})
           .then(function(r){ return r.json(); })
-          .then(function(d){ self.alertMetrics = (d||[]).map(function(s){ return {name:s.Name, type:s.Type}; }); })
+          .then(function(d){ self.alertMetrics = (d||[]).map(function(s){ return {name:s.name, type:s.type}; }); })
           .catch(function(){});
         fetch('/metrics/alerts/templates', {headers:{'Accept':'application/json'}})
           .then(function(r){ return r.json(); })
@@ -1563,11 +1609,10 @@ const dashboardSrc = `<!DOCTYPE html>
     if (n) Alpine.store('ui').add(n);
     Alpine.store('ui').name = '';
   }
-  function loadOrder(){ try { return JSON.parse(localStorage.getItem('golens.order') || '[]'); } catch(e){ return []; } }
-  function saveOrder(o){ try { localStorage.setItem('golens.order', JSON.stringify(o)); } catch(e){} }
+  function saveOrder(o){ dashCfg.order.all_metrics = o; persistDash(); }
 
   function metricNames(){
-    return Array.from(document.querySelectorAll('#charts > [data-metric]')).map(el => el.dataset.metric);
+    return Array.from(document.querySelectorAll('#charts [data-metric]')).map(el => el.dataset.metric);
   }
   function cssEsc(s){ return (window.CSS && CSS.escape) ? CSS.escape(s) : s.replace(/["\\]/g, '\\$&'); }
   // Clone each pinned metric's server-rendered card from #charts into its slot.
@@ -1581,7 +1626,7 @@ const dashboardSrc = `<!DOCTYPE html>
   }
   function applyFilter(){
     const q = (document.getElementById('search').value || '').toLowerCase();
-    document.querySelectorAll('#charts > [data-metric]').forEach(el => {
+    document.querySelectorAll('#charts [data-metric]').forEach(el => {
       el.style.display = (!q || el.dataset.metric.toLowerCase().indexOf(q) >= 0) ? '' : 'none';
     });
   }
@@ -1591,12 +1636,15 @@ const dashboardSrc = `<!DOCTYPE html>
   function sortCharts(){
     const grid = document.getElementById('charts');
     if (!grid) return;
-    const order = loadOrder();
-    const cards = Array.from(grid.querySelectorAll(':scope > [data-metric]'));
+    const order = dashCfg.order.all_metrics || [];
+    const cards = Array.from(grid.querySelectorAll('[data-metric]'));
     if (cards.length <= 1) return;
     const idx = name => { const i = order.indexOf(name); return i < 0 ? Infinity : i; };
     cards.sort((a, b) => idx(a.dataset.metric) - idx(b.dataset.metric));
-    cards.forEach(c => grid.appendChild(c));
+    // Cards live inside the section's grid wrapper div, not directly under
+    // #charts — re-append to their real parent to keep the grid intact.
+    const parent = cards[0].parentNode;
+    cards.forEach(c => parent.appendChild(c));
   }
 
   // Drag-and-drop for the All Metrics grid. Uses event delegation on the
@@ -1634,10 +1682,9 @@ const dashboardSrc = `<!DOCTYPE html>
   }
 
   // After each HTMX swap: restore custom order, reapply search filter, refresh pins.
-  document.body.addEventListener('htmx:afterSwap', () => { sortCharts(); applyFilter(); renderPinned(); initHooksDnD(); });
+  document.body.addEventListener('htmx:afterSwap', () => { sortCharts(); applyFilter(); renderPinned(); applyHookOrder(); });
 
-  function loadEpOrder(){ try { return JSON.parse(localStorage.getItem('golens.eporder') || '[]'); } catch(e){ return []; } }
-  function saveEpOrder(o){ try { localStorage.setItem('golens.eporder', JSON.stringify(o)); } catch(e){} }
+  function saveEpOrder(o){ dashCfg.order.endpoints = o; persistDash(); }
 
   // Per-endpoint latency chart: polls /metrics/endpoints (JSON), renders
   // p50/p95/p99 bars per endpoint, drag-to-reorder with persisted order.
@@ -1646,10 +1693,10 @@ const dashboardSrc = `<!DOCTYPE html>
       raw: [],
       bump: 0,
       drag: null,
-      init(){ this.load(); setInterval(() => this.load(), pollMs); },
+      init(){ this.load(); setInterval(() => { if (!document.hidden) this.load(); }, pollMs); },
       get endpoints(){
         this.bump; // reactive trigger for manual reorders
-        const ord = loadEpOrder();
+        const ord = dashCfg.order.endpoints || [];
         const key = e => e.method + ' ' + e.path;
         const idx = e => { const i = ord.indexOf(key(e)); return i < 0 ? Infinity : i; };
         return this.raw.slice().sort((a, b) => idx(a) - idx(b));
@@ -1685,7 +1732,7 @@ const dashboardSrc = `<!DOCTYPE html>
       drop(i){
         if (this.drag === null || this.drag === i) { this.drag = null; return; }
         const grid = document.getElementById('hooks');
-        const cards = Array.from(grid.querySelectorAll(':scope > [data-metric]'));
+        const cards = Array.from(grid.querySelectorAll('[data-metric]'));
         if (this.drag < cards.length && i < cards.length) {
           const dragged = cards[this.drag];
           const target = cards[i];
@@ -1695,8 +1742,8 @@ const dashboardSrc = `<!DOCTYPE html>
           parent.insertBefore(dragged, targetNext);
           parent.insertBefore(target, draggedNext);
           // Save new order
-          const names = Array.from(grid.querySelectorAll(':scope > [data-metric]')).map(el => el.dataset.metric);
-          try { localStorage.setItem('golens.hooksorder', JSON.stringify(names)); } catch(e){}
+          const names = Array.from(grid.querySelectorAll('[data-metric]')).map(el => el.dataset.metric);
+          saveHookOrder(names);
         }
         this.drag = null;
       },
@@ -1704,15 +1751,7 @@ const dashboardSrc = `<!DOCTYPE html>
         const grid = document.getElementById('hooks');
         if (!grid) return;
         // Apply persisted order on load
-        try {
-          const saved = JSON.parse(localStorage.getItem('golens.hooksorder') || '[]');
-          if (saved.length > 0) {
-            const cards = Array.from(grid.querySelectorAll(':scope > [data-metric]'));
-            const idx = name => { const i = saved.indexOf(name); return i < 0 ? Infinity : i; };
-            cards.sort((a, b) => idx(a.dataset.metric) - idx(b.dataset.metric));
-            cards.forEach(c => grid.appendChild(c));
-          }
-        } catch(e){}
+        applyHookOrder();
         // Setup drag-and-drop
         let dragCard = null;
         grid.addEventListener('dragstart', e => {
@@ -1739,27 +1778,30 @@ const dashboardSrc = `<!DOCTYPE html>
         grid.addEventListener('drop', e => {
           if (!dragCard) return;
           e.preventDefault();
-          const names = Array.from(grid.querySelectorAll(':scope > [data-metric]')).map(el => el.dataset.metric);
-          try { localStorage.setItem('golens.hooksorder', JSON.stringify(names)); } catch(e){}
+          const names = Array.from(grid.querySelectorAll('[data-metric]')).map(el => el.dataset.metric);
+          saveHookOrder(names);
         });
       }
     };
   }
 
-  // Initialize hooks drag-and-drop (called after HTMX swaps)
-  function initHooksDnD(){
+  // Hooks section ordering helpers, backed by the dashboard config document.
+  function saveHookOrder(names){ dashCfg.order.hooks = names; persistDash(); }
+  // Re-apply the persisted hook order to the (server-rendered) hooks grid.
+  // Called after HTMX swaps so the server's order doesn't clobber the user's.
+  function applyHookOrder(){
     const grid = document.getElementById('hooks');
     if (!grid) return;
-    // Apply persisted order
-    try {
-      const saved = JSON.parse(localStorage.getItem('golens.hooksorder') || '[]');
-      if (saved.length > 0) {
-        const cards = Array.from(grid.querySelectorAll(':scope > [data-metric]'));
-        const idx = name => { const i = saved.indexOf(name); return i < 0 ? Infinity : i; };
-        cards.sort((a, b) => idx(a.dataset.metric) - idx(b.dataset.metric));
-        cards.forEach(c => grid.appendChild(c));
-      }
-    } catch(e){}
+    const saved = dashCfg.order.hooks || [];
+    if (saved.length === 0) return;
+    const cards = Array.from(grid.querySelectorAll('[data-metric]'));
+    if (!cards.length) return;
+    const idx = name => { const i = saved.indexOf(name); return i < 0 ? Infinity : i; };
+    cards.sort((a, b) => idx(a.dataset.metric) - idx(b.dataset.metric));
+    // Cards live inside the section's grid wrapper div, not directly under
+    // #hooks — re-append to their real parent to keep the grid intact.
+    const parent = cards[0].parentNode;
+    cards.forEach(c => parent.appendChild(c));
   }
 
   // Cardinality panel: polls /metrics/cardinality and shows per-metric series stats.
@@ -1768,7 +1810,7 @@ const dashboardSrc = `<!DOCTYPE html>
       open: false,
       metrics: [],
       maxSeries: maxSeries,
-      init(){ this.load(); setInterval(() => { if (this.open) this.load(); }, pollMs); },
+      init(){ this.load(); setInterval(() => { if (this.open && !document.hidden) this.load(); }, pollMs); },
       load(){
         fetch('/metrics/cardinality').then(r => r.json()).then(d => { this.metrics = d || []; }).catch(() => {});
       },
@@ -1782,8 +1824,16 @@ const dashboardSrc = `<!DOCTYPE html>
     };
   }
 
-  // Boot: apply persisted All Metrics order + wire up its drag-and-drop.
-  document.addEventListener('DOMContentLoaded', () => { sortCharts(); applyFilter(); initMetricsDnD(); });
+  // Boot: apply persisted All Metrics order + wire up its drag-and-drop, then
+  // load the server-side dashboard layout document (falls back to the
+  // localStorage boot state when unavailable).
+  document.addEventListener('DOMContentLoaded', () => { sortCharts(); applyFilter(); initMetricsDnD(); loadDash(); });
+
+  // Pause all polling while the tab is hidden; resume on return. HTMX polling
+  // checks body.dataset.hidden; the Alpine components check document.hidden.
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) { document.body.dataset.hidden = '1'; } else { delete document.body.dataset.hidden; }
+  });
 
   // Cooldown ring: depletes over the poll interval, shows remaining seconds,
   // resets on each HTMX refresh, and freezes while paused. Turns red when the
@@ -1955,21 +2005,21 @@ const dashboardSrc = `<!DOCTYPE html>
       series: {},
       currentSysBytes: 0, currentHeapInuse: 0, currentMem: 0, currentHeapObj: 0, cpuPct: 0, currentGoro: 0,
       drag: null,
-      init() { this.refresh(); setInterval(() => this.refresh(), pollMs); },
+      init() { this.refresh(); setInterval(() => { if (!document.hidden) this.refresh(); }, pollMs); },
       start(i){ this.drag = i; },
       drop(i){
         if(this.drag === null || this.drag === i){ this.drag = null; return; }
-        // Reorder the runtime charts by swapping their positions in the DOM
-        const container = document.getElementById('runtime-charts');
-        const cards = container.querySelectorAll(':scope > div, :scope > div > div');
+        // Reorder the runtime charts by moving the dragged card relative to
+        // the target card. Selecting .rt-card (not every nested div) keeps the
+        // wired 0..2 indexes aligned with the actual cards, and after/before
+        // move nodes cleanly even when the two cards live in different
+        // containers (the memory card is a direct child of #runtime-charts,
+        // the CPU/goroutine cards sit inside the inner grid).
+        const cards = document.getElementById('runtime-charts').querySelectorAll('.rt-card');
         if(this.drag < cards.length && i < cards.length){
           const dragged = cards[this.drag];
           const target = cards[i];
-          const parent = dragged.parentNode;
-          const draggedNext = dragged.nextSibling;
-          const targetNext = target.nextSibling;
-          parent.insertBefore(dragged, targetNext);
-          parent.insertBefore(target, draggedNext);
+          if (this.drag < i) { target.after(dragged); } else { target.before(dragged); }
         }
         this.drag = null;
       },
@@ -1995,12 +2045,12 @@ const dashboardSrc = `<!DOCTYPE html>
         // also fetch current snapshot for live values
         fetch('/metrics/data?format=json').then(r => r.json()).then(snaps => {
           (snaps||[]).forEach(s => {
-            if (s.Name === 'go_memstats_sys_bytes') this.currentSysBytes = s.Value;
-            if (s.Name === 'go_memstats_heap_inuse_bytes') this.currentHeapInuse = s.Value;
-            if (s.Name === 'go_memstats_alloc_bytes') this.currentMem = s.Value;
-            if (s.Name === 'go_memstats_heap_objects') this.currentHeapObj = s.Value;
-            if (s.Name === 'cpu_usage_percent') this.cpuPct = s.Value;
-            if (s.Name === 'go_goroutines') this.currentGoro = Math.round(s.Value);
+            if (s.name === 'go_memstats_sys_bytes') this.currentSysBytes = s.value;
+            if (s.name === 'go_memstats_heap_inuse_bytes') this.currentHeapInuse = s.value;
+            if (s.name === 'go_memstats_alloc_bytes') this.currentMem = s.value;
+            if (s.name === 'go_memstats_heap_objects') this.currentHeapObj = s.value;
+            if (s.name === 'cpu_usage_percent') this.cpuPct = s.value;
+            if (s.name === 'go_goroutines') this.currentGoro = Math.round(s.value);
           });
         }).catch(() => {});
       },
@@ -2105,7 +2155,7 @@ const dashboardSrc = `<!DOCTYPE html>
 
       init() {
         this.refresh();
-        this.timer = setInterval(() => this.refresh(), this.pollMs);
+        this.timer = setInterval(() => { if (!document.hidden) this.refresh(); }, this.pollMs);
       },
 
       async refresh() {
@@ -2113,19 +2163,24 @@ const dashboardSrc = `<!DOCTYPE html>
           // Fetch all histogram metrics from current data
           const dataResp = await fetch('/metrics/data?format=json');
           const metrics = await dataResp.json();
-          const histogramCards = (metrics || []).filter(c => c.Type === 'histogram');
+          const histogramCards = (metrics || []).filter(c => c.type === 'histogram');
 
           // Build histogram metrics list
           this.histogramMetrics = histogramCards.map(card => ({
-            name: card.Name,
-            description: card.Description || '',
-            bounds: (card.Buckets || []).map(b => b.UpperBound).filter(b => b > 0) // Extract bounds from buckets
+            name: card.name,
+            description: card.description || '',
+            bounds: (card.buckets || []).map(b => b.upper_bound).filter(b => b > 0) // Extract bounds from buckets
           }));
+          if (!this.histogramMetrics.length) return;
 
-          // Fetch time-series data for each histogram metric
+          // One batch request for every histogram series — the N+1 sequential
+          // fetches this loop used to make are served by /metrics/history?names=.
+          const names = this.histogramMetrics.map(m => m.name).join(',');
+          const histResp = await fetch('/metrics/history?names=' + encodeURIComponent(names) + '&duration=' + this.duration);
+          const histories = await histResp.json();
+
           for (const metric of this.histogramMetrics) {
-            const historyResp = await fetch('/metrics/history?name=' + encodeURIComponent(metric.name) + '&duration=' + this.duration);
-            const history = await historyResp.json();
+            const history = (histories || {})[metric.name] || {};
             metric.points = history.points || [];
             metric.histogramBounds = history.histogram_bounds || [];
 

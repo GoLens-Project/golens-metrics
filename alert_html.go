@@ -361,7 +361,7 @@ const alertsPageSrc = `<!DOCTYPE html>
         var self = this;
         fetch('/metrics/data', {headers:{'Accept':'application/json'}})
           .then(function(r){ return r.json(); })
-          .then(function(d){ self.alertMetrics = (d||[]).map(function(s){ return {name:s.Name, type:s.Type}; }); })
+          .then(function(d){ self.alertMetrics = (d||[]).map(function(s){ return {name:s.name, type:s.type}; }); })
           .catch(function(){});
         fetch('/metrics/alerts/templates', {headers:{'Accept':'application/json'}})
           .then(function(r){ return r.json(); })

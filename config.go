@@ -70,6 +70,11 @@ type UIConfig struct {
 	Enabled      bool          `yaml:"enabled"`
 	PollInterval time.Duration `yaml:"poll_interval"`
 	Auth         AuthConfig    `yaml:"auth"`
+	// DashboardConfig is the file path the dashboard layout document (pinned
+	// charts, panel and section ordering) is persisted to. Empty means the
+	// document lives in registry memory only (and clients fall back to
+	// localStorage).
+	DashboardConfig string `yaml:"dashboard_config"`
 }
 
 // LabelsConfig controls label value sanitization and cardinality management.
