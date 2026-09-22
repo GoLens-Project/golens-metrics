@@ -20,4 +20,7 @@ Thumbs.db
 # Editor
 .idea/
 .vscode/
-*.swp
+i*.swp
+
+#config
+.daedalus/
