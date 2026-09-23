@@ -464,7 +464,15 @@ func (r *Registry) History(name string, dur time.Duration) HistorySeries {
 	from := time.Now().Add(-dur)
 	q := Query{Name: name, From: from, To: time.Now()}
 	aggs, err := r.storage.Query(ctx, q)
-	if err != nil || len(aggs) == 0 {
+	if err != nil {
+		return HistorySeries{Name: name}
+	}
+	// Append the aggregator's in-flight window so a freshly started process
+	// or sparse traffic still yields a current point instead of "no data".
+	if pw, ok := r.agg.partial(name); ok {
+		aggs = append(aggs, pw)
+	}
+	if len(aggs) == 0 {
 		return HistorySeries{Name: name}
 	}
 
@@ -490,11 +498,38 @@ func (r *Registry) History(name string, dur time.Duration) HistorySeries {
 			HistogramBuckets: a.HistogramBuckets,
 		})
 	}
+	// Storage may hold bucket slices in arbitrary order (map-iteration order
+	// is scrambled at flush time); normalize each point to the metric's
+	// bounds order with the overflow bucket last. This also repairs data
+	// already at rest, and matches the client's index-against-bounds layout.
+	if len(histogramBounds) > 0 {
+		for i := range pts {
+			pts[i].HistogramBuckets = orderedBuckets(pts[i].HistogramBuckets, histogramBounds)
+		}
+	}
 	return HistorySeries{
 		Name:            name,
 		Points:          pts,
 		HistogramBounds: histogramBounds,
 	}
+}
+
+// orderedBuckets rebuilds a stored bucket slice into bounds order, with the
+// overflow bucket (UpperBound 0) trailing. Buckets missing from the slice
+// count as zero; unknown boundaries are dropped.
+func orderedBuckets(buckets []HistogramBucket, bounds []float64) []HistogramBucket {
+	byBound := make(map[float64]int64, len(buckets))
+	for _, b := range buckets {
+		byBound[b.UpperBound] = b.Count
+	}
+	out := make([]HistogramBucket, 0, len(bounds)+1)
+	for _, bound := range bounds {
+		out = append(out, HistogramBucket{UpperBound: bound, Count: byBound[bound]})
+	}
+	if c, ok := byBound[0]; ok {
+		out = append(out, HistogramBucket{UpperBound: 0, Count: c})
+	}
+	return out
 }
 
 // EndpointLatency returns per-endpoint latency snapshots (p50/p95/p99) for the

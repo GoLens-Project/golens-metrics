@@ -286,3 +286,67 @@ func TestHistoryHistogramBounds(t *testing.T) {
 		t.Errorf("histogram bounds len = %d, want %d", len(series.HistogramBounds), len(bounds))
 	}
 }
+
+func TestHistoryIncludesInFlightWindow(t *testing.T) {
+	// Not started: no flush loop runs, so storage stays empty and the only
+	// source for a point is the aggregator's in-flight window.
+	r := newTestRegistry(t, DefaultConfig())
+	defer r.Close()
+
+	r.agg.add("live", 4, nil)
+	r.agg.add("live", 6, nil)
+
+	series := r.History("live", time.Hour)
+	if len(series.Points) != 1 {
+		t.Fatalf("want 1 point from the in-flight window, got %d", len(series.Points))
+	}
+	if series.Points[0].V != 5 {
+		t.Errorf("point value = %v, want 5", series.Points[0].V)
+	}
+}
+
+func TestHistoryOrdersHistogramBuckets(t *testing.T) {
+	r := newTestRegistry(t, DefaultConfig())
+	defer r.Close()
+
+	bounds := []float64{1, 5, 10}
+	r.Register("h", HistogramType, "test histogram", nil, bounds, 0, 0)
+
+	// Store a roll-up with buckets scrambled out of bounds order, an unknown
+	// boundary, and bound 5 missing entirely.
+	now := time.Now()
+	err := r.Storage().Store(context.Background(), AggregatedMetric{
+		Name: "h", Count: 2, Sum: 8,
+		WindowStart: now, WindowEnd: now,
+		HistogramBuckets: []HistogramBucket{
+			{UpperBound: 10, Count: 7},
+			{UpperBound: 99, Count: 4}, // unknown boundary: dropped
+			{UpperBound: 0, Count: 2},  // overflow bucket
+			{UpperBound: 1, Count: 3},
+			// bound 5 absent: counts as zero
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	series := r.History("h", time.Hour)
+	if len(series.Points) != 1 {
+		t.Fatalf("want 1 point, got %d", len(series.Points))
+	}
+	got := series.Points[0].HistogramBuckets
+	want := []HistogramBucket{
+		{UpperBound: 1, Count: 3},
+		{UpperBound: 5, Count: 0},
+		{UpperBound: 10, Count: 7},
+		{UpperBound: 0, Count: 2}, // overflow trails
+	}
+	if len(got) != len(want) {
+		t.Fatalf("buckets = %+v, want %+v", got, want)
+	}
+	for i, b := range want {
+		if got[i] != b {
+			t.Errorf("bucket[%d] = %+v, want %+v", i, got[i], b)
+		}
+	}
+}

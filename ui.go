@@ -2214,20 +2214,29 @@ const dashboardSrc = `<!DOCTYPE html>
         // Clear canvas
         ctx.clearRect(0, 0, W, H);
 
-        // Find time range
+        // Find time range. A single-timestamp series (fresh process / sparse
+        // traffic) has a zero-width x domain, which no tRange alone can widen
+        // (t - tMin stays 0 for every vertex); anchor the domain at
+        // [tMax - durSec, tMax] instead, so the point sits at the right edge
+        // and the polygon and axis labels share one full-width domain.
         let tMin = Infinity, tMax = -Infinity;
         metric.points.forEach(p => {
           tMin = Math.min(tMin, p.t);
           tMax = Math.max(tMax, p.t);
         });
-        const tRange = tMax - tMin || 1;
+        const dm = /^(\d+)([mhdw])$/.exec(this.duration || '');
+        const durSec = dm ? dm[1] * {m: 60, h: 3600, d: 86400, w: 604800}[dm[2]] : 0;
+        if (tMax === tMin) {
+          tMin = tMax - (durSec || 1);
+        }
+        const tRange = tMax - tMin;
 
         // Find max bucket count across all buckets for Y-axis scaling
         let maxCount = 0;
         metric.points.forEach(p => {
           if (p.histogram_buckets) {
             p.histogram_buckets.forEach(b => {
-              maxCount = Math.max(maxCount, b.Count);
+              maxCount = Math.max(maxCount, b.count);
             });
           }
         });
@@ -2266,7 +2275,7 @@ const dashboardSrc = `<!DOCTYPE html>
             // Sum counts for this bucket and all below it
             for (let i = 0; i <= bucketIdx; i++) {
               if (pt.histogram_buckets[i]) {
-                cumulativeCount += pt.histogram_buckets[i].Count;
+                cumulativeCount += pt.histogram_buckets[i].count;
               }
             }
             ctx.lineTo(xP(pt.t), yP(cumulativeCount));
