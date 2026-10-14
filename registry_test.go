@@ -2,6 +2,7 @@ package golens
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 )
@@ -20,7 +21,11 @@ func newTestRegistry(t *testing.T, cfg Config) *Registry {
 
 func TestRegistryPreRegistersREDMetrics(t *testing.T) {
 	r := newTestRegistry(t, DefaultConfig())
-	for _, name := range []string{"http_requests_total", "http_request_errors_total", "http_request_duration_seconds"} {
+	for _, name := range []string{
+		"http_requests_total", "http_request_errors_total", "http_request_duration_seconds",
+		// Fixed per-class children feeding the dashboard's status breakdown.
+		"http_requests_total_2xx", "http_requests_total_3xx", "http_requests_total_4xx", "http_requests_total_5xx",
+	} {
 		if _, ok := r.Snapshot(name); !ok {
 			t.Errorf("RED metric %q not pre-registered", name)
 		}
@@ -111,6 +116,36 @@ func TestRegistryEvictionWithIdleTTL(t *testing.T) {
 	r.Register("new_metric", CounterType, "", nil, nil, 0, 0)
 	if _, ok := r.Snapshot("new_metric"); !ok {
 		t.Error("new metric should exist after idle eviction")
+	}
+}
+
+// An uncompilable path filter is a startup error, not a silently dropped
+// filter line that would track unfiltered traffic.
+func TestNewRejectsInvalidPathPatterns(t *testing.T) {
+	tests := []struct {
+		name    string
+		pattern string
+		apply   func(cfg Config) Config
+	}{
+		{"invalid include pattern", "[", func(cfg Config) Config {
+			cfg.IncludePatterns = []string{"^/api/.*", "["}
+			return cfg
+		}},
+		{"invalid exclude pattern", "*", func(cfg Config) Config {
+			cfg.ExcludePatterns = []string{"*"}
+			return cfg
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := New(tc.apply(DefaultConfig()))
+			if err == nil {
+				t.Fatalf("New accepted invalid pattern %q", tc.pattern)
+			}
+			if !strings.Contains(err.Error(), tc.pattern) {
+				t.Errorf("error %q does not name the offending pattern %q", err, tc.pattern)
+			}
+		})
 	}
 }
 

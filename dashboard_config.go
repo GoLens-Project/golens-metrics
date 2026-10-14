@@ -7,9 +7,10 @@ import (
 	"os"
 )
 
-// DashboardConfig is the versioned dashboard layout document: pinned panels
-// and section ordering. It is the source of truth for the dashboard's
-// client-side layout; localStorage acts only as a write-through cache/fallback.
+// DashboardConfig is the versioned dashboard layout document: pinned panels,
+// section ordering, and the HTTP status card view. It is the source of truth
+// for the dashboard's client-side layout; localStorage acts only as a
+// write-through cache/fallback.
 //
 // A single versioned JSON document is persisted atomically (temp file +
 // rename) to cfg.UI.DashboardConfig. An empty path keeps the document in
@@ -18,15 +19,32 @@ type DashboardConfig struct {
 	Version int              `json:"version"`
 	Panels  []DashboardPanel `json:"panels"`
 	Order   DashboardOrder   `json:"order"`
+	// HTTPCardView selects the HTTP status card's column set:
+	// "breakdown" (2xx-5xx + total, default) or "totals" (total + errors).
+	HTTPCardView string `json:"http_card_view,omitempty"`
 }
 
-// DashboardPanel is one pinned dashboard panel. Fields beyond the metric
-// identity (type, title, thresholds, ...) are intentionally deferred until
-// pinned-panel customization actually exists.
+// DashboardPanel is one pinned dashboard panel. ChartType and Size are the
+// minimal customization set; both default to server-side values derived from
+// the metric kind when empty, so documents saved before they existed render
+// unchanged.
 type DashboardPanel struct {
 	ID     string `json:"id"`
 	Metric string `json:"metric"`
+	// ChartType overrides the rendered chart: line | bars | gauge |
+	// big-number. Empty = default derived from metric kind.
+	ChartType string `json:"chart_type,omitempty"`
+	// Size selects the grid span preset: sm | md | lg. Empty = the chart's
+	// default span. Full free-form resize stays out of scope.
+	Size string `json:"size,omitempty"`
 }
+
+// Panel field vocabularies, shared by the PUT validator and the renderer.
+var (
+	validPanelChartTypes = map[string]bool{"": true, "line": true, "bars": true, "gauge": true, "big-number": true}
+	validPanelSizes      = map[string]bool{"": true, "sm": true, "md": true, "lg": true}
+	validHTTPCardViews   = map[string]bool{"": true, httpViewBreakdown: true, httpViewTotals: true}
+)
 
 // DashboardOrder holds the user's drag-reorder arrangement per section.
 type DashboardOrder struct {
@@ -131,6 +149,18 @@ func (r *Registry) dashboardConfigHandler() http.HandlerFunc {
 					writeJSONError(w, "panel metric is required", http.StatusBadRequest)
 					return
 				}
+				if !validPanelChartTypes[p.ChartType] {
+					writeJSONError(w, "panel chart_type must be one of: line, bars, gauge, big-number", http.StatusBadRequest)
+					return
+				}
+				if !validPanelSizes[p.Size] {
+					writeJSONError(w, "panel size must be one of: sm, md, lg", http.StatusBadRequest)
+					return
+				}
+			}
+			if !validHTTPCardViews[d.HTTPCardView] {
+				writeJSONError(w, "http_card_view must be breakdown or totals", http.StatusBadRequest)
+				return
 			}
 			if d.Order.AllMetrics == nil {
 				d.Order.AllMetrics = []string{}

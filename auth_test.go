@@ -92,16 +92,51 @@ func TestAuthEnvPassword(t *testing.T) {
 	}
 }
 
+// A password without a username is a configuration error: auth was clearly
+// intended, so startup must fail rather than silently serve an
+// unauthenticated dashboard.
 func TestAuthRequiresUsername(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.UI.Auth.Password = "s3cret" // no username
-	r, err := New(cfg)
-	if err != nil {
-		t.Fatal(err)
+	if _, err := New(cfg); err == nil {
+		t.Fatal("New must reject a password configured without a username")
 	}
-	defer r.Close()
-	if r.auth.active() {
-		t.Error("auth must not activate without a username")
+}
+
+// resolveAuth must wipe the plaintext before anything else, so no failure
+// path — unhashable password, missing username — leaves it behind.
+func TestResolveAuthWipesPlaintextOnFailure(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  AuthConfig
+	}{
+		{"unhashable password", AuthConfig{Username: "admin", Password: strings.Repeat("x", 73)}}, // bcrypt's hard limit is 72 bytes
+		{"missing username", AuthConfig{Password: "s3cret"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			st, err := resolveAuth(&tc.cfg)
+			if err == nil {
+				t.Fatalf("resolveAuth accepted %+v", tc.cfg)
+			}
+			if st.active() {
+				t.Error("error path must not activate auth")
+			}
+			if tc.cfg.Password != "" {
+				t.Error("plaintext password was not wiped on the failure path")
+			}
+		})
+	}
+}
+
+// No credential configured: auth is intentionally off and this is not an error.
+func TestResolveAuthNoCredential(t *testing.T) {
+	st, err := resolveAuth(&AuthConfig{})
+	if err != nil {
+		t.Fatalf("resolveAuth with no credential returned error: %v", err)
+	}
+	if st.active() {
+		t.Error("auth must stay inactive with no credential configured")
 	}
 }
 

@@ -1,6 +1,7 @@
 package golens
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -114,6 +115,9 @@ func TestDashboardConfigPutValidation(t *testing.T) {
 		{"too many panels", `{"version": 1, "panels": [{"id":"a","metric":"m"}, {"id":"b","metric":"n"}]}`, "too many panels"},
 		{"panel without id", `{"version": 1, "panels": [{"metric": "m"}]}`, "panel id is required"},
 		{"panel without metric", `{"version": 1, "panels": [{"id": "a"}]}`, "panel metric is required"},
+		{"unknown panel chart_type", `{"version": 1, "panels": [{"id": "a", "metric": "m", "chart_type": "pie"}]}`, "chart_type"},
+		{"unknown panel size", `{"version": 1, "panels": [{"id": "a", "metric": "m", "size": "xl"}]}`, "size"},
+		{"unknown http_card_view", `{"version": 1, "http_card_view": "pie"}`, "http_card_view"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -137,6 +141,82 @@ func TestDashboardConfigPutValidation(t *testing.T) {
 				t.Errorf("rejected document was stored: %#v", d)
 			}
 		})
+	}
+}
+
+// The panel customization fields (chart_type, size) and the HTTP card view
+// are accepted, persisted, and survive a reload from disk.
+func TestDashboardConfigPutAcceptsPanelCustomization(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dashboard.json")
+	cfg := DefaultConfig()
+	cfg.UI.DashboardConfig = path
+	r := newTestRegistry(t, cfg)
+	mux := newServer(r)
+
+	rec := putDashboardConfig(t, mux, `{
+		"version": 1,
+		"http_card_view": "totals",
+		"panels": [{"id": "p1", "metric": "m1", "chart_type": "gauge", "size": "lg"}],
+		"order": {"all_metrics": [], "hooks": [], "endpoints": []}
+	}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PUT status = %d, body: %s", rec.Code, rec.Body.String())
+	}
+
+	r2 := newTestRegistry(t, cfg)
+	d := getDashboardConfig(t, newServer(r2))
+	if d.HTTPCardView != "totals" {
+		t.Errorf("reloaded http_card_view = %q, want totals", d.HTTPCardView)
+	}
+	if len(d.Panels) != 1 || d.Panels[0].ChartType != "gauge" || d.Panels[0].Size != "lg" {
+		t.Errorf("reloaded panels = %#v, want the gauge/lg customization", d.Panels)
+	}
+}
+
+// The persisted http_card_view selects the rendered column set of the HTTP
+// status card in the HTMX fragment.
+func TestHTTPCardViewDrivesRenderedCard(t *testing.T) {
+	r := newTestRegistry(t, DefaultConfig())
+	ctx, cancel := context.WithCancel(context.Background())
+	r.Start(ctx)
+	defer func() { cancel(); r.Close() }()
+
+	// Generate tracked traffic (default excludes only cover ^/metrics).
+	h := r.Middleware(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.WriteHeader(404)
+	}))
+	for i := 0; i < 3; i++ {
+		h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/api/x", nil))
+	}
+	waitForDrain(r)
+
+	mux := newServer(r)
+
+	// Default document: the breakdown view renders the per-class columns.
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest("GET", "/metrics/data", nil))
+	if body := rec.Body.String(); !strings.Contains(body, ">2xx</span>") {
+		t.Errorf("default view missing the 2xx column: %s", body)
+	}
+
+	if rec := putDashboardConfig(t, mux, `{"version":1,"http_card_view":"totals"}`); rec.Code != http.StatusOK {
+		t.Fatalf("PUT status = %d, body: %s", rec.Code, rec.Body.String())
+	}
+
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest("GET", "/metrics/data", nil))
+	body := rec.Body.String()
+	if !strings.Contains(body, `data-metric="http_requests_total"`) {
+		t.Fatalf("HTTP status card missing from fragment: %s", body)
+	}
+	if !strings.Contains(body, ">total</span>") || !strings.Contains(body, ">errors</span>") {
+		t.Errorf("totals view missing total/errors columns: %s", body)
+	}
+	if strings.Contains(body, ">2xx</span>") {
+		t.Errorf("totals view must not render per-class columns: %s", body)
+	}
+	if !strings.Contains(body, `active" onclick="setHTTPView('totals')"`) {
+		t.Errorf("totals toggle not marked active: %s", body)
 	}
 }
 

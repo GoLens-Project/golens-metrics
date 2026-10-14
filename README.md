@@ -58,6 +58,7 @@ This layer handles how the world sees your telemetry. It is designed to be "Swag
 * **High-Cardinality Safety:** Path normalization, label truncation, and a configurable cardinality guard prevent unbounded series growth.
 * **Context-Based Lifecycle:** Graceful shutdown with context stored in Registry struct.
 * **Histogram Time-Series:** Visualize histogram bucket distribution evolution over time with stacked area charts, enabling analysis of distribution trends and patterns.
+* **Air-Gap Safe UI:** All dashboard assets (stylesheet, page scripts, htmx, Alpine.js) are compiled into the binary via `go:embed` and served from `/metrics/static/`. No CDN, font, or any other network dependency — the dashboard renders fully offline.
 
 ---
 
