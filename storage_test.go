@@ -2,6 +2,7 @@ package golens
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 )
@@ -145,4 +146,25 @@ func filepathJoin(parts ...string) string {
 		}
 	}
 	return out
+}
+
+// The dashboard JS indexes histogram_buckets entries and reads b.count, and
+// the SQLite backend round-trips buckets through JSON: the lowercase keys are
+// the wire contract, not a styling choice.
+func TestHistogramBucketJSONKeys(t *testing.T) {
+	data, err := json.Marshal(HistogramBucket{UpperBound: 5, Count: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != `{"upper_bound":5,"count":3}` {
+		t.Errorf("marshaled = %s, want lowercase keys", data)
+	}
+
+	var back HistogramBucket
+	if err := json.Unmarshal(data, &back); err != nil {
+		t.Fatal(err)
+	}
+	if back != (HistogramBucket{UpperBound: 5, Count: 3}) {
+		t.Errorf("round-trip = %+v", back)
+	}
 }
