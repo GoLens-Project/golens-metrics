@@ -44,8 +44,8 @@ func (t MetricType) ChartType() string {
 
 // Label is a single key/value attribute attached to a metric sample.
 type Label struct {
-	Name  string
-	Value string
+	Name  string `json:"name"`
+	Value string `json:"value"`
 }
 
 // Metric is the user-facing definition of a registered metric. It is the
@@ -196,28 +196,29 @@ func (m *Metric) histogramBuckets() []BucketSnapshot {
 }
 
 // MetricSnapshot is a serializable view of a metric, used by the UI and OTLP.
+// The JSON tags are the stable public API contract for /metrics/data.
 type MetricSnapshot struct {
-	Name        string
-	Type        string
-	Description string
-	Labels      []string // declared label names
-	LabelValues []Label  // last observed label values (display only)
-	Chart       string
-	Value       float64
-	Count       int64
-	Sum         float64
-	Avg         float64
-	Buckets     []BucketSnapshot
-	UpdatedAt   int64
-	GaugeMin    float64 // minimum value for gauge scale
-	GaugeMax    float64 // maximum value for gauge scale
+	Name        string           `json:"name"`
+	Type        string           `json:"type"`
+	Description string           `json:"description,omitempty"`
+	Labels      []string         `json:"labels,omitempty"`       // declared label names
+	LabelValues []Label          `json:"label_values,omitempty"` // last observed label values (display only)
+	Chart       string           `json:"chart,omitempty"`
+	Value       float64          `json:"value"`
+	Count       int64            `json:"count,omitempty"`
+	Sum         float64          `json:"sum,omitempty"`
+	Avg         float64          `json:"avg,omitempty"`
+	Buckets     []BucketSnapshot `json:"buckets,omitempty"`
+	UpdatedAt   int64            `json:"updated_at,omitempty"`
+	GaugeMin    float64          `json:"gauge_min,omitempty"` // minimum value for gauge scale
+	GaugeMax    float64          `json:"gauge_max,omitempty"` // maximum value for gauge scale
 }
 
 // BucketSnapshot is one histogram bucket.
 type BucketSnapshot struct {
-	UpperBound float64
-	Count      int64
-	Overflow   bool
+	UpperBound float64 `json:"upper_bound"`
+	Count      int64   `json:"count"`
+	Overflow   bool    `json:"overflow"`
 }
 
 // DefaultHistogramBounds used when a histogram is registered without bounds.

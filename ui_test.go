@@ -27,17 +27,16 @@ func TestMountUIRegistersRoutes(t *testing.T) {
 	if !strings.Contains(body, "GoLens") || !strings.Contains(body, "discovery dashboard") {
 		t.Error("dashboard shell not rendered")
 	}
-	if !strings.Contains(body, "alpinejs") {
-		t.Error("Alpine.js not included")
-	}
-	if !strings.Contains(body, "tailwindcss") {
-		t.Error("Tailwind not included")
+	// The dashboard loads its pinned Alpine build from the embedded static
+	// assets, never from a CDN.
+	if !strings.Contains(body, "/metrics/static/alpine.min.js") {
+		t.Error("embedded Alpine.js not included")
 	}
 	if !strings.Contains(body, "hx-trigger") {
 		t.Error("HTMX polling trigger missing")
 	}
-	if !strings.Contains(body, "grid-cols-1") {
-		t.Error("responsive grid missing")
+	if !strings.Contains(body, "grid-cards") {
+		t.Error("card grid missing")
 	}
 	// Note: HTTP Request card only appears when there's actual HTTP traffic
 	// This test doesn't make HTTP requests, so we just check the basic UI structure
@@ -54,6 +53,74 @@ func TestMountUIDisabledDoesNothing(t *testing.T) {
 	mux.ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("UI disabled should not register routes; got %d", rec.Code)
+	}
+}
+
+// The air-gap contract: every asset the rendered pages reference is served
+// from the embedded /metrics/static/ tree.
+func TestStaticAssetsServed(t *testing.T) {
+	r := newTestRegistry(t, DefaultConfig())
+	mux := newServer(r)
+
+	for _, name := range []string{"styles.css", "common.js", "dashboard.js", "alerts.js", "htmx.min.js", "alpine.min.js"} {
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, httptest.NewRequest("GET", "/metrics/static/"+name, nil))
+		if rec.Code != http.StatusOK {
+			t.Errorf("%s: status = %d, want 200", name, rec.Code)
+			continue
+		}
+		if rec.Body.Len() == 0 {
+			t.Errorf("%s: served empty", name)
+		}
+	}
+
+	// The stylesheet must ship with a CSS content type, not a sniffed one.
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest("GET", "/metrics/static/styles.css", nil))
+	if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "text/css") {
+		t.Errorf("styles.css content type = %q, want text/css", ct)
+	}
+
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest("GET", "/metrics/static/nope.js", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("unknown asset: status = %d, want 404", rec.Code)
+	}
+
+	// Directory paths must never render a listing of the asset names.
+	for _, path := range []string{"/metrics/static/", "/metrics/static/styles.css/"} {
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, httptest.NewRequest("GET", path, nil))
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("%s: status = %d, want 404 (no directory listing)", path, rec.Code)
+		}
+	}
+}
+
+// Rendered pages must carry no absolute URL at all: no CDN script, no font
+// host, nothing that would break an air-gapped deployment.
+func TestRenderedPagesAreAirGapSafe(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Alerts.Enabled = true
+	r := newTestRegistry(t, cfg)
+	ctx, cancel := context.WithCancel(context.Background())
+	r.Start(ctx)
+	defer func() { cancel(); r.Close() }()
+
+	mux := newServer(r)
+	for _, path := range []string{"/metrics", "/metrics/alerts"} {
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, httptest.NewRequest("GET", path, nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: status = %d", path, rec.Code)
+		}
+		body := rec.Body.String()
+		if strings.Contains(body, "http://") || strings.Contains(body, "https://") {
+			t.Errorf("%s references an absolute URL; the dashboard must render fully offline", path)
+		}
+		if !strings.Contains(body, "/metrics/static/styles.css") {
+			t.Errorf("%s does not reference the embedded stylesheet", path)
+		}
 	}
 }
 
@@ -481,14 +548,159 @@ func TestBuildCardsUnknownType(t *testing.T) {
 	}
 }
 
+// A pinned panel's saved chart_type selects the card body; a saved bars type
+// on a bucket-less non-histogram metric falls back to a number instead of an
+// empty chart, while a bucket-less histogram keeps the (empty) bars chart.
+func TestApplyCardDefaultsPanelChartTypeOverrides(t *testing.T) {
+	withBuckets := []BucketSnapshot{{UpperBound: 1, Count: 9}, {Count: 1, Overflow: true}}
+	tests := []struct {
+		name     string
+		snap     MetricSnapshot
+		panel    DashboardPanel
+		wantView string
+		wantBars bool
+	}{
+		{"counter default", MetricSnapshot{Name: "m", Type: "counter", Value: 1}, DashboardPanel{}, "number", false},
+		{"histogram default", MetricSnapshot{Name: "m", Type: "histogram", Count: 10, Buckets: withBuckets}, DashboardPanel{}, "bars", true},
+		{"gauge override on counter", MetricSnapshot{Name: "m", Type: "counter", Value: 1}, DashboardPanel{ChartType: "gauge"}, "gauge", false},
+		{"bars override on histogram", MetricSnapshot{Name: "m", Type: "histogram", Count: 10, Buckets: withBuckets}, DashboardPanel{ChartType: "bars"}, "bars", true},
+		{"bars override on bucket-less counter falls back to number", MetricSnapshot{Name: "m", Type: "counter", Value: 4}, DashboardPanel{ChartType: "bars"}, "number", false},
+		{"bucket-less histogram keeps the empty bars chart", MetricSnapshot{Name: "m", Type: "histogram", Count: 0}, DashboardPanel{ChartType: "bars"}, "bars", false},
+		{"line override", MetricSnapshot{Name: "m", Type: "counter", Value: 1}, DashboardPanel{ChartType: "line"}, "line", false},
+		{"big-number override", MetricSnapshot{Name: "m", Type: "gauge", Value: 1}, DashboardPanel{ChartType: "big-number"}, "number", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var c metricCard
+			applyCardDefaults(&c, tc.snap, tc.panel)
+			if c.View != tc.wantView {
+				t.Errorf("view = %q, want %q", c.View, tc.wantView)
+			}
+			if tc.wantBars && len(c.Bars) == 0 {
+				t.Error("bars view must carry the bucket bars")
+			}
+		})
+	}
+}
+
+// A gauge-override card gets the full gauge scale (needle position), not just
+// the view name.
+func TestApplyCardDefaultsGaugeOverrideScalesNeedle(t *testing.T) {
+	var c metricCard
+	applyCardDefaults(&c, MetricSnapshot{Name: "m", Type: "counter", Value: 5}, DashboardPanel{ChartType: "gauge"})
+	if c.View != "gauge" || c.MaxValue != 10 {
+		t.Errorf("view = %q max = %v, want a scaled gauge (max 10)", c.View, c.MaxValue)
+	}
+}
+
+// The panel's saved size wins over the default grid span; histograms keep the
+// half-width span their bar rows need unless overridden.
+func TestApplyCardDefaultsPanelSizeOverrides(t *testing.T) {
+	tests := []struct {
+		name     string
+		snap     MetricSnapshot
+		panel    DashboardPanel
+		wantSize string
+	}{
+		{"histogram default md", MetricSnapshot{Name: "m", Type: "histogram", Count: 1, Buckets: []BucketSnapshot{{UpperBound: 1, Count: 1}}}, DashboardPanel{}, "md"},
+		{"explicit lg wins", MetricSnapshot{Name: "m", Type: "counter", Value: 1}, DashboardPanel{Size: "lg"}, "lg"},
+		{"explicit md wins on histogram", MetricSnapshot{Name: "m", Type: "histogram", Count: 1, Buckets: []BucketSnapshot{{UpperBound: 1, Count: 1}}}, DashboardPanel{Size: "md"}, "md"},
+		{"sm collapses to single cell", MetricSnapshot{Name: "m", Type: "counter", Value: 1}, DashboardPanel{Size: "sm"}, ""},
+		{"counter default single cell", MetricSnapshot{Name: "m", Type: "counter", Value: 1}, DashboardPanel{}, ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var c metricCard
+			applyCardDefaults(&c, tc.snap, tc.panel)
+			if c.Size != tc.wantSize {
+				t.Errorf("size = %q, want %q", c.Size, tc.wantSize)
+			}
+		})
+	}
+}
+
+// The needle must never divide by a zero-width scale: a flat or inverted
+// range is widened, and positions clamp to the dial ends (-90..+90 degrees).
+func TestApplyGaugeScaleDegenerateRange(t *testing.T) {
+	tests := []struct {
+		name    string
+		snap    MetricSnapshot
+		wantMax float64
+		wantPct int
+		wantDeg float64
+	}{
+		{"configured scale mid", MetricSnapshot{Name: "m", Type: "gauge", Value: 5, GaugeMin: 0, GaugeMax: 10}, 10, 50, 0},
+		{"clamped above max", MetricSnapshot{Name: "m", Type: "gauge", Value: 20, GaugeMin: 0, GaugeMax: 10}, 10, 100, 90},
+		{"clamped below min", MetricSnapshot{Name: "m", Type: "gauge", Value: -5, GaugeMin: 0, GaugeMax: 10}, 10, 0, -90},
+		{"flat scale widened", MetricSnapshot{Name: "m", Type: "gauge", Value: 10.5, GaugeMin: 10, GaugeMax: 10}, 11, 50, 0},
+		{"inverted scale widened", MetricSnapshot{Name: "m", Type: "gauge", Value: 8, GaugeMin: 8, GaugeMax: 2}, 9, 0, -90},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := metricCard{}
+			applyGaugeScale(&c, tc.snap)
+			if c.MinValue != tc.snap.GaugeMin || c.MaxValue != tc.wantMax {
+				t.Errorf("scale = [%v, %v], want [%v, %v]", c.MinValue, c.MaxValue, tc.snap.GaugeMin, tc.wantMax)
+			}
+			if c.NeedlePct != tc.wantPct {
+				t.Errorf("NeedlePct = %d, want %d", c.NeedlePct, tc.wantPct)
+			}
+			if c.NeedleDeg != tc.wantDeg {
+				t.Errorf("NeedleDeg = %v, want %v", c.NeedleDeg, tc.wantDeg)
+			}
+		})
+	}
+}
+
+// cardOptions snapshots the persisted dashboard document into builder options,
+// keyed per pinned metric.
+func TestCardOptionsFromRegistry(t *testing.T) {
+	r := newTestRegistry(t, DefaultConfig())
+	mux := newServer(r)
+
+	o := r.cardOptions()
+	if o.HTTPView != "" || o.panels != nil {
+		t.Errorf("default card options = %+v, want zero values", o)
+	}
+
+	rec := putDashboardConfig(t, mux, `{"version":1,"http_card_view":"totals","panels":[`+
+		`{"id":"p1","metric":"m1","chart_type":"gauge","size":"lg"},`+
+		`{"id":"p2","metric":"m2","chart_type":"line"}]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PUT status = %d, body: %s", rec.Code, rec.Body.String())
+	}
+
+	o = r.cardOptions()
+	if o.HTTPView != "totals" {
+		t.Errorf("HTTPView = %q, want totals", o.HTTPView)
+	}
+	if got := o.panels["m1"]; got.ChartType != "gauge" || got.Size != "lg" {
+		t.Errorf("m1 panel = %+v, want gauge/lg", got)
+	}
+	if got := o.panels["m2"]; got.ChartType != "line" || got.Size != "" {
+		t.Errorf("m2 panel = %+v, want line with default size", got)
+	}
+}
+
+// httpColumnMap indexes a card's HTTP columns by label.
+func httpColumnMap(c metricCard) map[string]float64 {
+	m := make(map[string]float64, len(c.HTTPColumns))
+	for _, col := range c.HTTPColumns {
+		m[col.Label] = col.Value
+	}
+	return m
+}
+
 func TestBuildHTTPCardStatusCodes(t *testing.T) {
 	snaps := []MetricSnapshot{
-		{Name: "http_requests_total", Type: "counter", Value: 100, LabelValues: []Label{{Name: "status", Value: "200"}}},
-		{Name: "http_requests_total", Type: "counter", Value: 50, LabelValues: []Label{{Name: "status", Value: "201"}}},
-		{Name: "http_requests_total", Type: "counter", Value: 10, LabelValues: []Label{{Name: "status", Value: "301"}}},
-		{Name: "http_requests_total", Type: "counter", Value: 20, LabelValues: []Label{{Name: "status", Value: "404"}}},
-		{Name: "http_requests_total", Type: "counter", Value: 5, LabelValues: []Label{{Name: "status", Value: "500"}}},
+		{Name: "http_requests_total_2xx", Type: "counter", Value: 150},
+		{Name: "http_requests_total_3xx", Type: "counter", Value: 10},
+		{Name: "http_requests_total_4xx", Type: "counter", Value: 20},
+		{Name: "http_requests_total_5xx", Type: "counter", Value: 5},
+		// Errors are a subset of 4xx+5xx and are counted separately.
 		{Name: "http_request_errors_total", Type: "counter", Value: 3},
+		// Non-class HTTP metrics (e.g. payload size) count into the total.
+		{Name: "http_request_bytes_sent", Type: "counter", Value: 7},
 	}
 	cards := buildHTTPCard(snaps)
 	if len(cards) != 1 {
@@ -498,28 +710,76 @@ func TestBuildHTTPCardStatusCodes(t *testing.T) {
 	if card.Badge != "COUNTER" {
 		t.Errorf("badge = %q, want COUNTER", card.Badge)
 	}
-	// Verify columns: 2xx=150, 3xx=10, 4xx=20, 5xx=5, errors=3, total=188
-	colMap := map[string]float64{}
-	for _, col := range card.HTTPColumns {
-		colMap[col.Label] = col.Value
+	if card.View != "http" {
+		t.Errorf("view = %q, want http", card.View)
 	}
-	if colMap["2xx"] != 150 {
-		t.Errorf("2xx = %v, want 150", colMap["2xx"])
+	// Breakdown columns: 2xx=150, 3xx=10, 4xx=20, 5xx=5, total=192
+	// (185 class requests + 7 other). The errors counter must not be added
+	// into the total — it re-counts the same requests as 4xx+5xx.
+	colMap := httpColumnMap(card)
+	for label, want := range map[string]float64{"2xx": 150, "3xx": 10, "4xx": 20, "5xx": 5, "total": 192} {
+		if colMap[label] != want {
+			t.Errorf("%s = %v, want %v", label, colMap[label], want)
+		}
 	}
-	if colMap["3xx"] != 10 {
-		t.Errorf("3xx = %v, want 10", colMap["3xx"])
+	if _, ok := colMap["errors"]; ok {
+		t.Error("breakdown view must not render an errors column")
 	}
-	if colMap["4xx"] != 20 {
-		t.Errorf("4xx = %v, want 20", colMap["4xx"])
+}
+
+func TestBuildHTTPCardTotalsView(t *testing.T) {
+	snaps := []MetricSnapshot{
+		{Name: "http_requests_total_2xx", Type: "counter", Value: 150},
+		{Name: "http_requests_total_4xx", Type: "counter", Value: 20},
+		{Name: "http_requests_total_5xx", Type: "counter", Value: 5},
+		{Name: "http_request_errors_total", Type: "counter", Value: 8},
 	}
-	if colMap["5xx"] != 5 {
-		t.Errorf("5xx = %v, want 5", colMap["5xx"])
+	cards := buildHTTPCardView(snaps, httpViewTotals)
+	if len(cards) != 1 {
+		t.Fatalf("got %d cards, want 1", len(cards))
 	}
-	if colMap["errors"] != 3 {
-		t.Errorf("errors = %v, want 3", colMap["errors"])
+	card := cards[0]
+	if card.HTTPView != httpViewTotals {
+		t.Errorf("HTTPView = %q, want totals", card.HTTPView)
 	}
-	if colMap["total"] != 188 {
-		t.Errorf("total = %v, want 188", colMap["total"])
+	if len(card.HTTPColumns) != 2 {
+		t.Fatalf("got %d columns, want 2 (total + errors): %+v", len(card.HTTPColumns), card.HTTPColumns)
+	}
+	colMap := httpColumnMap(card)
+	if colMap["total"] != 175 {
+		t.Errorf("total = %v, want 175 — errors must not be added into the total", colMap["total"])
+	}
+	if colMap["errors"] != 8 {
+		t.Errorf("errors = %v, want 8", colMap["errors"])
+	}
+}
+
+// The labeled parent only feeds the card when no per-class children exist yet:
+// it carries just the last-seen label set, so it would otherwise double count
+// requests the children already cover.
+func TestBuildHTTPCardParentTotalFallback(t *testing.T) {
+	parent := MetricSnapshot{Name: "http_requests_total", Type: "counter", Value: 42}
+
+	cards := buildHTTPCardView([]MetricSnapshot{parent}, httpViewBreakdown)
+	if len(cards) != 1 {
+		t.Fatalf("got %d cards, want 1", len(cards))
+	}
+	colMap := httpColumnMap(cards[0])
+	if colMap["total"] != 42 {
+		t.Errorf("total = %v, want the parent total 42", colMap["total"])
+	}
+	if colMap["2xx"] != 0 {
+		t.Errorf("2xx = %v, want 0 (no per-class data yet)", colMap["2xx"])
+	}
+
+	withChildren := []MetricSnapshot{parent, {Name: "http_requests_total_2xx", Type: "counter", Value: 42}}
+	cards = buildHTTPCardView(withChildren, httpViewBreakdown)
+	colMap = httpColumnMap(cards[0])
+	if colMap["total"] != 42 {
+		t.Errorf("total = %v, want 42 — parent must not double count", colMap["total"])
+	}
+	if colMap["2xx"] != 42 {
+		t.Errorf("2xx = %v, want 42", colMap["2xx"])
 	}
 }
 
@@ -530,24 +790,6 @@ func TestBuildHTTPCardNoHTTPMetrics(t *testing.T) {
 	cards := buildHTTPCard(snaps)
 	if cards != nil {
 		t.Errorf("expected nil for non-HTTP metrics, got %d cards", len(cards))
-	}
-}
-
-func TestBuildHTTPCardUncategorized(t *testing.T) {
-	// HTTP metric with no status label → goes to "other"
-	snaps := []MetricSnapshot{
-		{Name: "http_requests_total", Type: "counter", Value: 25},
-	}
-	cards := buildHTTPCard(snaps)
-	if len(cards) != 1 {
-		t.Fatalf("got %d cards, want 1", len(cards))
-	}
-	colMap := map[string]float64{}
-	for _, col := range cards[0].HTTPColumns {
-		colMap[col.Label] = col.Value
-	}
-	if colMap["total"] != 25 {
-		t.Errorf("total = %v, want 25", colMap["total"])
 	}
 }
 
@@ -802,11 +1044,18 @@ func TestDashboardContainsInternalsSection(t *testing.T) {
 	if !strings.Contains(body, "cardinalityPanel") {
 		t.Error("dashboard missing cardinalityPanel Alpine function")
 	}
-	if !strings.Contains(body, "/metrics/cardinality") {
-		t.Error("dashboard missing cardinality endpoint reference")
-	}
 	if !strings.Contains(body, "Per-Metric Cardinality") {
 		t.Error("dashboard missing per-metric cardinality table")
+	}
+	// The panel's polling logic (including the endpoint fetch) lives in the
+	// embedded page script, not inline.
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest("GET", "/metrics/static/dashboard.js", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("dashboard.js status = %d", rec.Code)
+	}
+	if js := rec.Body.String(); !strings.Contains(js, "/metrics/cardinality") {
+		t.Error("dashboard.js missing cardinality endpoint reference")
 	}
 }
 

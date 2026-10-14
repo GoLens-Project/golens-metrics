@@ -2,6 +2,7 @@ package golens
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 )
@@ -20,7 +21,11 @@ func newTestRegistry(t *testing.T, cfg Config) *Registry {
 
 func TestRegistryPreRegistersREDMetrics(t *testing.T) {
 	r := newTestRegistry(t, DefaultConfig())
-	for _, name := range []string{"http_requests_total", "http_request_errors_total", "http_request_duration_seconds"} {
+	for _, name := range []string{
+		"http_requests_total", "http_request_errors_total", "http_request_duration_seconds",
+		// Fixed per-class children feeding the dashboard's status breakdown.
+		"http_requests_total_2xx", "http_requests_total_3xx", "http_requests_total_4xx", "http_requests_total_5xx",
+	} {
 		if _, ok := r.Snapshot(name); !ok {
 			t.Errorf("RED metric %q not pre-registered", name)
 		}
@@ -111,6 +116,36 @@ func TestRegistryEvictionWithIdleTTL(t *testing.T) {
 	r.Register("new_metric", CounterType, "", nil, nil, 0, 0)
 	if _, ok := r.Snapshot("new_metric"); !ok {
 		t.Error("new metric should exist after idle eviction")
+	}
+}
+
+// An uncompilable path filter is a startup error, not a silently dropped
+// filter line that would track unfiltered traffic.
+func TestNewRejectsInvalidPathPatterns(t *testing.T) {
+	tests := []struct {
+		name    string
+		pattern string
+		apply   func(cfg Config) Config
+	}{
+		{"invalid include pattern", "[", func(cfg Config) Config {
+			cfg.IncludePatterns = []string{"^/api/.*", "["}
+			return cfg
+		}},
+		{"invalid exclude pattern", "*", func(cfg Config) Config {
+			cfg.ExcludePatterns = []string{"*"}
+			return cfg
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := New(tc.apply(DefaultConfig()))
+			if err == nil {
+				t.Fatalf("New accepted invalid pattern %q", tc.pattern)
+			}
+			if !strings.Contains(err.Error(), tc.pattern) {
+				t.Errorf("error %q does not name the offending pattern %q", err, tc.pattern)
+			}
+		})
 	}
 }
 
@@ -284,5 +319,69 @@ func TestHistoryHistogramBounds(t *testing.T) {
 	series := r.History("hist_metric", time.Hour)
 	if len(series.HistogramBounds) != len(bounds) {
 		t.Errorf("histogram bounds len = %d, want %d", len(series.HistogramBounds), len(bounds))
+	}
+}
+
+func TestHistoryIncludesInFlightWindow(t *testing.T) {
+	// Not started: no flush loop runs, so storage stays empty and the only
+	// source for a point is the aggregator's in-flight window.
+	r := newTestRegistry(t, DefaultConfig())
+	defer r.Close()
+
+	r.agg.add("live", 4, nil)
+	r.agg.add("live", 6, nil)
+
+	series := r.History("live", time.Hour)
+	if len(series.Points) != 1 {
+		t.Fatalf("want 1 point from the in-flight window, got %d", len(series.Points))
+	}
+	if series.Points[0].V != 5 {
+		t.Errorf("point value = %v, want 5", series.Points[0].V)
+	}
+}
+
+func TestHistoryOrdersHistogramBuckets(t *testing.T) {
+	r := newTestRegistry(t, DefaultConfig())
+	defer r.Close()
+
+	bounds := []float64{1, 5, 10}
+	r.Register("h", HistogramType, "test histogram", nil, bounds, 0, 0)
+
+	// Store a roll-up with buckets scrambled out of bounds order, an unknown
+	// boundary, and bound 5 missing entirely.
+	now := time.Now()
+	err := r.Storage().Store(context.Background(), AggregatedMetric{
+		Name: "h", Count: 2, Sum: 8,
+		WindowStart: now, WindowEnd: now,
+		HistogramBuckets: []HistogramBucket{
+			{UpperBound: 10, Count: 7},
+			{UpperBound: 99, Count: 4}, // unknown boundary: dropped
+			{UpperBound: 0, Count: 2},  // overflow bucket
+			{UpperBound: 1, Count: 3},
+			// bound 5 absent: counts as zero
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	series := r.History("h", time.Hour)
+	if len(series.Points) != 1 {
+		t.Fatalf("want 1 point, got %d", len(series.Points))
+	}
+	got := series.Points[0].HistogramBuckets
+	want := []HistogramBucket{
+		{UpperBound: 1, Count: 3},
+		{UpperBound: 5, Count: 0},
+		{UpperBound: 10, Count: 7},
+		{UpperBound: 0, Count: 2}, // overflow trails
+	}
+	if len(got) != len(want) {
+		t.Fatalf("buckets = %+v, want %+v", got, want)
+	}
+	for i, b := range want {
+		if got[i] != b {
+			t.Errorf("bucket[%d] = %+v, want %+v", i, got[i], b)
+		}
 	}
 }

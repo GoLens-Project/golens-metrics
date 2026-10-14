@@ -7,8 +7,8 @@ import (
 
 // HistogramBucket represents a single histogram bucket's count at a specific boundary.
 type HistogramBucket struct {
-	UpperBound float64
-	Count      int64
+	UpperBound float64 `json:"upper_bound"`
+	Count      int64   `json:"count"`
 }
 
 // AggregatedMetric is a roll-up bucket written to a persistence backend.

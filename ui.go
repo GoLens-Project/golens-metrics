@@ -2,8 +2,11 @@ package golens
 
 import (
 	"bytes"
+	"embed"
 	"encoding/json"
 	"html/template"
+	"io/fs"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -45,6 +48,8 @@ func (r *Registry) MountUI(mux *http.ServeMux) {
 		writeJSON(w, r.CardinalitySnapshots())
 	}))
 	mux.Handle("/metrics/history", wrap(r.metricsHistoryHandler()))
+	mux.Handle("/metrics/config", wrap(r.dashboardConfigHandler()))
+	mux.Handle("/metrics/static/", wrap(staticHandler.ServeHTTP))
 	mux.Handle("/favicon.ico", wrap(r.faviconHandler))
 
 	// Alert subsystem routes.
@@ -56,6 +61,33 @@ func (r *Registry) MountUI(mux *http.ServeMux) {
 		mux.Handle("/metrics/alerts/templates", wrap(r.alertTemplatesHandler()))
 	}
 }
+
+// staticAssets holds the vendored dashboard assets (stylesheet, page scripts,
+// pinned htmx and Alpine builds) so the dashboard renders with no CDN or
+// network dependencies — safe to run air-gapped.
+//
+//go:embed ui/static
+var staticAssets embed.FS
+
+// staticHandler serves the embedded assets under /metrics/static/. Directory
+// paths (including the bare prefix) are rejected so the FileServer never
+// renders a listing of the asset names.
+var staticHandler = func() http.Handler {
+	sub, err := fs.Sub(staticAssets, "ui/static")
+	if err != nil {
+		panic("golens: embedded static assets missing: " + err.Error())
+	}
+	files := http.FileServer(http.FS(sub))
+	return http.StripPrefix("/metrics/static/", http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		// StripPrefix reduces the bare prefix to an empty path; both it and
+		// any trailing-slash path would render a directory listing.
+		if req.URL.Path == "" || strings.HasSuffix(req.URL.Path, "/") {
+			http.NotFound(w, req)
+			return
+		}
+		files.ServeHTTP(w, req)
+	}))
+}()
 
 // DashboardHandler is the raw, unprotected handler that renders the main
 // dashboard HTML. Exposed so advanced users can mount it behind their own
@@ -180,12 +212,12 @@ func (r *Registry) metricsPageHandler() http.Handler {
 			intervalMs = 5000
 		}
 		data := map[string]interface{}{
-			"PollMs":         intervalMs,
-			"PollSec":        intervalMs / 1000,
-			"Cards":          buildCards(r.Snapshots()),
-			"HookCards":      buildHookCards(r.Snapshots()),
-			"Interval":       r.cfg.UI.PollInterval.String(),
-			"RuntimeEnabled": r.cfg.RuntimeMetrics.Enabled,
+			"PollMs":            intervalMs,
+			"PollSec":           intervalMs / 1000,
+			"Cards":             buildCardsOpts(r.Snapshots(), r.cardOptions()),
+			"HookCards":         buildHookCards(r.Snapshots()),
+			"Interval":          r.cfg.UI.PollInterval.String(),
+			"RuntimeEnabled":    r.cfg.RuntimeMetrics.Enabled,
 			"ProjectName":       r.cfg.ProjectName,
 			"DashboardSubtitle": r.cfg.DashboardSubtitle,
 			"MaxLabelSeries":    r.cfg.MaxLabelSeriesPerMetric,
@@ -223,7 +255,7 @@ func (r *Registry) metricsDataHandler() http.Handler {
 		}
 		// HTMX HTML fragment (the card grid).
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		_ = chartsTpl.Execute(w, map[string]interface{}{"Cards": buildCards(r.Snapshots())})
+		_ = chartsTpl.Execute(w, buildCardsOpts(r.Snapshots(), r.cardOptions()))
 	})
 }
 
@@ -239,18 +271,31 @@ var defaultDurations = map[string]time.Duration{
 
 func (r *Registry) metricsHistoryHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, req *http.Request) {
-		name := req.URL.Query().Get("name")
-		if name == "" {
-			http.Error(w, "missing ?name= parameter", http.StatusBadRequest)
-			return
-		}
-		durStr := req.URL.Query().Get("duration")
+		q := req.URL.Query()
+		durStr := q.Get("duration")
 		if durStr == "" {
 			durStr = "1h"
 		}
 		dur, ok := defaultDurations[durStr]
 		if !ok {
 			http.Error(w, "invalid duration; use 5m,30m,1h,4h,12h,24h,1w", http.StatusBadRequest)
+			return
+		}
+		// Batch form: /metrics/history?names=a,b,c returns {name: HistorySeries}
+		// so a panel grid costs one request per refresh.
+		if namesParam := q.Get("names"); namesParam != "" {
+			out := make(map[string]HistorySeries)
+			for _, name := range strings.Split(namesParam, ",") {
+				if name = strings.TrimSpace(name); name != "" {
+					out[name] = r.History(name, dur)
+				}
+			}
+			writeJSON(w, out)
+			return
+		}
+		name := q.Get("name")
+		if name == "" {
+			http.Error(w, "missing ?name= parameter", http.StatusBadRequest)
 			return
 		}
 		writeJSON(w, r.History(name, dur))
@@ -266,18 +311,32 @@ func (r *Registry) hooksDataHandler() http.Handler {
 		}
 		// HTMX HTML fragment
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		_ = chartsTpl.Execute(w, map[string]interface{}{"Cards": buildHookCards(r.Snapshots())})
+		_ = chartsTpl.Execute(w, buildHookCards(r.Snapshots()))
 	})
 }
 
-// faviconHandler serves the favicon.ico file
+// faviconBytes is embedded so the favicon resolves regardless of the
+// process working directory.
+//
+//go:embed favicon.ico
+var faviconBytes []byte
+
+// faviconHandler serves the embedded favicon.ico
 func (r *Registry) faviconHandler(w http.ResponseWriter, req *http.Request) {
-	http.ServeFile(w, req, "favicon.ico")
+	http.ServeContent(w, req, "favicon.ico", time.Time{}, bytes.NewReader(faviconBytes))
 }
 
+// wantsJSON reports whether the request prefers a JSON payload over the HTMX
+// HTML fragment. Composite Accept headers ("application/json, */*" — the
+// axios/fetch default) are matched per media range; bare "*/*" does not select
+// JSON so browser navigations keep rendering HTML.
 func wantsJSON(req *http.Request) bool {
-	for _, a := range []string{req.Header.Get("Accept"), req.URL.Query().Get("format")} {
-		if a == "json" || a == "application/json" {
+	if req.URL.Query().Get("format") == "json" {
+		return true
+	}
+	for _, part := range strings.Split(req.Header.Get("Accept"), ",") {
+		media := strings.TrimSpace(strings.SplitN(part, ";", 2)[0])
+		if media == "json" || media == "application/json" {
 			return true
 		}
 	}
@@ -298,8 +357,8 @@ func (r *Registry) alertsPageHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, req *http.Request) {
 		hasNotifier := r.alerter != nil && r.alerter.HasNotifier()
 		data := map[string]interface{}{
-			"ProjectName":  r.cfg.ProjectName,
-			"HasNotifier":  hasNotifier,
+			"ProjectName": r.cfg.ProjectName,
+			"HasNotifier": hasNotifier,
 		}
 		var buf bytes.Buffer
 		if err := alertsPageTpl.Execute(&buf, data); err != nil {
@@ -321,16 +380,16 @@ func (r *Registry) alertRulesHandler() http.HandlerFunc {
 		case http.MethodPost:
 			var rule AlertRule
 			if err := json.NewDecoder(req.Body).Decode(&rule); err != nil {
-				http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
+				writeJSONError(w, "invalid JSON", http.StatusBadRequest)
 				return
 			}
 			if rule.Name == "" || rule.Metric == "" {
-				http.Error(w, `{"error":"name and metric are required"}`, http.StatusBadRequest)
+				writeJSONError(w, "name and metric are required", http.StatusBadRequest)
 				return
 			}
 			saved, err := r.alerter.AddRule(rule)
 			if err != nil {
-				http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusInternalServerError)
+				writeJSONError(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
@@ -338,7 +397,7 @@ func (r *Registry) alertRulesHandler() http.HandlerFunc {
 			_ = json.NewEncoder(w).Encode(saved)
 
 		default:
-			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			writeJSONError(w, "method not allowed", http.StatusMethodNotAllowed)
 		}
 	}
 }
@@ -347,17 +406,17 @@ func (r *Registry) alertRulesHandler() http.HandlerFunc {
 func (r *Registry) alertRuleDeleteHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, req *http.Request) {
 		if req.Method != http.MethodDelete {
-			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			writeJSONError(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 		// Extract ID from path: /metrics/alerts/rules/{id}
 		id := strings.TrimPrefix(req.URL.Path, "/metrics/alerts/rules/")
 		if id == "" || id == req.URL.Path {
-			http.Error(w, `{"error":"missing rule id"}`, http.StatusBadRequest)
+			writeJSONError(w, "missing rule id", http.StatusBadRequest)
 			return
 		}
 		if err := r.alerter.RemoveRule(id); err != nil {
-			http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusInternalServerError)
+			writeJSONError(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
@@ -381,18 +440,22 @@ func (r *Registry) alertTemplatesHandler() http.HandlerFunc {
 // --- card rendering model --------------------------------------------------
 
 // metricCard is the UI-facing projection of a MetricSnapshot. It carries
-// pre-formatted strings and per-type styling so the templates stay logic-free.
+// pre-formatted strings, the effective body view, and semantic style tokens so
+// the templates stay logic-free.
 type metricCard struct {
 	Snapshot     MetricSnapshot
 	Badge        string // COUNTER / GAUGE / HISTOGRAM
-	BadgeClass   string // tailwind classes for the badge
-	BarClass     string // tailwind classes for histogram bars
+	BadgeTone    string // badge tone token: counter / gauge / histogram / unknown
+	View         string // body view: http / bars / gauge / number
+	Size         string // grid span preset: "" single cell, "md" half width, "lg" full width
 	DisplayValue string // formatted numeric value
 	Unit         string // value unit label
 	Bars         []histBar
-	HTTPColumns  []httpColumn // for HTTP request cards
+	HTTPColumns  []httpColumn // for the HTTP status card
+	HTTPView     string       // status card column set: breakdown / totals
 	// Gauge-specific fields
 	NeedlePct int     // 0..100 needle position for gauges
+	NeedleDeg float64 // -90..+90 SVG rotation matching NeedlePct across the dial arc
 	MinValue  float64 // minimum value for gauge scale
 	MaxValue  float64 // maximum value for gauge scale
 }
@@ -408,10 +471,166 @@ type httpColumn struct {
 	Value        float64
 	DisplayValue string // formatted value
 	HeightPct    int    // 0..100 relative to total
-	ColorClass   string // tailwind color class
+	Tone         string // column tone token: s2xx / s3xx / s4xx / s5xx / total / errors
+}
+
+// cardOptions carries the persisted dashboard customization into the card
+// builders: the HTTP status card view and per-panel chart/size overrides for
+// pinned metrics. Zero values mean server defaults.
+type cardOptions struct {
+	HTTPView string
+	panels   map[string]DashboardPanel // keyed by metric name
+}
+
+// cardOptions snapshots the persisted dashboard document into builder options.
+func (r *Registry) cardOptions() cardOptions {
+	r.dashMu.Lock()
+	d := r.dash
+	r.dashMu.Unlock()
+	o := cardOptions{HTTPView: d.HTTPCardView}
+	if len(d.Panels) > 0 {
+		o.panels = make(map[string]DashboardPanel, len(d.Panels))
+		for _, p := range d.Panels {
+			o.panels[p.Metric] = p
+		}
+	}
+	return o
+}
+
+// applyCardDefaults fills the per-type badge, display, and view fields of a
+// metric card. It is the single source of truth shared by the all-metrics
+// (buildCards) and hooks (buildHookCards) builders so their defaults can never
+// diverge per name-pattern. p carries the pinned panel's chart/size overrides;
+// its zero value keeps the defaults derived from the metric kind, so persisted
+// configs saved before these fields existed render unchanged.
+func applyCardDefaults(c *metricCard, s MetricSnapshot, p DashboardPanel) {
+	switch s.Type {
+	case "counter":
+		c.Badge = "COUNTER"
+		c.BadgeTone = "counter"
+		c.DisplayValue = formatMetricValue(s.Name, s.Value)
+	case "gauge":
+		c.Badge = "GAUGE"
+		c.BadgeTone = "gauge"
+		c.DisplayValue = formatMetricValue(s.Name, s.Value)
+	case "histogram":
+		c.Badge = "HISTOGRAM"
+		c.BadgeTone = "histogram"
+		c.DisplayValue = fmtInt(float64(s.Count))
+		c.Unit = "samples"
+	default:
+		c.Badge = "UNKNOWN"
+		c.BadgeTone = "unknown"
+		c.DisplayValue = formatMetricValue(s.Name, s.Value)
+	}
+
+	// Effective body view: the panel's saved chart type when it can be
+	// honored, else the default derived from the metric kind. A saved bars
+	// type on a bucket-less non-histogram metric falls back to a number
+	// instead of an empty chart; a bucket-less histogram always keeps the
+	// (empty) bars chart, whether the bars view was saved or derived.
+	switch {
+	case p.ChartType == "gauge":
+		c.View = "gauge"
+	case p.ChartType == "bars" && len(s.Buckets) > 0:
+		c.View = "bars"
+	case p.ChartType == "line":
+		c.View = "line"
+	case p.ChartType == "big-number":
+		c.View = "number"
+	default:
+		c.View = defaultCardView(s)
+	}
+	switch c.View {
+	case "gauge":
+		applyGaugeScale(c, s)
+	case "bars":
+		c.Bars = buildBars(s.Buckets)
+	}
+
+	// Grid span preset: the panel's saved size wins, otherwise histograms get
+	// the half-width span their bar rows need. "" is a single cell.
+	switch {
+	case p.Size == "md" || p.Size == "lg":
+		c.Size = p.Size
+	case p.Size == "sm":
+		c.Size = ""
+	case c.View == "bars":
+		c.Size = "md"
+	}
+}
+
+// defaultCardView maps a metric kind to its default dashboard body view.
+func defaultCardView(s MetricSnapshot) string {
+	switch s.Type {
+	case "gauge":
+		return "gauge"
+	case "histogram":
+		return "bars"
+	default:
+		return "number"
+	}
+}
+
+// applyGaugeScale resolves the gauge scale (configured GaugeMin/GaugeMax win,
+// otherwise smart defaults derived from the metric name) and computes the
+// needle position.
+func applyGaugeScale(c *metricCard, s MetricSnapshot) {
+	minVal := s.GaugeMin
+	maxVal := s.GaugeMax
+
+	// Smart defaults based on metric name patterns
+	if maxVal == 0 {
+		// Auto-detect reasonable max based on metric name
+		lowerName := strings.ToLower(s.Name)
+		switch {
+		case strings.Contains(lowerName, "percent") || strings.Contains(lowerName, "pct"):
+			maxVal = 100 // Percentage metrics
+		case strings.Contains(lowerName, "ratio") || strings.Contains(lowerName, "rate"):
+			maxVal = 1 // Ratio/rate metrics
+		case strings.Contains(lowerName, "bytes") || strings.Contains(lowerName, "mem"):
+			maxVal = s.Value * 2 // Memory metrics: 2x current value
+			if maxVal < 1024*1024 {
+				maxVal = 1024 * 1024
+			} // Min 1MB
+		default:
+			maxVal = s.Value * 1.5 // Default: 50% headroom
+			if maxVal < 10 {
+				maxVal = 10
+			} // Minimum scale
+		}
+	}
+
+	// Degenerate range (min == max, or inverted): widen it so the needle
+	// percentage can never divide by zero — a flat scale is widened, never
+	// NaN, never a pinned needle (same approach as Grafana).
+	if maxVal <= minVal {
+		maxVal = minVal + 1
+	}
+
+	c.MaxValue = maxVal
+	c.MinValue = minVal
+	pct := (s.Value - minVal) / (maxVal - minVal) * 100
+	if pct > 100 {
+		pct = 100
+	}
+	if pct < 0 {
+		pct = 0
+	}
+	c.NeedlePct = int(pct)
+	// The dial arc spans ±90° around vertical; map 0..100% onto -90..+90° so
+	// the needle sweeps the whole arc. Rounded to shed float noise (pct*1.8
+	// can land on 27.000000000000004) before the templates print it.
+	c.NeedleDeg = math.Round((pct*1.8-90)*100) / 100
 }
 
 func buildCards(snaps []MetricSnapshot) []metricCard {
+	return buildCardsOpts(snaps, cardOptions{})
+}
+
+// buildCardsOpts builds the All Metrics grid, honoring the persisted
+// dashboard customization (HTTP card view, per-panel chart/size overrides).
+func buildCardsOpts(snaps []MetricSnapshot, o cardOptions) []metricCard {
 	// Filter out individual metrics that are shown in Runtime Health charts and hooks
 	excludedMetrics := map[string]bool{
 		"go_memstats_alloc_bytes":      true,
@@ -424,86 +643,18 @@ func buildCards(snaps []MetricSnapshot) []metricCard {
 
 	cards := make([]metricCard, 0, len(snaps))
 	for _, s := range snaps {
-		// Skip HTTP metrics (they'll be grouped into a single card)
-		if isHTTPMetric(s.Name) {
-			continue
-		}
-		// Skip excluded metrics
-		if excludedMetrics[s.Name] {
-			continue
-		}
-		// Skip hook metrics (they go in the hooks section)
-		if isHookMetric(s.Name) {
+		// Skip HTTP metrics (they'll be grouped into a single card),
+		// excluded runtime metrics, and hook metrics (hooks section).
+		if isHTTPMetric(s.Name) || excludedMetrics[s.Name] || isHookMetric(s.Name) {
 			continue
 		}
 		c := metricCard{Snapshot: s}
-		switch s.Type {
-		case "counter":
-			c.Badge = "COUNTER"
-			c.BadgeClass = "bg-emerald-500/10 text-emerald-400 border-emerald-500/20"
-			c.BarClass = "bg-emerald-500 hover:bg-emerald-400"
-			c.DisplayValue = formatMetricValue(s.Name, s.Value)
-		case "gauge":
-			c.Badge = "GAUGE"
-			c.BadgeClass = "bg-sky-500/10 text-sky-400 border-sky-500/20"
-			c.BarClass = "bg-sky-500 hover:bg-sky-400"
-			c.DisplayValue = formatMetricValue(s.Name, s.Value)
-			// Use configured min/max or apply smart defaults
-			minVal := s.GaugeMin
-			maxVal := s.GaugeMax
-
-			// Smart defaults based on metric name patterns
-			if maxVal == 0 {
-				// Auto-detect reasonable max based on metric name
-				lowerName := strings.ToLower(s.Name)
-				if strings.Contains(lowerName, "percent") || strings.Contains(lowerName, "pct") || strings.Contains(lowerName, "_pct") {
-					maxVal = 100 // Percentage metrics
-				} else if strings.Contains(lowerName, "ratio") || strings.Contains(lowerName, "rate") {
-					maxVal = 1 // Ratio/rate metrics
-				} else if strings.Contains(lowerName, "bytes") || strings.Contains(lowerName, "mem") {
-					maxVal = s.Value * 2 // Memory metrics: 2x current value
-					if maxVal < 1024*1024 {
-						maxVal = 1024 * 1024
-					} // Min 1MB
-				} else {
-					maxVal = s.Value * 1.5 // Default: 50% headroom
-					if maxVal < 10 {
-						maxVal = 10
-					} // Minimum scale
-				}
-			}
-			if minVal == 0 && !strings.Contains(strings.ToLower(s.Name), "temp") {
-				minVal = 0 // Default to 0 unless it's a temperature-like metric
-			}
-
-			c.MaxValue = maxVal
-			c.MinValue = minVal
-			if maxVal > 0 {
-				c.NeedlePct = int((s.Value - minVal) / (maxVal - minVal) * 100)
-				if c.NeedlePct > 100 {
-					c.NeedlePct = 100
-				}
-				if c.NeedlePct < 0 {
-					c.NeedlePct = 0
-				}
-			}
-		case "histogram":
-			c.Badge = "HISTOGRAM"
-			c.BadgeClass = "bg-purple-500/10 text-purple-400 border-purple-500/20"
-			c.BarClass = "bg-purple-500 hover:bg-purple-400"
-			c.DisplayValue = fmtInt(float64(s.Count))
-			c.Unit = "samples"
-			c.Bars = buildBars(s.Buckets)
-		default:
-			c.Badge = "UNKNOWN"
-			c.BadgeClass = "bg-slate-500/10 text-slate-400 border-slate-500/20"
-			c.DisplayValue = formatMetricValue(s.Name, s.Value)
-		}
+		applyCardDefaults(&c, s, o.panels[s.Name])
 		cards = append(cards, c)
 	}
 
 	// Add HTTP request card first if any HTTP metrics exist
-	if httpCards := buildHTTPCard(snaps); httpCards != nil {
+	if httpCards := buildHTTPCardView(snaps, o.HTTPView); httpCards != nil {
 		cards = append(httpCards, cards...)
 	}
 
@@ -518,68 +669,7 @@ func buildHookCards(snaps []MetricSnapshot) []metricCard {
 			continue
 		}
 		c := metricCard{Snapshot: s}
-		switch s.Type {
-		case "counter":
-			c.Badge = "COUNTER"
-			c.BadgeClass = "bg-emerald-500/10 text-emerald-400 border-emerald-500/20"
-			c.BarClass = "bg-emerald-500 hover:bg-emerald-400"
-			c.DisplayValue = formatMetricValue(s.Name, s.Value)
-		case "gauge":
-			c.Badge = "GAUGE"
-			c.BadgeClass = "bg-sky-500/10 text-sky-400 border-sky-500/20"
-			c.BarClass = "bg-sky-500 hover:bg-sky-400"
-			c.DisplayValue = formatMetricValue(s.Name, s.Value)
-			// Use configured min/max or apply smart defaults
-			minVal := s.GaugeMin
-			maxVal := s.GaugeMax
-
-			// Smart defaults based on metric name patterns
-			if maxVal == 0 {
-				// Auto-detect reasonable max based on metric name
-				lowerName := strings.ToLower(s.Name)
-				if strings.Contains(lowerName, "percent") || strings.Contains(lowerName, "pct") || strings.Contains(lowerName, "_pct") {
-					maxVal = 100 // Percentage metrics
-				} else if strings.Contains(lowerName, "ratio") || strings.Contains(lowerName, "rate") {
-					maxVal = 1 // Ratio/rate metrics
-				} else if strings.Contains(lowerName, "bytes") || strings.Contains(lowerName, "mem") {
-					maxVal = s.Value * 2 // Memory metrics: 2x current value
-					if maxVal < 1024*1024 {
-						maxVal = 1024 * 1024
-					} // Min 1MB
-				} else {
-					maxVal = s.Value * 1.5 // Default: 50% headroom
-					if maxVal < 10 {
-						maxVal = 10
-					} // Minimum scale
-				}
-			}
-			if minVal == 0 && !strings.Contains(strings.ToLower(s.Name), "temp") {
-				minVal = 0 // Default to 0 unless it's a temperature-like metric
-			}
-
-			c.MaxValue = maxVal
-			c.MinValue = minVal
-			if maxVal > 0 {
-				c.NeedlePct = int((s.Value - minVal) / (maxVal - minVal) * 100)
-				if c.NeedlePct > 100 {
-					c.NeedlePct = 100
-				}
-				if c.NeedlePct < 0 {
-					c.NeedlePct = 0
-				}
-			}
-		case "histogram":
-			c.Badge = "HISTOGRAM"
-			c.BadgeClass = "bg-purple-500/10 text-purple-400 border-purple-500/20"
-			c.BarClass = "bg-purple-500 hover:bg-purple-400"
-			c.DisplayValue = fmtInt(float64(s.Count))
-			c.Unit = "samples"
-			c.Bars = buildBars(s.Buckets)
-		default:
-			c.Badge = "UNKNOWN"
-			c.BadgeClass = "bg-slate-500/10 text-slate-400 border-slate-500/20"
-			c.DisplayValue = formatMetricValue(s.Name, s.Value)
-		}
+		applyCardDefaults(&c, s, DashboardPanel{})
 		cards = append(cards, c)
 	}
 	return cards
@@ -597,70 +687,80 @@ func isHTTPMetric(name string) bool {
 	return strings.Contains(lowerName, "http") || strings.Contains(lowerName, "request") || strings.Contains(lowerName, "response")
 }
 
-// buildHTTPCard creates a single card grouping all HTTP request metrics by status
-func buildHTTPCard(snaps []MetricSnapshot) []metricCard {
-	// Categorize HTTP metrics by examining their labels for status codes
-	var sum2xx, sum3xx, sum4xx, sum5xx, sumErrors, sumOther float64
-	sum2xx, sum3xx, sum4xx, sum5xx, sumErrors, sumOther = 0, 0, 0, 0, 0, 0
+// httpStatusClasses are the fixed per-class request counters the RED
+// middleware emits (zero label cardinality). The HTTP status card reads them
+// by exact name because the labeled parent metric only carries the last-seen
+// label set — one value series per name is a core design decision.
+var httpStatusClasses = [...]string{"2xx", "3xx", "4xx", "5xx"}
 
+// HTTP status card views.
+const (
+	httpViewBreakdown = "breakdown" // 2xx-5xx columns + total (default)
+	httpViewTotals    = "totals"    // total + errors
+)
+
+func buildHTTPCard(snaps []MetricSnapshot) []metricCard {
+	return buildHTTPCardView(snaps, httpViewBreakdown)
+}
+
+// buildHTTPCardView builds the single HTTP status card from the middleware's
+// fixed per-class counters. view selects the column set: breakdown (2xx-5xx +
+// total) or totals (total + errors). The errors counter is a subset of 4xx+5xx
+// (the middleware counts the same requests), so it is shown alongside the
+// total but never added into it.
+func buildHTTPCardView(snaps []MetricSnapshot, view string) []metricCard {
+	byName := make(map[string]float64, len(snaps))
+	for _, s := range snaps {
+		byName[s.Name] = s.Value
+	}
+
+	var classes [len(httpStatusClasses)]float64
+	classSum := 0.0
+	for i, class := range httpStatusClasses {
+		classes[i] = byName["http_requests_total_"+class]
+		classSum += classes[i]
+	}
+
+	var sumErrors, sumOther float64
 	for _, s := range snaps {
 		if !isHTTPMetric(s.Name) {
 			continue
 		}
 		lowerName := strings.ToLower(s.Name)
-
-		// Skip error-specific metrics, we'll count them separately
+		// The per-class children are read directly above; the labeled parent
+		// counts the same requests, so it only feeds the card when it is the
+		// only total available (no children recorded yet).
+		if strings.HasPrefix(lowerName, "http_requests_total") &&
+			!(lowerName == "http_requests_total" && classSum == 0) {
+			continue
+		}
+		// Error-specific metrics are counted separately.
 		if strings.Contains(lowerName, "error") {
 			sumErrors += s.Value
 			continue
 		}
-
-		// Check labels for status codes
-		categorized := false
-		for _, lv := range s.LabelValues {
-			if lv.Name == "status" {
-				statusCode := lv.Value
-				// Categorize by status code range
-				if strings.HasPrefix(statusCode, "2") {
-					sum2xx += s.Value
-					categorized = true
-					break
-				} else if strings.HasPrefix(statusCode, "3") {
-					sum3xx += s.Value
-					categorized = true
-					break
-				} else if strings.HasPrefix(statusCode, "4") {
-					sum4xx += s.Value
-					categorized = true
-					break
-				} else if strings.HasPrefix(statusCode, "5") {
-					sum5xx += s.Value
-					categorized = true
-					break
-				}
-			}
-		}
-
-		// If not categorized by status code, add to other
-		if !categorized {
-			sumOther += s.Value
-		}
+		sumOther += s.Value
 	}
 
-	// Only show the card if we have HTTP metrics
-	totalHTTP := sum2xx + sum3xx + sum4xx + sum5xx + sumErrors + sumOther
+	totalHTTP := classSum + sumOther
 	if totalHTTP == 0 {
 		return nil
 	}
 
-	// Create columns for the chart
-	columns := []httpColumn{
-		{Label: "2xx", Value: sum2xx, ColorClass: "bg-emerald-500"},
-		{Label: "3xx", Value: sum3xx, ColorClass: "bg-blue-500"},
-		{Label: "4xx", Value: sum4xx, ColorClass: "bg-amber-500"},
-		{Label: "5xx", Value: sum5xx, ColorClass: "bg-rose-500"},
-		{Label: "errors", Value: sumErrors, ColorClass: "bg-red-500"},
-		{Label: "total", Value: totalHTTP, ColorClass: "bg-slate-400"},
+	var columns []httpColumn
+	if view == httpViewTotals {
+		columns = []httpColumn{
+			{Label: "total", Value: totalHTTP, Tone: "total"},
+			{Label: "errors", Value: sumErrors, Tone: "errors"},
+		}
+	} else {
+		columns = []httpColumn{
+			{Label: "2xx", Value: classes[0], Tone: "s2xx"},
+			{Label: "3xx", Value: classes[1], Tone: "s3xx"},
+			{Label: "4xx", Value: classes[2], Tone: "s4xx"},
+			{Label: "5xx", Value: classes[3], Tone: "s5xx"},
+			{Label: "total", Value: totalHTTP, Tone: "total"},
+		}
 	}
 
 	// Format display values for columns
@@ -689,10 +789,13 @@ func buildHTTPCard(snaps []MetricSnapshot) []metricCard {
 	card := metricCard{
 		Snapshot:     MetricSnapshot{Name: "http_requests_total", Description: "HTTP requests by status"},
 		Badge:        "COUNTER",
-		BadgeClass:   "bg-emerald-500/10 text-emerald-400 border-emerald-500/20",
+		BadgeTone:    "counter",
+		View:         "http",
+		Size:         "lg",
 		DisplayValue: fmtInt(totalHTTP),
 		Unit:         "requests",
 		HTTPColumns:  columns,
+		HTTPView:     view,
 	}
 
 	return []metricCard{card}
@@ -809,6 +912,11 @@ var tmplFuncs = template.FuncMap{
 	"fmt": fmtFloat,
 }
 
+// The dashboard shell. Markup uses semantic classes defined in
+// ui/static/styles.css; behavior lives in ui/static/{common,dashboard}.js and
+// the pinned Alpine build, all served from /metrics/static/. The inline
+// bootstrap publishes server-rendered values (poll interval, notifier flag)
+// for the scripts; the theme guard stays inline because it must run pre-paint.
 const dashboardSrc = `<!DOCTYPE html>
 <html lang="en" x-data="{}">
 <head>
@@ -816,13 +924,11 @@ const dashboardSrc = `<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="icon" type="image/x-icon" href="/favicon.ico">
 <title>{{.ProjectName}} Metrics</title>
-<script src="https://cdn.tailwindcss.com"></script>
-<script>tailwind.config={theme:{extend:{fontFamily:{sans:['Inter','system-ui','sans-serif'],mono:['JetBrains Mono','ui-monospace','SFMono-Regular','Menlo','monospace']}}}}</script>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-<script src="https://unpkg.com/htmx.org@1.9.12"></script>
-<script defer src="https://unpkg.com/alpinejs@3.14.1/dist/cdn.min.js"></script>
+<link rel="stylesheet" href="/metrics/static/styles.css">
+<script src="/metrics/static/htmx.min.js" defer></script>
+<script>
+  window.GoLensConfig = { pollMs: {{.PollMs}}, hasNotifier: {{if .HasNotifier}}true{{else}}false{{end}} };
+</script>
 <script>
   // Apply the saved theme before paint to avoid a flash of the wrong theme.
   (function(){
@@ -833,143 +939,109 @@ const dashboardSrc = `<!DOCTYPE html>
     c.remove(t === 'light' ? 'dark' : 'light');
   })();
 </script>
-<style>
-  [x-cloak]{display:none}
-  ::-webkit-scrollbar{height:8px;width:8px}
-  ::-webkit-scrollbar-thumb{background:#334155;border-radius:4px}
-  /* Light theme: remap the dark slate palette to light surfaces/text.
-     Accent colors (emerald/amber/rose/sky/purple) read fine on both. */
-  html.light{color-scheme:light}
-  html.light body{background:#ffffff;color:#0f172a}
-  html.light .bg-slate-950{background-color:#ffffff !important}
-  html.light .bg-slate-950\/80{background-color:rgba(255,255,255,.8) !important}
-  html.light .bg-slate-900{background-color:#f8fafc !important}
-  html.light .bg-slate-800{background-color:#e2e8f0 !important}
-  html.light .bg-slate-800\/80{background-color:rgba(226,232,240,.9) !important}
-  html.light .hover\:bg-slate-800:hover{background-color:#e2e8f0 !important}
-  html.light .hover\:bg-rose-500\/80:hover{background-color:rgba(244,63,94,.85) !important}
-  html.light .hover\:bg-slate-700{border-color:#cbd5e1 !important}
-  html.light .border-slate-800{border-color:#e2e8f0 !important}
-  html.light .border-slate-800\/80{border-color:rgba(226,232,240,.8) !important}
-  html.light .border-slate-700{border-color:#cbd5e1 !important}
-  html.light .text-white{color:#0f172a !important}
-  html.light .text-slate-100{color:#0f172a !important}
-  html.light .text-slate-200{color:#1e293b !important}
-  html.light .text-slate-300{color:#334155 !important}
-  html.light .text-slate-400{color:#475569 !important}
-  html.light .text-slate-500{color:#64748b !important}
-  html.light .text-slate-600{color:#94a3b8 !important}
-  html.light ::-webkit-scrollbar-thumb{background:#cbd5e1}
-</style>
+<script src="/metrics/static/common.js" defer></script>
+<script src="/metrics/static/dashboard.js" defer></script>
+<script defer src="/metrics/static/alpine.min.js"></script>
 </head>
-<body class="bg-slate-950 min-h-screen text-slate-100 font-sans antialiased">
+<body>
 
 <!-- Header -->
-<header class="border-b border-slate-800/80 bg-slate-950/80 backdrop-blur sticky top-0 z-20">
-  <div class="max-w-7xl mx-auto px-6 py-4 flex items-center gap-4 flex-wrap">
-    <div class="flex items-center gap-2 mr-auto">
-      <span class="inline-block w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse"></span>
-      <h1 class="text-lg font-semibold tracking-tight">{{.ProjectName}}</h1>
-      <span class="text-xs text-slate-500 font-mono">{{.DashboardSubtitle}}</span>
+<header class="topbar">
+  <div class="wrap topbar-inner row">
+    <div class="brand grow">
+      <span class="brand-dot"></span>
+      <h1 class="brand-title">{{.ProjectName}}</h1>
+      <span class="brand-sub">{{.DashboardSubtitle}}</span>
     </div>
-    <input id="search" type="text" placeholder="Search metrics..."
-           class="text-sm font-mono px-3 py-1.5 rounded-lg bg-slate-900 border border-slate-800 text-slate-200 placeholder-slate-600 focus:outline-none focus:border-slate-600 w-56"
-           oninput="applyFilter()">
-    <button onclick="document.body.dataset.add='1'"
-            class="text-sm px-3 py-1.5 rounded-lg border border-slate-800 bg-slate-900 hover:bg-slate-800 transition">+ Add Chart</button>
+    <input id="search" type="text" placeholder="Search metrics..." class="search" oninput="applyFilter()">
+    <button onclick="document.body.dataset.add='1'" class="btn">+ Add Chart</button>
     {{if .AlertsEnabled}}
-    <a href="/metrics/alerts"
-       class="text-sm px-3 py-1.5 rounded-lg border border-slate-800 bg-slate-900 hover:bg-slate-800 transition">Alerts</a>
-    <button onclick="document.body.dataset.alertAdd='1'"
-            class="text-sm px-3 py-1.5 rounded-lg border border-slate-800 bg-slate-900 hover:bg-slate-800 transition">+ Add Alert</button>
+    <a href="/metrics/alerts" class="btn">Alerts</a>
+    <button onclick="document.body.dataset.alertAdd='1'" class="btn">+ Add Alert</button>
     {{end}}
-    <label class="text-xs text-slate-500 font-mono flex items-center gap-1.5 cursor-pointer select-none">
-      <input type="checkbox" class="accent-slate-500"
-             onchange="document.body.dataset.paused=this.checked?'1':''"> pause
+    <label class="pause-toggle">
+      <input type="checkbox" class="check" onchange="document.body.dataset.paused=this.checked?'1':''"> pause
     </label>
     <!-- Cooldown ring: depletes over the poll interval, resets on each HTMX refresh -->
-    <div class="relative w-9 h-9" title="next refresh">
-      <svg class="w-9 h-9 -rotate-90" viewBox="0 0 36 36">
+    <div class="cooldown" title="next refresh">
+      <svg viewBox="0 0 36 36">
         <circle cx="18" cy="18" r="14" fill="none" stroke="#1e293b" stroke-width="3"></circle>
-        <circle id="cooldown-ring" cx="18" cy="18" r="14" fill="none" stroke="#34d399"
-                stroke-width="3" stroke-linecap="round"></circle>
+        <circle id="cooldown-ring" cx="18" cy="18" r="14" fill="none" stroke="#34d399" stroke-width="3" stroke-linecap="round"></circle>
       </svg>
-      <span id="cooldown-label" class="absolute inset-0 flex items-center justify-center text-[10px] font-mono text-slate-400">{{.PollSec}}</span>
+      <span id="cooldown-label" class="cooldown-label">{{.PollSec}}</span>
     </div>
     <!-- Theme toggle -->
-    <button id="theme-toggle" title="toggle theme"
-            onclick="toggleTheme()"
-            class="w-9 h-9 rounded-lg border border-slate-800 bg-slate-900 hover:bg-slate-800 text-slate-300 text-base flex items-center justify-center transition">🌙</button>
+    <button id="theme-toggle" title="toggle theme" onclick="toggleTheme()" class="btn btn-icon">🌙</button>
   </div>
 </header>
 
-<main class="max-w-7xl mx-auto px-6 py-6">
+<main class="wrap stack">
   {{if .RuntimeEnabled}}
   <!-- Runtime Health: time-series charts for memory, CPU, goroutines -->
-  <section x-data="runtimeHealth({{.PollMs}})" class="mb-8" x-cloak>
-    <div class="flex items-center gap-2 mb-3 flex-wrap">
-      <h2 class="text-xs font-mono uppercase tracking-wider text-slate-500">Runtime Health</h2>
-      <span class="text-[10px] font-mono text-slate-600">· drag to reorder</span>
-      <div class="flex gap-1 ml-2">
+  <section x-data="runtimeHealth()" x-cloak>
+    <div class="row">
+      <h2 class="section-title">Runtime Health</h2>
+      <span class="meta-faint">· drag to reorder</span>
+      <div class="row-tight">
         <template x-for="d in ['5m','30m','1h','4h','12h','24h','1w']" :key="d">
-          <button @click="duration=d; refresh()"
-                  :class="duration===d ? 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30' : 'bg-slate-800 text-slate-500 border-slate-700 hover:bg-slate-700'"
-                  class="text-[10px] font-mono px-2 py-0.5 rounded border transition" x-text="d"></button>
+          <button @click="duration=d; refresh()" class="pill" :class="duration===d ? 'active' : ''" x-text="d"></button>
         </template>
       </div>
     </div>
 
-    <!-- Runtime charts container for drag-to-reorder -->
-    <div id="runtime-charts" class="space-y-5">
+    <!-- Runtime charts container for drag-to-reorder. Cards carry the
+         rt-card class so the drop handler selects exactly the card elements
+         (never their inner header/legend divs). -->
+    <div id="runtime-charts" class="stack">
       <!-- Memory Overview (full width) -->
       <div draggable="true"
            @dragstart="start(0)" @dragover.prevent @drop="drop(0)" @dragend="drag=null"
-           :class="drag===0 ? 'opacity-40 ring-2 ring-emerald-500/60' : ''"
-           class="bg-slate-900 border border-slate-800 rounded-xl p-5 cursor-grab active:cursor-grabbing">
-        <div class="flex items-center justify-between mb-1">
-          <span class="text-xs font-mono text-slate-400">Memory Overview</span>
-          <div class="flex gap-4">
-            <span class="text-xs font-mono text-slate-500">sys: <span x-text="fmtBytes(currentSysBytes)"></span></span>
-            <span class="text-xs font-mono text-slate-500">heap: <span x-text="fmtBytes(currentHeapInuse)"></span></span>
-            <span class="text-xs font-mono text-slate-500">alloc: <span x-text="fmtBytes(currentMem)"></span></span>
-            <span class="text-xs font-mono text-slate-500">obj: <span x-text="fmtCount(currentHeapObj)"></span></span>
+           :class="drag===0 ? 'dragging' : ''"
+           class="card card-grab rt-card">
+        <div class="card-sub">
+          <span class="card-name">Memory Overview</span>
+          <div class="row-tight meta">
+            <span>sys: <span x-text="fmtBytes(currentSysBytes)"></span></span>
+            <span>heap: <span x-text="fmtBytes(currentHeapInuse)"></span></span>
+            <span>alloc: <span x-text="fmtBytes(currentMem)"></span></span>
+            <span>obj: <span x-text="fmtCount(currentHeapObj)"></span></span>
           </div>
         </div>
-        <canvas id="rt-mem" class="w-full" height="100"></canvas>
-        <div class="flex justify-between text-[10px] font-mono text-slate-600 mt-1">
-          <span class="text-emerald-400">sys bytes</span>
-          <span class="text-teal-400">heap inuse</span>
-          <span class="text-blue-400">alloc bytes</span>
-          <span class="text-amber-400">heap objects (right)</span>
+        <canvas id="rt-mem" class="chart-canvas" height="100"></canvas>
+        <div class="chart-legend">
+          <span class="legend-accent">sys bytes</span>
+          <span class="legend-teal">heap inuse</span>
+          <span class="legend-blue">alloc bytes</span>
+          <span class="legend-amber">heap objects (right)</span>
         </div>
       </div>
 
       <!-- CPU and Goroutines in grid -->
-      <div class="grid grid-cols-1 md:grid-cols-2 gap-5">
+      <div class="grid grid-half">
         <!-- CPU -->
         <div draggable="true"
              @dragstart="start(1)" @dragover.prevent @drop="drop(1)" @dragend="drag=null"
-             :class="drag===1 ? 'opacity-40 ring-2 ring-emerald-500/60' : ''"
-             class="bg-slate-900 border border-slate-800 rounded-xl p-5 cursor-grab active:cursor-grabbing">
-          <div class="flex items-center justify-between mb-1">
-            <span class="text-xs font-mono text-slate-400">CPU Usage</span>
-            <span class="text-xs font-mono text-slate-500" x-text="cpuPct.toFixed(1) + '%'"></span>
+             :class="drag===1 ? 'dragging' : ''"
+             class="card card-grab rt-card">
+          <div class="card-sub">
+            <span class="card-name">CPU Usage</span>
+            <span class="card-name" x-text="cpuPct.toFixed(1) + '%'"></span>
           </div>
-          <canvas id="rt-cpu" class="w-full" height="120"></canvas>
-          <div class="flex justify-between text-[10px] font-mono text-slate-600 mt-1">
+          <canvas id="rt-cpu" class="chart-canvas" height="120"></canvas>
+          <div class="chart-legend">
             <span>cpu %</span><span>goroutines (right)</span>
           </div>
         </div>
         <!-- Goroutines -->
         <div draggable="true"
              @dragstart="start(2)" @dragover.prevent @drop="drop(2)" @dragend="drag=null"
-             :class="drag===2 ? 'opacity-40 ring-2 ring-emerald-500/60' : ''"
-             class="bg-slate-900 border border-slate-800 rounded-xl p-5 cursor-grab active:cursor-grabbing">
-          <div class="flex items-center justify-between mb-1">
-            <span class="text-xs font-mono text-slate-400">App Goroutines</span>
-            <span class="text-xs font-mono text-slate-500" x-text="currentGoro"></span>
+             :class="drag===2 ? 'dragging' : ''"
+             class="card card-grab rt-card">
+          <div class="card-sub">
+            <span class="card-name">App Goroutines</span>
+            <span class="card-name" x-text="currentGoro"></span>
           </div>
-          <canvas id="rt-goro" class="w-full" height="120"></canvas>
+          <canvas id="rt-goro" class="chart-canvas" height="120"></canvas>
         </div>
       </div>
     </div>
@@ -977,29 +1049,27 @@ const dashboardSrc = `<!DOCTYPE html>
   {{end}}
 
   <!-- Histogram Time-Series: bucket distribution evolution over time -->
-  <section x-data="histogramTimeSeries({{.PollMs}})" class="mb-8" x-cloak>
-    <div class="flex items-center gap-2 mb-3 flex-wrap">
-      <h2 class="text-xs font-mono uppercase tracking-wider text-purple-400">Histogram Time-Series</h2>
-      <span class="text-[10px] font-mono text-slate-600">· bucket distribution evolution</span>
-      <div class="flex gap-1 ml-2">
+  <section x-data="histogramTimeSeries()" class="section-histogram" x-cloak>
+    <div class="row">
+      <h2 class="section-title section-title-accent">Histogram Time-Series</h2>
+      <span class="meta-faint">· bucket distribution evolution</span>
+      <div class="row-tight">
         <template x-for="d in ['5m','30m','1h','4h','12h','24h','1w']" :key="d">
-          <button @click="duration=d; refresh()"
-                  :class="duration===d ? 'bg-purple-500/20 text-purple-400 border-purple-500/30' : 'bg-slate-800 text-slate-500 border-slate-700 hover:bg-slate-700'"
-                  class="text-[10px] font-mono px-2 py-0.5 rounded border transition" x-text="d"></button>
+          <button @click="duration=d; refresh()" class="pill" :class="duration===d ? 'active' : ''" x-text="d"></button>
         </template>
       </div>
     </div>
 
     <!-- Histogram charts grid -->
-    <div id="histogram-timeseries" class="grid grid-cols-1 lg:grid-cols-2 gap-5">
+    <div id="histogram-timeseries" class="grid grid-half-lg">
       <template x-for="metric in histogramMetrics" :key="metric.name">
-        <div class="bg-slate-900 border border-slate-800 rounded-xl p-5">
-          <div class="flex items-center justify-between mb-1">
-            <span class="text-xs font-mono text-purple-400" x-text="metric.name"></span>
-            <span class="text-xs font-mono text-slate-500" x-text="metric.description"></span>
+        <div class="card card-static">
+          <div class="card-sub">
+            <span class="card-name card-name-accent" x-text="metric.name"></span>
+            <span class="card-name" x-text="metric.description"></span>
           </div>
-          <canvas :id="'hist-ts-' + metric.name" class="w-full" height="150"></canvas>
-          <div class="flex flex-wrap gap-2 text-[10px] font-mono text-slate-600 mt-1">
+          <canvas :id="'hist-ts-' + metric.name" class="chart-canvas" height="150"></canvas>
+          <div class="chart-legend-bucket">
             <template x-for="(bound, index) in metric.bounds" :key="index">
               <span :class="getBucketColor(index)" x-text="'≤' + formatBound(bound)"></span>
             </template>
@@ -1009,106 +1079,31 @@ const dashboardSrc = `<!DOCTYPE html>
     </div>
 
     <!-- Empty state -->
-    <div x-show="histogramMetrics.length === 0" class="bg-slate-900 border border-slate-800 rounded-xl p-8 text-center">
-      <p class="text-sm font-mono text-slate-500">No histogram metrics with time-series data found.</p>
-      <p class="text-xs font-mono text-slate-600 mt-2">Histogram metrics will appear here after data collection begins.</p>
+    <div x-show="histogramMetrics.length === 0" class="empty-state">
+      <p class="empty-title">No histogram metrics with time-series data found.</p>
+      <p class="empty-hint">Histogram metrics will appear here after data collection begins.</p>
     </div>
   </section>
 
   {{if .HookCards}}
   <!-- Hooks Section: webhook and lifecycle hook metrics -->
-  <section x-data="hooksSection({{.PollMs}})" class="mb-8" x-cloak>
-    <div class="flex items-center gap-2 mb-3">
-      <h2 class="text-xs font-mono uppercase tracking-wider text-slate-500">Hooks</h2>
-      <span class="text-[10px] font-mono text-slate-600">· drag to reorder</span>
+  <section x-data="hooksSection()" x-cloak>
+    <div class="row">
+      <h2 class="section-title">Hooks</h2>
+      <span class="meta-faint">· drag to reorder</span>
     </div>
     <div id="hooks"
          hx-get="/metrics/hooks"
-         hx-trigger="every {{.PollMs}}ms [!document.body.dataset.paused]"
+         hx-trigger="every {{.PollMs}}ms [!document.body.dataset.paused && !document.body.dataset.hidden]"
          hx-swap="innerHTML">
-      <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
-      {{range .HookCards}}
-      {{$c := .}}
-      {{$hist := eq .Snapshot.Type "histogram"}}
-      <div data-metric="{{.Snapshot.Name}}" draggable="true"
-           class="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-sm hover:border-slate-700 transition flex flex-col justify-between cursor-grab active:cursor-grabbing {{if $hist}}md:col-span-2{{end}}">
-        <div>
-          <div class="flex items-center justify-between mb-2 gap-2">
-            <span class="text-[10px] font-mono font-semibold px-2 py-0.5 rounded-full border {{.BadgeClass}}">{{.Badge}}</span>
-            <span class="text-xs text-slate-500 font-mono truncate">{{.Snapshot.Name}}</span>
-          </div>
-          <p class="text-sm text-slate-400">{{or .Snapshot.Description "—"}}</p>
-        </div>
-
-        {{if $hist}}
-          <!-- histogram: CSS flexbox bar chart -->
-          <div class="flex items-end justify-between h-28 gap-1 border-b border-slate-800 mt-4 pb-1">
-            {{range .Bars}}
-            <div class="w-full rounded-t group relative cursor-pointer transition-all {{$c.BarClass}}" style="height:{{.HeightPct}}%">
-              <div class="opacity-0 group-hover:opacity-100 absolute -top-7 left-1/2 -translate-x-1/2 bg-slate-800 text-[10px] px-1.5 py-0.5 rounded font-mono whitespace-nowrap z-10 transition-opacity">{{.Label}}</div>
-            </div>
-            {{end}}
-          </div>
-          <div class="flex justify-between text-[10px] font-mono text-slate-600 mt-1">
-            {{range .Bars}}<span class="truncate">{{.Axis}}</span>{{end}}
-          </div>
-          <div class="flex justify-between text-[11px] font-mono text-slate-400 mt-2">
-            <span>count <span class="text-slate-200">{{.Snapshot.Count}}</span></span>
-            <span>sum <span class="text-slate-200">{{fmt .Snapshot.Sum}}s</span></span>
-            <span>avg <span class="text-slate-200">{{fmt .Snapshot.Avg}}s</span></span>
-          </div>
-        {{else if eq .Snapshot.Type "gauge"}}
-          <!-- gauge: semi-circle with red/green zones -->
-          <div class="mt-4">
-            <div class="relative w-40 h-20 mx-auto overflow-hidden">
-              <!-- Semi-circle gauge -->
-              <div class="absolute inset-0">
-                <!-- Red zone (danger) - left side -->
-                <svg viewBox="0 0 100 50" class="w-full h-full">
-                  <!-- Background arc -->
-                  <path d="M 10 50 A 40 40 0 0 1 90 50" fill="none" stroke="#1e293b" stroke-width="8"/>
-                  <!-- Red zone (0-50%) -->
-                  <path d="M 10 50 A 40 40 0 0 1 50 10" fill="none" stroke="#ef4444" stroke-width="8" stroke-dasharray="62.83" stroke-dashoffset="0"/>
-                  <!-- Green zone (50-100%) -->
-                  <path d="M 50 10 A 40 40 0 0 1 90 50" fill="none" stroke="#22c55e" stroke-width="8" stroke-dasharray="62.83" stroke-dashoffset="0"/>
-                  <!-- Needle -->
-                  <line x1="50" y1="50" x2="50" y2="10" stroke="white" stroke-width="2" transform="rotate({{if .NeedlePct}}{{.NeedlePct}}{{else}}0{{end}} 50 50)" style="transform-origin: 50px 50px;"/>
-                  <!-- Center dot -->
-                  <circle cx="50" cy="50" r="3" fill="white"/>
-                </svg>
-              </div>
-            </div>
-            <div class="flex items-baseline mt-2 justify-center">
-              <span class="text-4xl font-semibold tracking-tight text-white font-mono">{{.DisplayValue}}</span>
-              {{if .Unit}}<span class="text-xs text-slate-500 ml-1.5 font-mono">{{.Unit}}</span>{{end}}
-            </div>
-          </div>
-          {{if .Snapshot.LabelValues}}
-          <div class="mt-3 flex flex-wrap gap-1">
-            {{range .Snapshot.LabelValues}}<span class="text-[10px] font-mono px-1.5 py-0.5 bg-slate-800 text-slate-400 rounded">{{.Name}}={{.Value}}</span>{{end}}
-          </div>
-          {{end}}
-        {{else}}
-          <!-- counter: simple number display -->
-          <div class="mt-4 flex items-baseline">
-            <span class="text-4xl font-semibold tracking-tight text-white font-mono">{{.DisplayValue}}</span>
-            {{if .Unit}}<span class="text-xs text-slate-500 ml-1.5 font-mono">{{.Unit}}</span>{{end}}
-          </div>
-          {{if .Snapshot.LabelValues}}
-          <div class="mt-3 flex flex-wrap gap-1">
-            {{range .Snapshot.LabelValues}}<span class="text-[10px] font-mono px-1.5 py-0.5 bg-slate-800 text-slate-400 rounded">{{.Name}}={{.Value}}</span>{{end}}
-          </div>
-          {{end}}
-        {{end}}
-      </div>
-      {{end}}
-      </div>
+      {{template "cards" .HookCards}}
     </div>
   </section>
   {{end}}
 
-  <!-- My Charts: pinned metrics, persisted in localStorage, drag-to-reorder,
-       kept live by cloning the matching server-rendered card from #charts. -->
+  <!-- My Charts: pinned metrics from the server-persisted dashboard config
+       (localStorage is a fallback cache), drag-to-reorder, kept live by
+       cloning the matching server-rendered card from #charts. -->
   <section x-show="$store.ui.charts.length" x-cloak
            x-data="{ drag: null,
                      start(i){ this.drag = i; },
@@ -1116,70 +1111,69 @@ const dashboardSrc = `<!DOCTYPE html>
                               const c = Alpine.store('ui').charts;
                               const m = c.splice(this.drag, 1)[0];
                               c.splice(i, 0, m);
-                              saveCharts(c);
+                              dashCfg.panels = chartsToPanels(c);
+                              persistDash();
                               this.drag = null;
                               this.$nextTick(() => renderPinned()); } }"
-           x-effect="$store.ui.charts.length; renderPinned()"
-           class="mb-8">
-    <div class="flex items-center gap-2 mb-3">
-      <h2 class="text-xs font-mono uppercase tracking-wider text-slate-500">My Charts</h2>
-      <span class="text-[10px] font-mono text-slate-600" x-text="'(' + $store.ui.charts.length + ')'"></span>
-      <span class="text-[10px] font-mono text-slate-600">· drag to reorder</span>
+           x-effect="$store.ui.charts.length; renderPinned()">
+    <div class="row">
+      <h2 class="section-title">My Charts</h2>
+      <span class="meta-faint" x-text="'(' + $store.ui.charts.length + ')'"></span>
+      <span class="meta-faint">· drag to reorder</span>
     </div>
-    <div id="pinned" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
+    <div id="pinned" class="grid grid-cards">
       <template x-for="(name, idx) in $store.ui.charts" :key="name">
         <div draggable="true"
              @dragstart="start(idx)"
              @dragover.prevent
              @drop="drop(idx)"
              @dragend="drag=null"
-             :class="drag===idx ? 'opacity-40 ring-2 ring-emerald-500/60' : ''"
-             class="relative bg-slate-900 border border-slate-800 rounded-xl overflow-hidden cursor-grab active:cursor-grabbing">
-          <button title="remove" @click="$store.ui.remove(name)"
-                  class="absolute top-2 right-2 z-10 w-6 h-6 rounded-full bg-slate-800/80 hover:bg-rose-500/80 text-slate-300 text-xs flex items-center justify-center">×</button>
+             :class="drag===idx ? 'dragging' : ''"
+             class="card card-grab pin-slot">
+          <button title="remove" @click="$store.ui.remove(name)" class="pin-remove">×</button>
           <div class="pin-body" :data-pin="name"></div>
         </div>
       </template>
     </div>
   </section>
 
-  <h2 class="text-xs font-mono uppercase tracking-wider text-slate-500 mb-3">All Metrics</h2>
+  <h2 class="section-title">All Metrics</h2>
   <div id="charts"
        hx-get="/metrics/data"
-       hx-trigger="every {{.PollMs}}ms [!document.body.dataset.paused]"
+       hx-trigger="every {{.PollMs}}ms [!document.body.dataset.paused && !document.body.dataset.hidden]"
        hx-swap="innerHTML">
-    {{template "cards" .}}
+    {{template "cards" .Cards}}
   </div>
 
   <!-- Endpoint latency: p50 / p95 / p99 per endpoint, polled as JSON,
        drag-to-reorder with persisted order. -->
-  <section x-data="endpointLatency({{.PollMs}})" class="mt-8">
-    <div class="flex items-center gap-2 mb-3">
-      <h2 class="text-xs font-mono uppercase tracking-wider text-slate-500">Endpoint Latency</h2>
-      <span class="text-[10px] font-mono text-slate-600">· drag to reorder</span>
+  <section x-data="endpointLatency()">
+    <div class="row">
+      <h2 class="section-title">Endpoint Latency</h2>
+      <span class="meta-faint">· drag to reorder</span>
     </div>
-    <div x-show="endpoints.length === 0" class="text-xs text-slate-600 font-mono">no endpoint traffic yet.</div>
-    <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
+    <div x-show="endpoints.length === 0" class="meta">no endpoint traffic yet.</div>
+    <div class="grid grid-cards">
       <template x-for="(e, idx) in endpoints" :key="e.method + ' ' + e.path">
         <div draggable="true"
              @dragstart="start(idx)" @dragover.prevent @drop="drop(idx)" @dragend="drag=null"
-             :class="drag===idx ? 'opacity-40 ring-2 ring-emerald-500/60' : ''"
-             class="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-sm flex flex-col cursor-grab active:cursor-grabbing">
-          <div class="flex items-center justify-between mb-2 gap-2">
-            <span class="text-[10px] font-mono px-2 py-0.5 rounded-full border bg-sky-500/10 text-sky-400 border-sky-500/20" x-text="e.method"></span>
-            <span class="text-xs text-slate-400 font-mono truncate" x-text="e.path"></span>
+             :class="drag===idx ? 'dragging' : ''"
+             class="card card-grab">
+          <div class="card-head">
+            <span class="badge badge-method" x-text="e.method"></span>
+            <span class="card-name nowrap" x-text="e.path"></span>
           </div>
-          <div class="text-[11px] text-slate-500 font-mono mb-3"><span x-text="e.count"></span> requests · avg <span x-text="fmt(e.avg)"></span>s</div>
-          <div class="flex items-end justify-between h-24 gap-4 border-b border-slate-800 pb-1">
-            <template x-for="p in [{k:'p50',v:e.p50,c:'bg-emerald-500'},{k:'p95',v:e.p95,c:'bg-amber-500'},{k:'p99',v:e.p99,c:'bg-rose-500'}]" :key="p.k">
-              <div class="flex-1 flex flex-col items-center justify-end h-full group relative">
-                <div :class="p.c" class="w-full rounded-t transition-all" :style="'height:'+h(e,p.v)+'%'"></div>
-                <span class="absolute -top-5 text-[10px] font-mono text-slate-300 opacity-0 group-hover:opacity-100" x-text="fmt(p.v)+'s'"></span>
+          <div class="ep-meta"><span x-text="e.count"></span> requests · avg <span x-text="fmt(e.avg)"></span>s</div>
+          <div class="ep-chart">
+            <template x-for="p in [{k:'p50',v:e.p50,c:'ep-bar-p50'},{k:'p95',v:e.p95,c:'ep-bar-p95'},{k:'p99',v:e.p99,c:'ep-bar-p99'}]" :key="p.k">
+              <div class="ep-col">
+                <div class="ep-col-bar" :class="p.c" :style="'height:'+h(e,p.v)+'%'"></div>
+                <span class="ep-col-tip" x-text="fmt(p.v)+'s'"></span>
               </div>
             </template>
           </div>
-          <div class="flex justify-between text-[10px] font-mono text-slate-500 mt-1">
-            <span class="text-emerald-400">p50</span><span class="text-amber-400">p95</span><span class="text-rose-400">p99</span>
+          <div class="ep-legend">
+            <span class="legend-accent">p50</span><span class="legend-amber">p95</span><span class="legend-rose">p99</span>
           </div>
         </div>
       </template>
@@ -1187,70 +1181,69 @@ const dashboardSrc = `<!DOCTYPE html>
   </section>
 
   <!-- GoLens Internals: cardinality tracking and system stats -->
-  <section x-data="cardinalityPanel({{.PollMs}}, {{.MaxLabelSeries}})" class="mt-8" x-cloak>
-    <button @click="open = !open"
-            class="flex items-center gap-2 mb-3 group cursor-pointer">
-      <svg class="w-3 h-3 text-slate-500 transition-transform" :class="open ? 'rotate-90' : ''" viewBox="0 0 20 20" fill="currentColor">
+  <section x-data="cardinalityPanel({{.MaxLabelSeries}})" x-cloak>
+    <button @click="open = !open" class="disclose">
+      <svg class="disclose-caret" :class="open ? 'disclose-caret-open' : ''" viewBox="0 0 20 20" fill="currentColor">
         <path fill-rule="evenodd" d="M7.21 14.77a.75.75 0 01.02-1.06L11.168 10 7.23 6.29a.75.75 0 111.04-1.08l4.5 4.25a.75.75 0 010 1.08l-4.5 4.25a.75.75 0 01-1.06-.02z" clip-rule="evenodd"/>
       </svg>
-      <h2 class="text-xs font-mono uppercase tracking-wider text-slate-500 group-hover:text-slate-400 transition">{{.ProjectName}} Internals</h2>
-      <span class="text-[10px] font-mono text-slate-600">· cardinality & system</span>
+      <h2 class="section-title">{{.ProjectName}} Internals</h2>
+      <span class="meta-faint">· cardinality &amp; system</span>
     </button>
-    <div x-show="open" x-transition.duration.200ms>
-      <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5 mb-5">
-        <!-- Summary cards -->
-        <div class="bg-slate-900 border border-slate-800 rounded-xl p-5">
-          <div class="text-[10px] font-mono text-slate-500 uppercase mb-1">Total Series</div>
-          <div class="text-2xl font-mono font-semibold text-white" x-text="totalSeries"></div>
-          <div class="text-[10px] font-mono text-slate-600 mt-1">across <span x-text="metricCount"></span> metrics</div>
+    <div x-show="open" x-transition.duration.200ms class="stack">
+      <!-- Summary cards -->
+      <div class="grid grid-cards">
+        <div class="stat-tile">
+          <div class="stat-label">Total Series</div>
+          <div class="stat-value" x-text="totalSeries"></div>
+          <div class="stat-sub">across <span x-text="metricCount"></span> metrics</div>
         </div>
-        <div class="bg-slate-900 border border-slate-800 rounded-xl p-5">
-          <div class="text-[10px] font-mono text-slate-500 uppercase mb-1">Total Dropped</div>
-          <div class="text-2xl font-mono font-semibold" :class="totalDropped > 0 ? 'text-amber-400' : 'text-emerald-400'" x-text="totalDropped"></div>
-          <div class="text-[10px] font-mono text-slate-600 mt-1">samples rejected by guard</div>
+        <div class="stat-tile">
+          <div class="stat-label">Total Dropped</div>
+          <div class="stat-value" :class="totalDropped > 0 ? 'stat-value-warn' : 'stat-value-ok'" x-text="totalDropped"></div>
+          <div class="stat-sub">samples rejected by guard</div>
         </div>
-        <div class="bg-slate-900 border border-slate-800 rounded-xl p-5">
-          <div class="text-[10px] font-mono text-slate-500 uppercase mb-1">Series Cap</div>
-          <div class="text-2xl font-mono font-semibold text-white" x-text="maxSeries === 0 ? '∞' : maxSeries"></div>
-          <div class="text-[10px] font-mono text-slate-600 mt-1">per metric (<span x-text="maxSeries === 0 ? 'unlimited' : 'configured'"></span>)</div>
+        <div class="stat-tile">
+          <div class="stat-label">Series Cap</div>
+          <div class="stat-value" x-text="maxSeries === 0 ? '∞' : maxSeries"></div>
+          <div class="stat-sub">per metric (<span x-text="maxSeries === 0 ? 'unlimited' : 'configured'"></span>)</div>
         </div>
       </div>
 
       <!-- Per-metric detail table -->
-      <div class="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden">
-        <div class="px-5 py-3 border-b border-slate-800 flex items-center justify-between">
-          <span class="text-xs font-mono text-slate-400">Per-Metric Cardinality</span>
-          <span class="text-[10px] font-mono text-slate-600" x-text="metrics.length + ' metrics'"></span>
+      <div class="data-card">
+        <div class="data-card-head">
+          <span class="meta">Per-Metric Cardinality</span>
+          <span class="meta-faint" x-text="metrics.length + ' metrics'"></span>
         </div>
-        <div class="overflow-x-auto">
-          <table class="w-full text-xs font-mono">
+        <div class="table-scroll">
+          <table class="data-table data-table-dashboard">
             <thead>
-              <tr class="text-slate-500 text-left">
-                <th class="px-5 py-2 font-medium">Metric</th>
-                <th class="px-5 py-2 font-medium text-right">Series</th>
-                <th class="px-5 py-2 font-medium text-right">Cap</th>
-                <th class="px-5 py-2 font-medium text-right">Dropped</th>
-                <th class="px-5 py-2 font-medium">Usage</th>
+              <tr>
+                <th>Metric</th>
+                <th class="cell-num">Series</th>
+                <th class="cell-num">Cap</th>
+                <th class="cell-num">Dropped</th>
+                <th>Usage</th>
               </tr>
             </thead>
             <tbody>
               <template x-for="m in metrics" :key="m.metric_name">
-                <tr class="border-t border-slate-800/50 hover:bg-slate-800/30 transition">
-                  <td class="px-5 py-2 text-slate-300" x-text="m.metric_name"></td>
-                  <td class="px-5 py-2 text-right text-slate-200" x-text="m.series"></td>
-                  <td class="px-5 py-2 text-right text-slate-500" x-text="m.max_series === 0 ? '∞' : m.max_series"></td>
-                  <td class="px-5 py-2 text-right" :class="m.dropped > 0 ? 'text-amber-400' : 'text-slate-500'" x-text="m.dropped"></td>
-                  <td class="px-5 py-2">
-                    <div class="w-full bg-slate-800 rounded-full h-1.5 max-w-[120px]">
-                      <div class="h-1.5 rounded-full transition-all"
-                           :class="usagePct(m) >= 90 ? 'bg-rose-500' : usagePct(m) >= 70 ? 'bg-amber-500' : 'bg-emerald-500'"
+                <tr>
+                  <td class="cell-mono" x-text="m.metric_name"></td>
+                  <td class="cell-num" x-text="m.series"></td>
+                  <td class="cell-dim" x-text="m.max_series === 0 ? '∞' : m.max_series"></td>
+                  <td class="cell-dim" :class="m.dropped > 0 ? 'cell-danger' : ''" x-text="m.dropped"></td>
+                  <td>
+                    <div class="meter">
+                      <div class="meter-fill"
+                           :class="usagePct(m) >= 90 ? 'meter-full' : usagePct(m) >= 70 ? 'meter-warn' : 'meter-ok'"
                            :style="'width:' + Math.min(100, usagePct(m)) + '%'"></div>
                     </div>
                   </td>
                 </tr>
               </template>
               <tr x-show="metrics.length === 0">
-                <td colspan="5" class="px-5 py-4 text-center text-slate-600">No cardinality data yet.</td>
+                <td colspan="5" class="cell-empty">No cardinality data yet.</td>
               </tr>
             </tbody>
           </table>
@@ -1261,7 +1254,9 @@ const dashboardSrc = `<!DOCTYPE html>
 </main>
 
 <!-- Add-chart modal (Alpine): lists all currently-available metrics by default,
-     filtered live by the search box; refreshes whenever the modal opens. -->
+     filtered live by the search box; refreshes whenever the modal opens.
+     Chart type and size apply to the chart being added (empty = the server's
+     per-kind default). -->
 <div x-data="{
         get list(){
           this.$store.ui.add;                       // refresh on open
@@ -1270,22 +1265,41 @@ const dashboardSrc = `<!DOCTYPE html>
         }
      }"
      x-show="$store.ui.add" x-cloak
-     class="fixed inset-0 z-30 flex items-center justify-center bg-black/60" @keydown.escape.window="$store.ui.add=false">
-  <div class="bg-slate-900 border border-slate-800 rounded-xl p-5 w-full max-w-md shadow-xl">
-    <h3 class="text-sm font-semibold mb-3">Add chart from metric</h3>
+     class="modal-overlay" @keydown.escape.window="$store.ui.add=false">
+  <div class="modal modal-sm">
+    <h3 class="modal-title">Add chart from metric</h3>
     <input type="text" placeholder="search metrics..." x-model="$store.ui.name" autofocus
-           @keydown.enter="addChart()"
-           class="w-full text-sm font-mono px-3 py-2 rounded-lg bg-slate-950 border border-slate-800 text-slate-200 placeholder-slate-600 focus:outline-none focus:border-slate-600">
-    <div class="mt-2 max-h-64 overflow-y-auto rounded-lg border border-slate-800 bg-slate-950">
-      <template x-for="m in list" :key="m">
-        <button type="button" @click="$store.ui.name=m; addChart()"
-                class="block w-full text-left text-sm font-mono px-3 py-2 text-slate-300 hover:bg-slate-800 transition" x-text="m"></button>
-      </template>
-      <div x-show="list.length === 0" class="px-3 py-4 text-center text-xs text-slate-600 font-mono">no matching metrics</div>
+           @keydown.enter="addChart()" class="input">
+    <div class="form-cols">
+      <div class="field">
+        <label class="field-label" for="add-chart-type">Chart type</label>
+        <select id="add-chart-type" class="input">
+          <option value="">default</option>
+          <option value="line">line</option>
+          <option value="bars">bars</option>
+          <option value="gauge">gauge</option>
+          <option value="big-number">big number</option>
+        </select>
+      </div>
+      <div class="field field-narrow">
+        <label class="field-label" for="add-chart-size">Size</label>
+        <select id="add-chart-size" class="input">
+          <option value="">default</option>
+          <option value="sm">small</option>
+          <option value="md">medium</option>
+          <option value="lg">large</option>
+        </select>
+      </div>
     </div>
-    <div class="flex justify-end gap-2 mt-4">
-      <button @click="$store.ui.add=false" class="text-sm px-3 py-1.5 rounded-lg border border-slate-800 hover:bg-slate-800">Cancel</button>
-      <button @click="addChart()" class="text-sm px-3 py-1.5 rounded-lg bg-emerald-500/90 hover:bg-emerald-500 text-slate-950 font-medium">Add</button>
+    <div class="modal-list">
+      <template x-for="m in list" :key="m">
+        <button type="button" @click="$store.ui.name=m; addChart()" class="modal-item" x-text="m"></button>
+      </template>
+      <div x-show="list.length === 0" class="modal-empty">no matching metrics</div>
+    </div>
+    <div class="modal-footer">
+      <button @click="$store.ui.add=false" class="btn">Cancel</button>
+      <button @click="addChart()" class="btn-primary">Add</button>
     </div>
   </div>
 </div>
@@ -1301,29 +1315,26 @@ const dashboardSrc = `<!DOCTYPE html>
         }
      }"
      x-show="$store.ui.alertModal" x-cloak
-     class="fixed inset-0 z-30 flex items-center justify-center bg-black/60"
+     class="modal-overlay"
      @keydown.escape.window="$store.ui.closeAlert()">
-  <div class="bg-slate-900 border border-slate-800 rounded-xl p-6 w-full max-w-lg shadow-xl"
-       @click.outside="$store.ui.closeAlert()">
+  <div class="modal modal-lg" @click.outside="$store.ui.closeAlert()">
 
     <!-- Step 1: Pick metric -->
     <template x-if="$store.ui.alertStep === 1">
       <div>
-        <h3 class="text-sm font-semibold mb-3">New Alert — select a metric</h3>
-        <input type="text" placeholder="search metrics..." x-model="$store.ui.alertSearch" autofocus
-               class="w-full text-sm font-mono px-3 py-2 rounded-lg bg-slate-950 border border-slate-800 text-slate-200 placeholder-slate-600 focus:outline-none focus:border-slate-600">
-        <div class="mt-2 max-h-64 overflow-y-auto rounded-lg border border-slate-800 bg-slate-950">
+        <h3 class="modal-title">New Alert — select a metric</h3>
+        <input type="text" placeholder="search metrics..." x-model="$store.ui.alertSearch" autofocus class="input">
+        <div class="modal-list">
           <template x-for="m in filteredMetrics" :key="m.name">
-            <button type="button" @click="$store.ui.selectMetric(m.name)"
-                    class="block w-full text-left text-sm font-mono px-3 py-2 hover:bg-slate-800 transition flex items-center justify-between">
-              <span class="text-slate-300" x-text="m.name"></span>
-              <span class="text-[10px] font-mono px-1.5 py-0.5 rounded bg-slate-800 text-slate-500" x-text="m.type"></span>
+            <button type="button" @click="$store.ui.selectMetric(m.name)" class="modal-item">
+              <span x-text="m.name"></span>
+              <span class="badge" x-text="m.type"></span>
             </button>
           </template>
-          <div x-show="filteredMetrics.length === 0" class="px-3 py-4 text-center text-xs text-slate-600 font-mono">no matching metrics</div>
+          <div x-show="filteredMetrics.length === 0" class="modal-empty">no matching metrics</div>
         </div>
-        <div class="flex justify-end gap-2 mt-4">
-          <button @click="$store.ui.closeAlert()" class="text-sm px-3 py-1.5 rounded-lg border border-slate-800 hover:bg-slate-800">Cancel</button>
+        <div class="modal-footer">
+          <button @click="$store.ui.closeAlert()" class="btn">Cancel</button>
         </div>
       </div>
     </template>
@@ -1331,22 +1342,20 @@ const dashboardSrc = `<!DOCTYPE html>
     <!-- Step 2: Configure rule -->
     <template x-if="$store.ui.alertStep === 2">
       <div>
-        <div class="flex items-center gap-2 mb-4">
-          <button @click="$store.ui.alertStep=1" class="text-xs text-slate-500 hover:text-slate-300 transition">&larr; Back</button>
-          <h3 class="text-sm font-semibold">Configure Alert</h3>
-          <span class="text-[10px] font-mono px-1.5 py-0.5 rounded bg-slate-800 text-slate-500" x-text="$store.ui.alertMetric"></span>
+        <div class="row-tight form-row">
+          <button @click="$store.ui.alertStep=1" class="modal-back">&larr; Back</button>
+          <h3 class="modal-title">Configure Alert</h3>
+          <span class="badge" x-text="$store.ui.alertMetric"></span>
         </div>
         <form @submit.prevent="$store.ui.submitAlert()">
-          <div class="mb-3">
-            <label class="block text-xs text-slate-500 font-mono mb-1">Name</label>
-            <input type="text" x-model="$store.ui.alertForm.name" required placeholder="e.g. High Error Rate"
-                   class="w-full text-sm font-mono px-3 py-2 rounded-lg bg-slate-950 border border-slate-800 text-slate-200 placeholder-slate-600 focus:outline-none focus:border-slate-600">
+          <div class="form-row">
+            <label class="field-label">Name</label>
+            <input type="text" x-model="$store.ui.alertForm.name" required placeholder="e.g. High Error Rate" class="input">
           </div>
-          <div class="flex gap-3 mb-3">
-            <div class="flex-1">
-              <label class="block text-xs text-slate-500 font-mono mb-1">Condition</label>
-              <select x-model="$store.ui.alertForm.condition"
-                      class="w-full text-sm font-mono px-3 py-2 rounded-lg bg-slate-950 border border-slate-800 text-slate-200 focus:outline-none focus:border-slate-600">
+          <div class="form-cols">
+            <div class="field">
+              <label class="field-label">Condition</label>
+              <select x-model="$store.ui.alertForm.condition" class="input">
                 <option value="gt">&gt; Greater than</option>
                 <option value="gte">&ge; Greater or equal</option>
                 <option value="lt">&lt; Less than</option>
@@ -1354,71 +1363,62 @@ const dashboardSrc = `<!DOCTYPE html>
                 <option value="eq">= Equal</option>
               </select>
             </div>
-            <div class="w-32">
-              <label class="block text-xs text-slate-500 font-mono mb-1">Threshold</label>
-              <input type="number" step="any" x-model.number="$store.ui.alertForm.threshold" required placeholder="0"
-                     class="w-full text-sm font-mono px-3 py-2 rounded-lg bg-slate-950 border border-slate-800 text-slate-200 placeholder-slate-600 focus:outline-none focus:border-slate-600">
+            <div class="field field-narrow">
+              <label class="field-label">Threshold</label>
+              <input type="number" step="any" x-model.number="$store.ui.alertForm.threshold" required placeholder="0" class="input">
             </div>
           </div>
-          <div class="mb-3">
-            <label class="block text-xs text-slate-500 font-mono mb-1">Cooldown (e.g. 5m, 1h)</label>
-            <input type="text" x-model="$store.ui.alertForm.cooldown" placeholder="5m"
-                   class="w-full text-sm font-mono px-3 py-2 rounded-lg bg-slate-950 border border-slate-800 text-slate-200 placeholder-slate-600 focus:outline-none focus:border-slate-600">
+          <div class="form-row">
+            <label class="field-label">Cooldown (e.g. 5m, 1h)</label>
+            <input type="text" x-model="$store.ui.alertForm.cooldown" placeholder="5m" class="input">
           </div>
           {{if .HasNotifier}}
-          <div class="border-t border-slate-800 my-4"></div>
-          <p class="text-xs text-slate-500 font-mono mb-3">Email Notification (optional)</p>
-          <div class="mb-3">
-            <label class="block text-xs text-slate-500 font-mono mb-1">To (comma-separated)</label>
-            <input type="text" x-model="$store.ui.alertForm.email_to" placeholder="team@example.com"
-                   class="w-full text-sm font-mono px-3 py-2 rounded-lg bg-slate-950 border border-slate-800 text-slate-200 placeholder-slate-600 focus:outline-none focus:border-slate-600">
+          <hr class="form-sep">
+          <p class="form-note">Email Notification (optional)</p>
+          <div class="form-row">
+            <label class="field-label">To (comma-separated)</label>
+            <input type="text" x-model="$store.ui.alertForm.email_to" placeholder="team@example.com" class="input">
           </div>
-          <div class="mb-3" x-show="$store.ui.alertTemplates.length > 0">
-            <label class="block text-xs text-slate-500 font-mono mb-1">Format</label>
-            <select x-model="$store.ui.alertForm.email_html"
-                    class="w-full text-sm font-mono px-3 py-2 rounded-lg bg-slate-950 border border-slate-800 text-slate-200 focus:outline-none focus:border-slate-600">
+          <div class="form-row" x-show="$store.ui.alertTemplates.length > 0">
+            <label class="field-label">Format</label>
+            <select x-model="$store.ui.alertForm.email_html" class="input">
               <option value="false">Text</option>
               <option value="true">HTML</option>
             </select>
           </div>
-          <div class="mb-3" x-show="$store.ui.alertForm.email_html === 'true' && $store.ui.alertTemplates.length > 0">
-            <label class="block text-xs text-slate-500 font-mono mb-1">Template</label>
-            <select @change="$store.ui.applyTemplate($event.target.value)"
-                    class="w-full text-sm font-mono px-3 py-2 rounded-lg bg-slate-950 border border-slate-800 text-slate-200 focus:outline-none focus:border-slate-600">
+          <div class="form-row" x-show="$store.ui.alertForm.email_html === 'true' && $store.ui.alertTemplates.length > 0">
+            <label class="field-label">Template</label>
+            <select @change="$store.ui.applyTemplate($event.target.value)" class="input">
               <option value="">Custom (edit below)</option>
               <template x-for="t in $store.ui.alertTemplates" :key="t.id">
                 <option :value="t.id" x-text="t.name"></option>
               </template>
             </select>
           </div>
-          <div class="mb-3">
-            <label class="block text-xs text-slate-500 font-mono mb-1">Subject</label>
-            <input type="text" x-model="$store.ui.alertForm.email_subject" placeholder="Alert: {{"{{.RuleName}}"}}"
-                   class="w-full text-sm font-mono px-3 py-2 rounded-lg bg-slate-950 border border-slate-800 text-slate-200 placeholder-slate-600 focus:outline-none focus:border-slate-600">
+          <div class="form-row">
+            <label class="field-label">Subject</label>
+            <input type="text" x-model="$store.ui.alertForm.email_subject" placeholder="Alert: {{"{{.RuleName}}"}}" class="input">
           </div>
-          <div class="mb-4">
-            <label class="block text-xs text-slate-500 font-mono mb-1">Body</label>
-            <textarea x-model="$store.ui.alertForm.email_body" rows="4" placeholder="Custom alert message..."
-                      class="w-full text-sm font-mono px-3 py-2 rounded-lg bg-slate-950 border border-slate-800 text-slate-200 placeholder-slate-600 focus:outline-none focus:border-slate-600 resize-none"></textarea>
+          <div class="form-row">
+            <label class="field-label">Body</label>
+            <textarea x-model="$store.ui.alertForm.email_body" rows="4" placeholder="Custom alert message..." class="input"></textarea>
           </div>
-          <details class="mb-4" x-show="$store.ui.alertForm.email_html === 'true'">
-            <summary class="text-xs text-slate-500 font-mono cursor-pointer hover:text-slate-400 transition">Available template variables</summary>
-            <div class="mt-2 bg-slate-950 border border-slate-800 rounded-lg p-3 text-[11px] font-mono text-slate-400 space-y-0.5">
-              <div><span class="text-emerald-400">{{"{{.RuleName}}"}}</span> — rule name</div>
-              <div><span class="text-emerald-400">{{"{{.Metric}}"}}</span> — metric name</div>
-              <div><span class="text-emerald-400">{{"{{.Value}}"}}</span> — current value</div>
-              <div><span class="text-emerald-400">{{"{{.Threshold}}"}}</span> — threshold</div>
-              <div><span class="text-emerald-400">{{"{{.ConditionLabel}}"}}</span> — condition (&gt;, &lt;, &gt;=, &lt;=, ==)</div>
-              <div><span class="text-emerald-400">{{"{{.FiredAt}}"}}</span> — timestamp</div>
-              <div><span class="text-emerald-400">{{"{{.ProjectName}}"}}</span> — project name</div>
+          <details class="tpl-help" x-show="$store.ui.alertForm.email_html === 'true'">
+            <summary>Available template variables</summary>
+            <div class="tpl-vars">
+              <div><span class="tpl-var-name">{{"{{.RuleName}}"}}</span> — rule name</div>
+              <div><span class="tpl-var-name">{{"{{.Metric}}"}}</span> — metric name</div>
+              <div><span class="tpl-var-name">{{"{{.Value}}"}}</span> — current value</div>
+              <div><span class="tpl-var-name">{{"{{.Threshold}}"}}</span> — threshold</div>
+              <div><span class="tpl-var-name">{{"{{.ConditionLabel}}"}}</span> — condition (&gt;, &lt;, &gt;=, &lt;=, ==)</div>
+              <div><span class="tpl-var-name">{{"{{.FiredAt}}"}}</span> — timestamp</div>
+              <div><span class="tpl-var-name">{{"{{.ProjectName}}"}}</span> — project name</div>
             </div>
           </details>
           {{end}}
-          <div class="flex justify-end gap-2">
-            <button type="button" @click="$store.ui.closeAlert()"
-                    class="text-sm px-3 py-1.5 rounded-lg border border-slate-800 hover:bg-slate-800">Cancel</button>
-            <button type="submit"
-                    class="text-sm px-3 py-1.5 rounded-lg bg-emerald-500/90 hover:bg-emerald-500 text-slate-950 font-medium">Create Alert</button>
+          <div class="modal-footer">
+            <button type="button" @click="$store.ui.closeAlert()" class="btn">Cancel</button>
+            <button type="submit" class="btn-primary">Create Alert</button>
           </div>
         </form>
       </div>
@@ -1428,960 +1428,120 @@ const dashboardSrc = `<!DOCTYPE html>
 </div>
 {{end}}
 
-<script>
-  function applyTheme(t){
-    var c = document.documentElement.classList;
-    c.toggle('light', t === 'light');
-    c.toggle('dark', t !== 'light');
-    try { localStorage.setItem('golens.theme', t); } catch(e){}
-    var btn = document.getElementById('theme-toggle');
-    if (btn) btn.textContent = (t === 'light') ? '☀️' : '🌙';
-  }
-  function toggleTheme(){
-    var light = document.documentElement.classList.contains('light');
-    applyTheme(light ? 'dark' : 'light');
-  }
-  // Sync the toggle button's icon once the DOM is ready.
-  document.addEventListener('DOMContentLoaded', function(){
-    var t = 'dark'; try { t = localStorage.getItem('golens.theme') || 'dark'; } catch(e){}
-    applyTheme(t);
-  });
-
-  function loadCharts(){ try { return JSON.parse(localStorage.getItem('golens.charts') || '[]'); } catch(e){ return []; } }
-  function saveCharts(c){ try { localStorage.setItem('golens.charts', JSON.stringify(c)); } catch(e){} }
-
-  document.addEventListener('alpine:init', () => {
-    Alpine.store('ui', {
-      add: false,
-      name: '',
-      charts: loadCharts(),
-      has(n){ return this.charts.indexOf(n) >= 0; },
-      add(n){ if (n && !this.has(n)) { this.charts.push(n); saveCharts(this.charts); } },
-      remove(n){ this.charts = this.charts.filter(x => x !== n); saveCharts(this.charts); },
-
-      // Alert modal state
-      alertModal: false,
-      alertStep: 1,
-      alertMetric: '',
-      alertSearch: '',
-      alertMetrics: [],
-      alertTemplates: [],
-      alertForm: { name:'', condition:'gt', threshold:0, cooldown:'5m', email_to:'', email_subject:'', email_body:'', email_html:'false' },
-
-      openAlert(){
-        this.alertStep = 1;
-        this.alertMetric = '';
-        this.alertSearch = '';
-        this.alertForm = { name:'', condition:'gt', threshold:0, cooldown:'5m', email_to:'', email_subject:'', email_body:'', email_html:'false' };
-        var self = this;
-        fetch('/metrics/data', {headers:{'Accept':'application/json'}})
-          .then(function(r){ return r.json(); })
-          .then(function(d){ self.alertMetrics = (d||[]).map(function(s){ return {name:s.Name, type:s.Type}; }); })
-          .catch(function(){});
-        fetch('/metrics/alerts/templates', {headers:{'Accept':'application/json'}})
-          .then(function(r){ return r.json(); })
-          .then(function(d){ self.alertTemplates = d || []; })
-          .catch(function(){ self.alertTemplates = []; });
-        this.alertModal = true;
-      },
-
-      applyTemplate(id){
-        if (!id) return;
-        var t = this.alertTemplates.find(function(x){ return x.id === id; });
-        if (t) {
-          this.alertForm.email_subject = t.subject;
-          this.alertForm.email_body = t.body;
-        }
-      },
-
-      selectMetric(name){
-        this.alertMetric = name;
-        this.alertForm.name = name + ' alert';
-        this.alertStep = 2;
-      },
-
-      closeAlert(){
-        this.alertModal = false;
-        this.alertStep = 1;
-      },
-
-      submitAlert(){
-        var body = {
-          name: this.alertForm.name,
-          metric: this.alertMetric,
-          condition: this.alertForm.condition,
-          threshold: this.alertForm.threshold,
-          cooldown: this.alertForm.cooldown,
-          enabled: true
-        };
-        var hasNotifier = {{if .HasNotifier}}true{{else}}false{{end}};
-        if (hasNotifier) {
-          body.email_to = this.alertForm.email_to ? this.alertForm.email_to.split(',').map(function(s){ return s.trim(); }).filter(Boolean) : [];
-          body.email_subject = this.alertForm.email_subject;
-          body.email_body = this.alertForm.email_body;
-          body.email_html = this.alertForm.email_html === 'true';
-        }
-        var self = this;
-        fetch('/metrics/alerts/rules', {
-          method: 'POST',
-          headers: {'Content-Type':'application/json'},
-          body: JSON.stringify(body)
-        }).then(function(r){
-          if (!r.ok) return r.json().then(function(e){ throw new Error(e.error || 'Server error'); });
-          return r.json();
-        }).then(function(){
-          self.closeAlert();
-          showToast('Alert created for ' + self.alertMetric, 'success');
-        }).catch(function(e){ showToast(e.message || 'Failed to create alert'); });
-      }
-    });
-  });
-  // open modal from the header button — always start from a clean state
-  const mo = new MutationObserver(() => {
-    if (document.body.dataset.add === '1') {
-      const ui = Alpine.store('ui');
-      ui.name = '';        // clear any previous search/selection
-      ui.add = true;       // open
-      delete document.body.dataset.add;
-    }
-  });
-  mo.observe(document.body, { attributes: true, attributeFilter: ['data-add'] });
-
-  // open alert modal from the header button
-  const moAlert = new MutationObserver(() => {
-    if (document.body.dataset.alertAdd === '1') {
-      Alpine.store('ui').openAlert();
-      delete document.body.dataset.alertAdd;
-    }
-  });
-  moAlert.observe(document.body, { attributes: true, attributeFilter: ['data-alert-add'] });
-
-  // Add the searched/selected metric as a pinned chart (no navigation).
-  function addChart(){
-    const n = Alpine.store('ui').name;
-    Alpine.store('ui').add = false;
-    if (n) Alpine.store('ui').add(n);
-    Alpine.store('ui').name = '';
-  }
-  function loadOrder(){ try { return JSON.parse(localStorage.getItem('golens.order') || '[]'); } catch(e){ return []; } }
-  function saveOrder(o){ try { localStorage.setItem('golens.order', JSON.stringify(o)); } catch(e){} }
-
-  function metricNames(){
-    return Array.from(document.querySelectorAll('#charts > [data-metric]')).map(el => el.dataset.metric);
-  }
-  function cssEsc(s){ return (window.CSS && CSS.escape) ? CSS.escape(s) : s.replace(/["\\]/g, '\\$&'); }
-  // Clone each pinned metric's server-rendered card from #charts into its slot.
-  function renderPinned(){
-    document.querySelectorAll('#pinned [data-pin]').forEach(body => {
-      const name = body.getAttribute('data-pin');
-      const card = document.querySelector('#charts [data-metric="' + cssEsc(name) + '"]');
-      if (card) { body.innerHTML = card.innerHTML; }
-      else { body.innerHTML = '<div class="p-5 text-xs text-slate-600 font-mono">metric unavailable</div>'; }
-    });
-  }
-  function applyFilter(){
-    const q = (document.getElementById('search').value || '').toLowerCase();
-    document.querySelectorAll('#charts > [data-metric]').forEach(el => {
-      el.style.display = (!q || el.dataset.metric.toLowerCase().indexOf(q) >= 0) ? '' : 'none';
-    });
-  }
-  // sortCharts reorders the All Metrics cards to match the persisted order
-  // (unknown/new metrics appended at the end). Called after every HTMX swap so
-  // the server's order doesn't clobber the user's custom arrangement.
-  function sortCharts(){
-    const grid = document.getElementById('charts');
-    if (!grid) return;
-    const order = loadOrder();
-    const cards = Array.from(grid.querySelectorAll(':scope > [data-metric]'));
-    if (cards.length <= 1) return;
-    const idx = name => { const i = order.indexOf(name); return i < 0 ? Infinity : i; };
-    cards.sort((a, b) => idx(a.dataset.metric) - idx(b.dataset.metric));
-    cards.forEach(c => grid.appendChild(c));
-  }
-
-  // Drag-and-drop for the All Metrics grid. Uses event delegation on the
-  // persistent #charts container so listeners survive HTMX innerHTML swaps.
-  let dragCard = null;
-  function initMetricsDnD(){
-    const grid = document.getElementById('charts');
-    if (!grid) return;
-    grid.addEventListener('dragstart', e => {
-      const card = e.target.closest('[data-metric]');
-      if (!card) return;
-      dragCard = card;
-      card.classList.add('opacity-40', 'ring-2', 'ring-emerald-500/60');
-      e.dataTransfer.effectAllowed = 'move';
-    });
-    grid.addEventListener('dragend', e => {
-      const card = e.target.closest('[data-metric]');
-      if (card) { card.classList.remove('opacity-40', 'ring-2', 'ring-emerald-500/60'); }
-      dragCard = null;
-    });
-    grid.addEventListener('dragover', e => {
-      if (!dragCard) return;
-      const target = e.target.closest('[data-metric]');
-      if (!target || target === dragCard) return;
-      e.preventDefault();
-      const r = target.getBoundingClientRect();
-      const after = (e.clientY - r.top) > r.height / 2;
-      if (after) target.after(dragCard); else target.before(dragCard);
-    });
-    grid.addEventListener('drop', e => {
-      if (!dragCard) return;
-      e.preventDefault();
-      saveOrder(metricNames());   // persist the new arrangement
-    });
-  }
-
-  // After each HTMX swap: restore custom order, reapply search filter, refresh pins.
-  document.body.addEventListener('htmx:afterSwap', () => { sortCharts(); applyFilter(); renderPinned(); initHooksDnD(); });
-
-  function loadEpOrder(){ try { return JSON.parse(localStorage.getItem('golens.eporder') || '[]'); } catch(e){ return []; } }
-  function saveEpOrder(o){ try { localStorage.setItem('golens.eporder', JSON.stringify(o)); } catch(e){} }
-
-  // Per-endpoint latency chart: polls /metrics/endpoints (JSON), renders
-  // p50/p95/p99 bars per endpoint, drag-to-reorder with persisted order.
-  function endpointLatency(pollMs){
-    return {
-      raw: [],
-      bump: 0,
-      drag: null,
-      init(){ this.load(); setInterval(() => this.load(), pollMs); },
-      get endpoints(){
-        this.bump; // reactive trigger for manual reorders
-        const ord = loadEpOrder();
-        const key = e => e.method + ' ' + e.path;
-        const idx = e => { const i = ord.indexOf(key(e)); return i < 0 ? Infinity : i; };
-        return this.raw.slice().sort((a, b) => idx(a) - idx(b));
-      },
-      load(){
-        fetch('/metrics/endpoints').then(r => r.json()).then(d => { this.raw = d || []; }).catch(() => {});
-      },
-      start(i){ this.drag = i; },
-      drop(i){
-        if (this.drag === null || this.drag === i) { this.drag = null; return; }
-        const keys = this.endpoints.map(e => e.method + ' ' + e.path);
-        const moved = keys.splice(this.drag, 1)[0];
-        keys.splice(i, 0, moved);
-        saveEpOrder(keys);
-        this.drag = null;
-        this.bump++;
-      },
-      // Calculate height relative to each endpoint's p99 (the highest bar)
-      h(endpoint, value){
-        const max = endpoint.p99 || 0.001;
-        return Math.max(2, Math.round((value / max) * 100));
-      },
-      fmt(v){ if (v >= 1) return v.toFixed(2); if (v >= 0.01) return v.toFixed(3); return v.toFixed(4); }
-    };
-  }
-
-  // Hooks section: provides drag-and-drop for hook metrics
-  function hooksSection(pollMs){
-    return {
-      drag: null,
-      init(){ this.setupDnD(); },
-      start(i){ this.drag = i; },
-      drop(i){
-        if (this.drag === null || this.drag === i) { this.drag = null; return; }
-        const grid = document.getElementById('hooks');
-        const cards = Array.from(grid.querySelectorAll(':scope > [data-metric]'));
-        if (this.drag < cards.length && i < cards.length) {
-          const dragged = cards[this.drag];
-          const target = cards[i];
-          const parent = dragged.parentNode;
-          const draggedNext = dragged.nextSibling;
-          const targetNext = target.nextSibling;
-          parent.insertBefore(dragged, targetNext);
-          parent.insertBefore(target, draggedNext);
-          // Save new order
-          const names = Array.from(grid.querySelectorAll(':scope > [data-metric]')).map(el => el.dataset.metric);
-          try { localStorage.setItem('golens.hooksorder', JSON.stringify(names)); } catch(e){}
-        }
-        this.drag = null;
-      },
-      setupDnD(){
-        const grid = document.getElementById('hooks');
-        if (!grid) return;
-        // Apply persisted order on load
-        try {
-          const saved = JSON.parse(localStorage.getItem('golens.hooksorder') || '[]');
-          if (saved.length > 0) {
-            const cards = Array.from(grid.querySelectorAll(':scope > [data-metric]'));
-            const idx = name => { const i = saved.indexOf(name); return i < 0 ? Infinity : i; };
-            cards.sort((a, b) => idx(a.dataset.metric) - idx(b.dataset.metric));
-            cards.forEach(c => grid.appendChild(c));
-          }
-        } catch(e){}
-        // Setup drag-and-drop
-        let dragCard = null;
-        grid.addEventListener('dragstart', e => {
-          const card = e.target.closest('[data-metric]');
-          if (!card) return;
-          dragCard = card;
-          card.classList.add('opacity-40', 'ring-2', 'ring-emerald-500/60');
-          e.dataTransfer.effectAllowed = 'move';
-        });
-        grid.addEventListener('dragend', e => {
-          const card = e.target.closest('[data-metric]');
-          if (card) { card.classList.remove('opacity-40', 'ring-2', 'ring-emerald-500/60'); }
-          dragCard = null;
-        });
-        grid.addEventListener('dragover', e => {
-          if (!dragCard) return;
-          const target = e.target.closest('[data-metric]');
-          if (!target || target === dragCard) return;
-          e.preventDefault();
-          const r = target.getBoundingClientRect();
-          const after = (e.clientY - r.top) > r.height / 2;
-          if (after) target.after(dragCard); else target.before(dragCard);
-        });
-        grid.addEventListener('drop', e => {
-          if (!dragCard) return;
-          e.preventDefault();
-          const names = Array.from(grid.querySelectorAll(':scope > [data-metric]')).map(el => el.dataset.metric);
-          try { localStorage.setItem('golens.hooksorder', JSON.stringify(names)); } catch(e){}
-        });
-      }
-    };
-  }
-
-  // Initialize hooks drag-and-drop (called after HTMX swaps)
-  function initHooksDnD(){
-    const grid = document.getElementById('hooks');
-    if (!grid) return;
-    // Apply persisted order
-    try {
-      const saved = JSON.parse(localStorage.getItem('golens.hooksorder') || '[]');
-      if (saved.length > 0) {
-        const cards = Array.from(grid.querySelectorAll(':scope > [data-metric]'));
-        const idx = name => { const i = saved.indexOf(name); return i < 0 ? Infinity : i; };
-        cards.sort((a, b) => idx(a.dataset.metric) - idx(b.dataset.metric));
-        cards.forEach(c => grid.appendChild(c));
-      }
-    } catch(e){}
-  }
-
-  // Cardinality panel: polls /metrics/cardinality and shows per-metric series stats.
-  function cardinalityPanel(pollMs, maxSeries){
-    return {
-      open: false,
-      metrics: [],
-      maxSeries: maxSeries,
-      init(){ this.load(); setInterval(() => { if (this.open) this.load(); }, pollMs); },
-      load(){
-        fetch('/metrics/cardinality').then(r => r.json()).then(d => { this.metrics = d || []; }).catch(() => {});
-      },
-      get totalSeries(){ return this.metrics.reduce((s, m) => s + m.series, 0); },
-      get totalDropped(){ return this.metrics.reduce((s, m) => s + m.dropped, 0); },
-      get metricCount(){ return this.metrics.length; },
-      usagePct(m){
-        if (!m.max_series) return 0;
-        return Math.round((m.series / m.max_series) * 100);
-      }
-    };
-  }
-
-  // Boot: apply persisted All Metrics order + wire up its drag-and-drop.
-  document.addEventListener('DOMContentLoaded', () => { sortCharts(); applyFilter(); initMetricsDnD(); });
-
-  // Cooldown ring: depletes over the poll interval, shows remaining seconds,
-  // resets on each HTMX refresh, and freezes while paused. Turns red when the
-  // previous refresh failed, green when successful.
-  (function(){
-    const pollMs = {{.PollMs}};
-    const ring = document.getElementById('cooldown-ring');
-    const label = document.getElementById('cooldown-label');
-    if (!ring || !label || !pollMs) return;
-    const r = 14;
-    const circ = 2 * Math.PI * r;
-    ring.style.strokeDasharray = circ;
-    ring.style.strokeDashoffset = 0;
-    let start = performance.now();
-    let pausedAt = 0;
-    function frame(now){
-      if (document.body.dataset.paused) {
-        if (!pausedAt) { pausedAt = now; label.textContent = 'II'; }
-      } else {
-        if (pausedAt) { start += now - pausedAt; pausedAt = 0; }
-        const remaining = pollMs - (now - start);
-        const frac = Math.max(0, Math.min(1, remaining / pollMs)); // 1 → 0
-        ring.style.strokeDashoffset = circ * (1 - frac);
-        label.textContent = Math.max(0, Math.ceil(remaining / 1000));
-      }
-      requestAnimationFrame(frame);
-    }
-    requestAnimationFrame(frame);
-    document.body.addEventListener('htmx:afterRequest', (evt) => {
-      start = performance.now();
-      const ok = evt.detail.successful;
-      ring.setAttribute('stroke', ok ? '#34d399' : '#ef4444');
-    });
-  })();
-
-  // --- Runtime Health: time-series charts ---
-  function fmtBytes(b) {
-    if (b < 1024) return b.toFixed(0) + ' B';
-    if (b < 1024*1024) return (b/1024).toFixed(1) + ' KB';
-    if (b < 1024*1024*1024) return (b/(1024*1024)).toFixed(1) + ' MB';
-    return (b/(1024*1024*1024)).toFixed(2) + ' GB';
-  }
-  function fmtCount(n) {
-    if (n < 1000) return n.toString();
-    if (n < 1e6) return (n/1e3).toFixed(1) + 'K';
-    return (n/1e6).toFixed(1) + 'M';
-  }
-
-  function drawChart(canvasId, series, opts) {
-    const canvas = document.getElementById(canvasId);
-    if (!canvas) return;
-    const ctx = canvas.getContext('2d');
-    const dpr = window.devicePixelRatio || 1;
-    const rect = canvas.getBoundingClientRect();
-    canvas.width = rect.width * dpr;
-    canvas.height = rect.height * dpr;
-    ctx.scale(dpr, dpr);
-    const W = rect.width, H = rect.height;
-    const pad = {top:8, right:opts.padRight||8, bottom:20, left:50};
-    const cw = W - pad.left - pad.right;
-    const ch = H - pad.top - pad.bottom;
-
-    ctx.clearRect(0, 0, W, H);
-    if (!series.length || !series[0].points.length) {
-      ctx.fillStyle = '#475569';
-      ctx.font = '11px JetBrains Mono, monospace';
-      ctx.textAlign = 'center';
-      ctx.fillText('no data yet', W/2, H/2);
-      return;
-    }
-
-    // compute global min/max across all series
-    let gMin = Infinity, gMax = -Infinity;
-    series.forEach(s => s.points.forEach(p => {
-      if (p.min !== undefined) gMin = Math.min(gMin, p.min);
-      if (p.max !== undefined) gMax = Math.max(gMax, p.max);
-      gMin = Math.min(gMin, p.v);
-      gMax = Math.max(gMax, p.v);
-    }));
-    if (gMin === gMax) { gMin *= 0.9; gMax *= 1.1; }
-    if (gMin === 0 && gMax === 0) { gMax = 1; }
-    const range = gMax - gMin;
-
-    // time range
-    let tMin = Infinity, tMax = -Infinity;
-    series[0].points.forEach(p => { tMin = Math.min(tMin, p.t); tMax = Math.max(tMax, p.t); });
-    const tRange = tMax - tMin || 1;
-
-    function xPos(t) { return pad.left + ((t - tMin) / tRange) * cw; }
-    function yPos(v) { return pad.top + ch - ((v - gMin) / range) * ch; }
-
-    // grid lines
-    ctx.strokeStyle = '#1e293b';
-    ctx.lineWidth = 1;
-    for (let i = 0; i <= 4; i++) {
-      const y = pad.top + (ch * i / 4);
-      ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(pad.left + cw, y); ctx.stroke();
-    }
-
-    // Y-axis labels
-    ctx.fillStyle = '#475569';
-    ctx.font = '10px JetBrains Mono, monospace';
-    ctx.textAlign = 'right';
-    for (let i = 0; i <= 4; i++) {
-      const v = gMax - (range * i / 4);
-      const y = pad.top + (ch * i / 4);
-      ctx.fillText((opts.fmtY || fmtCount)(v), pad.left - 6, y + 3);
-    }
-
-    // X-axis labels
-    ctx.textAlign = 'center';
-    const steps = Math.min(series[0].points.length, 6);
-    for (let i = 0; i <= steps; i++) {
-      const t = tMin + (tRange * i / steps);
-      const x = xPos(t);
-      const d = new Date(t * 1000);
-      const label = d.getHours().toString().padStart(2,'0') + ':' + d.getMinutes().toString().padStart(2,'0');
-      ctx.fillText(label, x, pad.top + ch + 14);
-    }
-
-    // draw each series
-    const colors = ['#34d399', '#38bdf8', '#f59e0b', '#f472b6'];
-    series.forEach((s, si) => {
-      const color = colors[si % colors.length];
-      const pts = s.points;
-      if (!pts.length) return;
-
-      // min/max band
-      if (pts[0].min !== undefined) {
-        ctx.fillStyle = color + '15';
-        ctx.beginPath();
-        ctx.moveTo(xPos(pts[0].t), yPos(pts[0].max));
-        pts.forEach(p => ctx.lineTo(xPos(p.t), yPos(p.max)));
-        for (let i = pts.length - 1; i >= 0; i--) ctx.lineTo(xPos(pts[i].t), yPos(pts[i].min));
-        ctx.closePath();
-        ctx.fill();
-      }
-
-      // line
-      ctx.strokeStyle = color;
-      ctx.lineWidth = 1.5;
-      ctx.beginPath();
-      pts.forEach((p, i) => {
-        const x = xPos(p.t), y = yPos(p.v);
-        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-      });
-      ctx.stroke();
-
-      // end dot
-      const last = pts[pts.length - 1];
-      ctx.fillStyle = color;
-      ctx.beginPath();
-      ctx.arc(xPos(last.t), yPos(last.v), 3, 0, Math.PI * 2);
-      ctx.fill();
-    });
-  }
-
-  function runtimeHealth(pollMs) {
-    const metrics = [
-      {key:'go_memstats_sys_bytes'},
-      {key:'go_memstats_heap_inuse_bytes'},
-      {key:'go_memstats_alloc_bytes'},
-      {key:'go_memstats_heap_objects'},
-      {key:'cpu_usage_percent'},
-      {key:'go_goroutines'}
-    ];
-    return {
-      duration: '1h',
-      series: {},
-      currentSysBytes: 0, currentHeapInuse: 0, currentMem: 0, currentHeapObj: 0, cpuPct: 0, currentGoro: 0,
-      drag: null,
-      init() { this.refresh(); setInterval(() => this.refresh(), pollMs); },
-      start(i){ this.drag = i; },
-      drop(i){
-        if(this.drag === null || this.drag === i){ this.drag = null; return; }
-        // Reorder the runtime charts by swapping their positions in the DOM
-        const container = document.getElementById('runtime-charts');
-        const cards = container.querySelectorAll(':scope > div, :scope > div > div');
-        if(this.drag < cards.length && i < cards.length){
-          const dragged = cards[this.drag];
-          const target = cards[i];
-          const parent = dragged.parentNode;
-          const draggedNext = dragged.nextSibling;
-          const targetNext = target.nextSibling;
-          parent.insertBefore(dragged, targetNext);
-          parent.insertBefore(target, draggedNext);
-        }
-        this.drag = null;
-      },
-      refresh() {
-        metrics.forEach(m => {
-          fetch('/metrics/history?name=' + m.key + '&duration=' + this.duration)
-            .then(r => r.json())
-            .then(d => {
-              this.series[m.key] = d.points || [];
-              // update current values from last point
-              if (d.points && d.points.length) {
-                const last = d.points[d.points.length - 1].v;
-                if (m.key === 'go_memstats_sys_bytes') this.currentSysBytes = last;
-                if (m.key === 'go_memstats_heap_inuse_bytes') this.currentHeapInuse = last;
-                if (m.key === 'go_memstats_alloc_bytes') this.currentMem = last;
-                if (m.key === 'go_memstats_heap_objects') this.currentHeapObj = last;
-                if (m.key === 'cpu_usage_percent') this.cpuPct = last;
-                if (m.key === 'go_goroutines') this.currentGoro = Math.round(last);
-              }
-              this.draw();
-            }).catch(() => {});
-        });
-        // also fetch current snapshot for live values
-        fetch('/metrics/data?format=json').then(r => r.json()).then(snaps => {
-          (snaps||[]).forEach(s => {
-            if (s.Name === 'go_memstats_sys_bytes') this.currentSysBytes = s.Value;
-            if (s.Name === 'go_memstats_heap_inuse_bytes') this.currentHeapInuse = s.Value;
-            if (s.Name === 'go_memstats_alloc_bytes') this.currentMem = s.Value;
-            if (s.Name === 'go_memstats_heap_objects') this.currentHeapObj = s.Value;
-            if (s.Name === 'cpu_usage_percent') this.cpuPct = s.Value;
-            if (s.Name === 'go_goroutines') this.currentGoro = Math.round(s.Value);
-          });
-        }).catch(() => {});
-      },
-      draw() {
-        // Memory: all 4 metrics (3 byte metrics on left axis, objects on right axis)
-        const memByteSeries = [
-          {points: this.series['go_memstats_sys_bytes']||[]},
-          {points: this.series['go_memstats_heap_inuse_bytes']||[]},
-          {points: this.series['go_memstats_alloc_bytes']||[]}
-        ];
-        drawChart('rt-mem', memByteSeries, {fmtY: fmtBytes, padRight: 50});
-        // overlay heap objects on same canvas with right axis
-        const heapObjPts = this.series['go_memstats_heap_objects']||[];
-        if (heapObjPts.length) {
-          const canvas = document.getElementById('rt-mem');
-          if (canvas) {
-            const ctx = canvas.getContext('2d');
-            const rect = canvas.getBoundingClientRect();
-            const W = rect.width, H = rect.height;
-            const pad = {top:8, right:50, bottom:20, left:50};
-            const cw = W - pad.left - pad.right;
-            const ch = H - pad.top - pad.bottom;
-            let tMin = Infinity, tMax = -Infinity;
-            memByteSeries.forEach(s => s.points.forEach(p => { tMin = Math.min(tMin, p.t); tMax = Math.max(tMax, p.t); }));
-            heapObjPts.forEach(p => { tMin = Math.min(tMin, p.t); tMax = Math.max(tMax, p.t); });
-            const tRange = tMax - tMin || 1;
-            let gMin = Infinity, gMax = -Infinity;
-            heapObjPts.forEach(p => { gMin = Math.min(gMin, p.v); gMax = Math.max(gMax, p.v); });
-            if (gMin === gMax) { gMin *= 0.9; gMax *= 1.1; }
-            const range = gMax - gMin;
-            function xP(t) { return pad.left + ((t - tMin) / tRange) * cw; }
-            function yP(v) { return pad.top + ch - ((v - gMin) / range) * ch; }
-            ctx.strokeStyle = '#f59e0b';
-            ctx.lineWidth = 1.5;
-            ctx.setLineDash([4, 3]);
-            ctx.beginPath();
-            heapObjPts.forEach((p, i) => { i===0 ? ctx.moveTo(xP(p.t), yP(p.v)) : ctx.lineTo(xP(p.t), yP(p.v)); });
-            ctx.stroke();
-            ctx.setLineDash([]);
-            ctx.fillStyle = '#f59e0b';
-            ctx.font = '10px JetBrains Mono, monospace';
-            ctx.textAlign = 'left';
-            for (let i = 0; i <= 4; i++) {
-              const v = gMax - (range * i / 4);
-              ctx.fillText(fmtCount(v), pad.left + cw + 4, pad.top + (ch * i / 4) + 3);
-            }
-          }
-        }
-        // CPU + goroutines (dual axis)
-        const cpuPts = this.series['cpu_usage_percent']||[];
-        const goroPts = this.series['go_goroutines']||[];
-        drawChart('rt-cpu', [{points:cpuPts}], {fmtY: v => v.toFixed(0)+'%', padRight: 40});
-        // overlay goroutines on same canvas
-        if (goroPts.length) {
-          const canvas = document.getElementById('rt-cpu');
-          if (canvas) {
-            const ctx = canvas.getContext('2d');
-            const rect = canvas.getBoundingClientRect();
-            const W = rect.width, H = rect.height;
-            const pad = {top:8, right:40, bottom:20, left:50};
-            const cw = W - pad.left - pad.right;
-            const ch = H - pad.top - pad.bottom;
-            let tMin = Infinity, tMax = -Infinity;
-            cpuPts.forEach(p => { tMin = Math.min(tMin, p.t); tMax = Math.max(tMax, p.t); });
-            goroPts.forEach(p => { tMin = Math.min(tMin, p.t); tMax = Math.max(tMax, p.t); });
-            const tRange = tMax - tMin || 1;
-            let gMin = Infinity, gMax = -Infinity;
-            goroPts.forEach(p => { gMin = Math.min(gMin, p.v); gMax = Math.max(gMax, p.v); });
-            if (gMin === gMax) { gMin *= 0.9; gMax *= 1.1; }
-            const range = gMax - gMin;
-            function xP(t) { return pad.left + ((t - tMin) / tRange) * cw; }
-            function yP(v) { return pad.top + ch - ((v - gMin) / range) * ch; }
-            ctx.strokeStyle = '#38bdf8';
-            ctx.lineWidth = 1.5;
-            ctx.setLineDash([4, 3]);
-            ctx.beginPath();
-            goroPts.forEach((p, i) => { i===0 ? ctx.moveTo(xP(p.t), yP(p.v)) : ctx.lineTo(xP(p.t), yP(p.v)); });
-            ctx.stroke();
-            ctx.setLineDash([]);
-            ctx.fillStyle = '#38bdf8';
-            ctx.font = '10px JetBrains Mono, monospace';
-            ctx.textAlign = 'left';
-            for (let i = 0; i <= 4; i++) {
-              const v = gMax - (range * i / 4);
-              ctx.fillText(Math.round(v).toString(), pad.left + cw + 4, pad.top + (ch * i / 4) + 3);
-            }
-          }
-        }
-        // Goroutines
-        drawChart('rt-goro', [{points: this.series['go_goroutines']||[]}], {fmtY: v => Math.round(v).toString()});
-      }
-    };
-  }
-
-  // Histogram Time-Series component
-  function histogramTimeSeries(pollMs) {
-    return {
-      pollMs: pollMs,
-      duration: '1h',
-      histogramMetrics: [],
-      timer: null,
-
-      init() {
-        this.refresh();
-        this.timer = setInterval(() => this.refresh(), this.pollMs);
-      },
-
-      async refresh() {
-        try {
-          // Fetch all histogram metrics from current data
-          const dataResp = await fetch('/metrics/data?format=json');
-          const metrics = await dataResp.json();
-          const histogramCards = (metrics || []).filter(c => c.Type === 'histogram');
-
-          // Build histogram metrics list
-          this.histogramMetrics = histogramCards.map(card => ({
-            name: card.Name,
-            description: card.Description || '',
-            bounds: (card.Buckets || []).map(b => b.UpperBound).filter(b => b > 0) // Extract bounds from buckets
-          }));
-
-          // Fetch time-series data for each histogram metric
-          for (const metric of this.histogramMetrics) {
-            const historyResp = await fetch('/metrics/history?name=' + encodeURIComponent(metric.name) + '&duration=' + this.duration);
-            const history = await historyResp.json();
-            metric.points = history.points || [];
-            metric.histogramBounds = history.histogram_bounds || [];
-
-            // Render stacked area chart
-            this.renderHistogramChart(metric);
-          }
-        } catch (e) {
-          console.error('Failed to fetch histogram time-series:', e);
-        }
-      },
-
-      renderHistogramChart(metric) {
-        const canvasId = 'hist-ts-' + metric.name;
-        const canvas = document.getElementById(canvasId);
-        if (!canvas || !metric.points.length) return;
-
-        const ctx = canvas.getContext('2d');
-        const rect = canvas.getBoundingClientRect();
-        const W = rect.width, H = rect.height;
-
-        // Handle high-DPI displays
-        const dpr = window.devicePixelRatio || 1;
-        canvas.width = W * dpr;
-        canvas.height = H * dpr;
-        ctx.scale(dpr, dpr);
-
-        const pad = {top: 15, right: 20, bottom: 30, left: 45};
-        const cw = W - pad.left - pad.right;
-        const ch = H - pad.top - pad.bottom;
-
-        // Clear canvas
-        ctx.clearRect(0, 0, W, H);
-
-        // Find time range
-        let tMin = Infinity, tMax = -Infinity;
-        metric.points.forEach(p => {
-          tMin = Math.min(tMin, p.t);
-          tMax = Math.max(tMax, p.t);
-        });
-        const tRange = tMax - tMin || 1;
-
-        // Find max bucket count across all buckets for Y-axis scaling
-        let maxCount = 0;
-        metric.points.forEach(p => {
-          if (p.histogram_buckets) {
-            p.histogram_buckets.forEach(b => {
-              maxCount = Math.max(maxCount, b.Count);
-            });
-          }
-        });
-        if (maxCount === 0) maxCount = 1;
-
-        // Purple color palette for buckets
-        const bucketColors = [
-          'rgba(168, 85, 247, 0.7)',   // purple-500
-          'rgba(139, 92, 246, 0.7)',   // violet-500
-          'rgba(124, 58, 237, 0.7)',   // violet-600
-          'rgba(109, 40, 217, 0.7)',   // violet-700
-          'rgba(88, 28, 135, 0.7)',    // violet-900
-          'rgba(192, 132, 252, 0.7)',  // purple-400
-          'rgba(216, 180, 254, 0.7)',  // purple-300
-        ];
-
-        // Helper functions
-        function xP(t) { return pad.left + ((t - tMin) / tRange) * cw; }
-        function yP(v) { return pad.top + ch - (v / maxCount) * ch; }
-
-        // Draw stacked area chart for each bucket
-        const numBuckets = metric.histogramBounds.length;
-        for (let bucketIdx = 0; bucketIdx < numBuckets; bucketIdx++) {
-          const bound = metric.histogramBounds[bucketIdx];
-          const color = bucketColors[bucketIdx % bucketColors.length];
-
-          ctx.beginPath();
-          ctx.moveTo(xP(tMin), yP(0));
-
-          // Build the stacked area
-          for (const pt of metric.points) {
-            if (!pt.histogram_buckets || !pt.histogram_buckets[bucketIdx]) continue;
-            const bucketData = pt.histogram_buckets[bucketIdx];
-            let cumulativeCount = 0;
-
-            // Sum counts for this bucket and all below it
-            for (let i = 0; i <= bucketIdx; i++) {
-              if (pt.histogram_buckets[i]) {
-                cumulativeCount += pt.histogram_buckets[i].Count;
-              }
-            }
-            ctx.lineTo(xP(pt.t), yP(cumulativeCount));
-          }
-
-          // Close the path
-          ctx.lineTo(xP(tMax), yP(0));
-          ctx.closePath();
-
-          ctx.fillStyle = color;
-          ctx.fill();
-        }
-
-        // Draw axes
-        ctx.strokeStyle = '#475569';
-        ctx.lineWidth = 1;
-        ctx.beginPath();
-        ctx.moveTo(pad.left, pad.top);
-        ctx.lineTo(pad.left, pad.top + ch);
-        ctx.lineTo(pad.left + cw, pad.top + ch);
-        ctx.stroke();
-
-        // Draw Y-axis labels
-        ctx.fillStyle = '#64748b';
-        ctx.font = '10px JetBrains Mono, monospace';
-        ctx.textAlign = 'right';
-        ctx.textBaseline = 'middle';
-        for (let i = 0; i <= 4; i++) {
-          const v = Math.round(maxCount * (1 - i / 4));
-          ctx.fillText(v.toString(), pad.left - 8, pad.top + (ch * i / 4));
-        }
-
-        // Draw X-axis labels (time)
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'top';
-        const timeLabels = 5;
-        for (let i = 0; i < timeLabels; i++) {
-          const t = tMin + (tRange * i / (timeLabels - 1));
-          const x = pad.left + (cw * i / (timeLabels - 1));
-          const date = new Date(t * 1000);
-          const label = date.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false });
-          ctx.fillText(label, x, pad.top + ch + 8);
-        }
-      },
-
-      getBucketColor(index) {
-        const colors = [
-          'text-purple-400', 'text-violet-400', 'text-violet-500',
-          'text-violet-600', 'text-violet-700', 'text-purple-300'
-        ];
-        return colors[index % colors.length];
-      },
-
-      formatBound(bound) {
-        if (bound >= 1) return bound.toFixed(0);
-        if (bound >= 0.01) return bound.toFixed(2);
-        return bound.toFixed(3);
-      }
-    };
-  }
-
-  // Dashboard toast notification
-  var _toastTimer = null;
-  function showToast(msg, type){
-    var el = document.getElementById('dash-toast');
-    if (!el) return;
-    el.textContent = msg;
-    el.className = 'fixed bottom-6 right-6 z-40 max-w-sm px-4 py-2.5 rounded-lg text-sm font-mono shadow-lg border ' +
-      (type === 'success' ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400' : 'bg-rose-500/10 border-rose-500/30 text-rose-400');
-    el.style.display = 'block';
-    if (_toastTimer) clearTimeout(_toastTimer);
-    _toastTimer = setTimeout(function(){ el.style.display = 'none'; }, 4000);
-  }
-</script>
-
 <!-- Toast -->
-<div id="dash-toast" style="display:none"
-     class="fixed bottom-6 right-6 z-40 max-w-sm px-4 py-2.5 rounded-lg text-sm font-mono shadow-lg border"></div>
+<div id="app-toast" class="toast"></div>
 
 </body>
 </html>`
 
+// The card grid, shared by the All Metrics section, the Hooks section, and
+// the HTMX fragment endpoints. Ranges over a []metricCard slice. Each card's
+// body branches on its effective View; Size adds a grid-span preset class.
 const cardsSrc = `{{define "cards"}}
-{{if not .Cards}}
-<div class="text-sm text-slate-500 font-mono py-12 text-center">No metrics recorded yet.</div>
+{{if not .}}
+<div class="empty-inline">No metrics recorded yet.</div>
 {{end}}
-<div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
-{{range .Cards}}
-{{$c := .}}
-{{$hist := eq .Snapshot.Type "histogram"}}
-{{$http := .HTTPColumns}}
+<div class="grid grid-cards">
+{{range .}}
 <div data-metric="{{.Snapshot.Name}}" draggable="true"
-     class="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-sm hover:border-slate-700 transition flex flex-col justify-between cursor-grab active:cursor-grabbing {{if $hist}}md:col-span-2{{end}} {{if $http}}md:col-span-2 lg:col-span-3{{end}}">
+     class="card card-grab{{if .Size}} card-{{.Size}}{{end}}">
   <div>
-    <div class="flex items-center justify-between mb-2 gap-2">
-      <span class="text-[10px] font-mono font-semibold px-2 py-0.5 rounded-full border {{.BadgeClass}}">{{.Badge}}</span>
-      <span class="text-xs text-slate-500 font-mono truncate">{{.Snapshot.Name}}</span>
+    <div class="card-head">
+      <span class="badge badge-{{.BadgeTone}}">{{.Badge}}</span>
+      <span class="card-name nowrap">{{.Snapshot.Name}}</span>
     </div>
-    <p class="text-sm text-slate-400">{{or .Snapshot.Description "—"}}</p>
+    <p class="card-desc">{{or .Snapshot.Description "—"}}</p>
   </div>
 
-  {{if $http}}
+  {{if eq .View "http"}}
+  <div>
     <!-- HTTP request status column chart -->
-    <div class="flex items-end justify-between h-32 gap-3 mt-4 pb-1">
+    <div class="http-chart">
       {{range .HTTPColumns}}
-      <div class="flex-1 flex flex-col items-center justify-end h-full">
-        <div class="w-full rounded-t {{.ColorClass}}" style="height:{{.HeightPct}}%"></div>
-        <span class="text-[10px] font-mono text-slate-600 mt-1 truncate">{{.Label}}</span>
-        <span class="text-[10px] font-mono text-slate-400">{{.DisplayValue}}</span>
+      <div class="http-col">
+        <div class="http-col-bar tone-{{.Tone}}" style="height:{{.HeightPct}}%"></div>
+        <span class="http-col-label">{{.Label}}</span>
+        <span class="http-col-value">{{.DisplayValue}}</span>
       </div>
       {{end}}
     </div>
-  {{else if $hist}}
-    <!-- histogram: CSS flexbox bar chart -->
-    <div class="flex items-end justify-between h-28 gap-1 border-b border-slate-800 mt-4 pb-1">
+    <div class="row-tight http-toggle">
+      <button type="button" class="pill{{if ne .HTTPView "totals"}} active{{end}}" onclick="setHTTPView('breakdown')">breakdown</button>
+      <button type="button" class="pill{{if eq .HTTPView "totals"}} active{{end}}" onclick="setHTTPView('totals')">totals</button>
+    </div>
+  </div>
+  {{else if eq .View "bars"}}
+  <!-- histogram: CSS flexbox bar chart -->
+  <div>
+    <div class="bar-chart">
       {{range .Bars}}
-      <div class="w-full rounded-t group relative cursor-pointer transition-all {{$c.BarClass}}" style="height:{{.HeightPct}}%">
-        <div class="opacity-0 group-hover:opacity-100 absolute -top-7 left-1/2 -translate-x-1/2 bg-slate-800 text-[10px] px-1.5 py-0.5 rounded font-mono whitespace-nowrap z-10 transition-opacity">{{.Label}}</div>
+      <div class="bar bar-histogram" style="height:{{.HeightPct}}%">
+        <div class="bar-tip">{{.Label}}</div>
       </div>
       {{end}}
     </div>
-    <div class="flex justify-between text-[10px] font-mono text-slate-600 mt-1">
-      {{range .Bars}}<span class="truncate">{{.Axis}}</span>{{end}}
+    <div class="bar-axis">
+      {{range .Bars}}<span>{{.Axis}}</span>{{end}}
     </div>
-    <div class="flex justify-between text-[11px] font-mono text-slate-400 mt-2">
-      <span>count <span class="text-slate-200">{{.Snapshot.Count}}</span></span>
-      <span>sum <span class="text-slate-200">{{fmt .Snapshot.Sum}}s</span></span>
-      <span>avg <span class="text-slate-200">{{fmt .Snapshot.Avg}}s</span></span>
+    <div class="bar-stats">
+      <span>count <span>{{.Snapshot.Count}}</span></span>
+      <span>sum <span>{{fmt .Snapshot.Sum}}s</span></span>
+      <span>avg <span>{{fmt .Snapshot.Avg}}s</span></span>
     </div>
-  {{else if eq .Snapshot.Type "gauge"}}
-    <!-- gauge: semi-circle with red/green zones -->
-    <div class="mt-4">
-      <div class="relative w-40 h-20 mx-auto overflow-hidden">
-        <!-- Semi-circle gauge -->
-        <div class="absolute inset-0">
-          <svg viewBox="0 0 100 50" class="w-full h-full">
-            <!-- Background arc -->
-            <path d="M 10 50 A 40 40 0 0 1 90 50" fill="none" stroke="#1e293b" stroke-width="8"/>
-            <!-- Red zone (0-50%) -->
-            <path d="M 10 50 A 40 40 0 0 1 50 10" fill="none" stroke="#ef4444" stroke-width="8" stroke-dasharray="62.83" stroke-dashoffset="0"/>
-            <!-- Green zone (50-100%) -->
-            <path d="M 50 10 A 40 40 0 0 1 90 50" fill="none" stroke="#22c55e" stroke-width="8" stroke-dasharray="62.83" stroke-dashoffset="0"/>
-            <!-- Needle -->
-            <line x1="50" y1="50" x2="50" y2="10" stroke="white" stroke-width="2" transform="rotate({{if .NeedlePct}}{{.NeedlePct}}{{else}}0{{end}} 50 50)" style="transform-origin: 50px 50px;"/>
-            <!-- Center dot -->
-            <circle cx="50" cy="50" r="3" fill="white"/>
-          </svg>
-        </div>
+  </div>
+  {{else if eq .View "gauge"}}
+  <!-- gauge: semi-circle with danger/safe zones -->
+  <div>
+    <div class="gauge">
+      <div class="gauge-dial-box">
+        <svg viewBox="0 0 100 50" class="gauge-dial">
+          <path class="gauge-track" d="M 10 50 A 40 40 0 0 1 90 50" fill="none" stroke-width="8"/>
+          <path class="gauge-zone-danger" d="M 10 50 A 40 40 0 0 1 50 10" fill="none" stroke-width="8" stroke-dasharray="62.83" stroke-dashoffset="0"/>
+          <path class="gauge-zone-safe" d="M 50 10 A 40 40 0 0 1 90 50" fill="none" stroke-width="8" stroke-dasharray="62.83" stroke-dashoffset="0"/>
+          <line class="gauge-needle" x1="50" y1="50" x2="50" y2="10" stroke-width="2" transform="rotate({{.NeedleDeg}} 50 50)" style="transform-origin: 50px 50px;"/>
+          <circle class="gauge-hub" cx="50" cy="50" r="3"/>
+        </svg>
       </div>
-      <div class="flex items-baseline mt-2 justify-center">
-        <span class="text-4xl font-semibold tracking-tight text-white font-mono">{{.DisplayValue}}</span>
-        {{if .Unit}}<span class="text-xs text-slate-500 ml-1.5 font-mono">{{.Unit}}</span>{{end}}
+      <div class="gauge-value-row">
+        <span class="metric-value">{{.DisplayValue}}</span>
+        {{if .Unit}}<span class="metric-unit">{{.Unit}}</span>{{end}}
       </div>
     </div>
     {{if .Snapshot.LabelValues}}
-    <div class="mt-3 flex flex-wrap gap-1">
-      {{range .Snapshot.LabelValues}}<span class="text-[10px] font-mono px-1.5 py-0.5 bg-slate-800 text-slate-400 rounded">{{.Name}}={{.Value}}</span>{{end}}
-    </div>
-  {{end}}
-  {{else}}
-    <!-- counter: simple number display -->
-    <div class="mt-4 flex items-baseline">
-      <span class="text-4xl font-semibold tracking-tight text-white font-mono">{{.DisplayValue}}</span>
-      {{if .Unit}}<span class="text-xs text-slate-500 ml-1.5 font-mono">{{.Unit}}</span>{{end}}
-    </div>
-    {{if .Snapshot.LabelValues}}
-    <div class="mt-3 flex flex-wrap gap-1">
-      {{range .Snapshot.LabelValues}}<span class="text-[10px] font-mono px-1.5 py-0.5 bg-slate-800 text-slate-400 rounded">{{.Name}}={{.Value}}</span>{{end}}
+    <div class="labels-row">
+      {{range .Snapshot.LabelValues}}<span class="chip">{{.Name}}={{.Value}}</span>{{end}}
     </div>
     {{end}}
+  </div>
+  {{else if eq .View "line"}}
+  <!-- line: current value plus a time-series canvas drawn client-side from
+       /metrics/history (see drawLineCharts); the value keeps the card legible
+       before the first draw. -->
+  <div>
+    <div class="metric-value-row">
+      <span class="metric-value">{{.DisplayValue}}</span>
+      {{if .Unit}}<span class="metric-unit">{{.Unit}}</span>{{end}}
+    </div>
+    <canvas class="chart-canvas" data-history="{{.Snapshot.Name}}" height="120"></canvas>
+    {{if .Snapshot.LabelValues}}
+    <div class="labels-row">
+      {{range .Snapshot.LabelValues}}<span class="chip">{{.Name}}={{.Value}}</span>{{end}}
+    </div>
+    {{end}}
+  </div>
+  {{else}}
+  <!-- counter/gauge: number display -->
+  <div>
+    <div class="metric-value-row">
+      <span class="metric-value">{{.DisplayValue}}</span>
+      {{if .Unit}}<span class="metric-unit">{{.Unit}}</span>{{end}}
+    </div>
+    {{if .Snapshot.LabelValues}}
+    <div class="labels-row">
+      {{range .Snapshot.LabelValues}}<span class="chip">{{.Name}}={{.Value}}</span>{{end}}
+    </div>
+    {{end}}
+  </div>
   {{end}}
 </div>
 {{end}}

@@ -24,6 +24,7 @@ package golens
 
 import (
 	"context"
+	"log"
 	"net/http"
 )
 
@@ -37,7 +38,9 @@ const Version = "0.1.0"
 func Handler(cfg Config, next http.Handler) (*Registry, http.Handler) {
 	r, err := New(cfg)
 	if err != nil {
-		// Fall back to defaults on misconfiguration so the app still runs.
+		// Fall back to defaults on misconfiguration so the app still runs —
+		// but never silently: the fallback can drop configured auth.
+		log.Printf("[golens] config rejected, falling back to defaults: %v", err)
 		r, _ = New(DefaultConfig())
 	}
 	_ = r.Start(context.Background())

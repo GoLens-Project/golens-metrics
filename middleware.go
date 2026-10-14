@@ -41,6 +41,15 @@ func (r *Registry) Middleware(next http.Handler) http.Handler {
 
 		r.Record("http_requests_total", 1, labels...)
 
+		// Per-class child counters (fixed names, zero label cardinality) power
+		// the dashboard's HTTP status breakdown. The labeled parent carries
+		// only the last-seen label set, so the breakdown cannot be derived
+		// from it. Statuses outside 2xx-5xx (e.g. 1xx) land in the parent
+		// total only.
+		if class := statusClassName(rec.status); class != "" {
+			r.Record("http_requests_total_"+class, 1)
+		}
+
 		if rec.status >= 400 {
 			r.Record("http_request_errors_total", 1,
 				Label{Name: "method", Value: req.Method},
@@ -55,6 +64,23 @@ func (r *Registry) Middleware(next http.Handler) http.Handler {
 		// normalization) powering the endpoint percentile chart.
 		r.endpoints.Observe(req.Method, req.URL.Path, duration)
 	})
+}
+
+// statusClassName maps a response status to its 2xx-5xx class name, used in
+// the fixed http_requests_total_<class> child counters. Empty for statuses
+// outside those classes.
+func statusClassName(status int) string {
+	switch {
+	case status >= 200 && status < 300:
+		return "2xx"
+	case status >= 300 && status < 400:
+		return "3xx"
+	case status >= 400 && status < 500:
+		return "4xx"
+	case status >= 500 && status < 600:
+		return "5xx"
+	}
+	return ""
 }
 
 // MiddlewareFunc is the same middleware exposed as a standalone function for

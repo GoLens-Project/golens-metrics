@@ -2,6 +2,7 @@ package golens
 
 import (
 	"crypto/subtle"
+	"fmt"
 	"net/http"
 
 	"golang.org/x/crypto/bcrypt"
@@ -28,30 +29,38 @@ func (a authState) active() bool { return a.username != "" && len(a.hash) > 0 }
 // literal value, so both `password: env:GOLENS_ADMIN_PASSWORD` and
 // `password: s3cret` work. A pre-hashed password_hash is honored when no
 // plaintext password is supplied.
-func resolveAuth(a *AuthConfig) authState {
-	a.Password = expandEnv(a.Password)
+//
+// With no password configured, auth is intentionally off and no error is
+// returned. But when a credential IS supplied, auth was intended: a hashing
+// failure (e.g. password > 72 bytes) or a missing username is a startup error,
+// never a silent fallback to an unauthenticated dashboard.
+func resolveAuth(a *AuthConfig) (authState, error) {
+	password := expandEnv(a.Password)
+	// Wipe the plaintext from the caller's config before anything else, so no
+	// path — including a hashing failure — leaves it behind.
+	a.Password = ""
 
 	user := a.Username
 	var hash []byte
 
 	switch {
-	case a.Password != "":
-		h, err := bcrypt.GenerateFromPassword([]byte(a.Password), bcrypt.DefaultCost)
+	case password != "":
+		h, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 		if err != nil {
-			return authState{} // invalid plaintext → auth stays inactive
+			return authState{}, fmt.Errorf("golens: admin password rejected: %w", err)
 		}
 		hash = h
 	case a.PasswordHash != "":
 		hash = []byte(a.PasswordHash)
 	}
 
-	// Wipe the plaintext from the caller's config regardless of which path ran.
-	a.Password = ""
-
-	if user == "" || len(hash) == 0 {
-		return authState{}
+	if len(hash) == 0 {
+		return authState{}, nil // no credential configured: auth stays off
 	}
-	return authState{username: user, hash: hash}
+	if user == "" {
+		return authState{}, fmt.Errorf("golens: admin auth username is required when a password is configured")
+	}
+	return authState{username: user, hash: hash}, nil
 }
 
 // basicAuth wraps an http.HandlerFunc with HTTP Basic Auth (RFC 7617). The

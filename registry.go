@@ -44,6 +44,12 @@ type Registry struct {
 
 	auth authState
 
+	// Dashboard layout document (pinned panels + section order) and its
+	// optional on-disk persistence path. Guarded by dashMu.
+	dashMu   sync.Mutex
+	dash     *DashboardConfig
+	dashPath string
+
 	include []*regexp.Regexp
 	exclude []*regexp.Regexp
 
@@ -66,10 +72,15 @@ func New(cfg Config) (*Registry, error) {
 	cfg.applyDefaults()
 
 	// Resolve optional admin auth before building the Registry so the wiped
-	// config (no plaintext password) is what gets stored on r.cfg.
+	// config (no plaintext password) is what gets stored on r.cfg. A supplied
+	// credential that cannot be honored is a startup failure, not a silent
+	// fallback to an unauthenticated dashboard.
 	auth := authState{}
 	if cfg.UI.Enabled {
-		auth = resolveAuth(&cfg.UI.Auth)
+		var err error
+		if auth, err = resolveAuth(&cfg.UI.Auth); err != nil {
+			return nil, err
+		}
 	}
 
 	r := &Registry{
@@ -82,16 +93,21 @@ func New(cfg Config) (*Registry, error) {
 		auth:    auth,
 	}
 
-	// Compile path filters once.
+	// Compile path filters once. An uncompilable pattern is a startup error,
+	// not a silently dropped filter line.
 	for _, p := range cfg.IncludePatterns {
-		if re, err := regexp.Compile(p); err == nil {
-			r.include = append(r.include, re)
+		re, err := regexp.Compile(p)
+		if err != nil {
+			return nil, fmt.Errorf("golens: invalid include_patterns entry %q: %w", p, err)
 		}
+		r.include = append(r.include, re)
 	}
 	for _, p := range cfg.ExcludePatterns {
-		if re, err := regexp.Compile(p); err == nil {
-			r.exclude = append(r.exclude, re)
+		re, err := regexp.Compile(p)
+		if err != nil {
+			return nil, fmt.Errorf("golens: invalid exclude_patterns entry %q: %w", p, err)
 		}
+		r.exclude = append(r.exclude, re)
 	}
 
 	// Persistence backend.
@@ -148,10 +164,20 @@ func New(cfg Config) (*Registry, error) {
 		r.exporter = newOTLPExporter(cfg.OTLP)
 	}
 
+	// Dashboard layout persistence: load the saved document, falling back to
+	// defaults when unset or unreadable.
+	r.dashPath = cfg.UI.DashboardConfig
+	r.dash = r.loadDashboardConfig()
+
 	// Pre-register the canonical RED metrics so they always exist.
 	r.mustRegister("http_requests_total", CounterType, "Total HTTP requests", []string{"method", "path", "status"}, nil)
 	r.mustRegister("http_request_errors_total", CounterType, "HTTP errors (status >= 400)", []string{"method", "path"}, nil)
 	r.mustRegister("http_request_duration_seconds", HistogramType, "HTTP request latency", []string{"method", "path"}, DefaultHistogramBounds)
+	// Per-class request counters for the dashboard status breakdown (fed by
+	// the middleware; fixed names, no labels).
+	for _, class := range httpStatusClasses {
+		r.mustRegister("http_requests_total_"+class, CounterType, "HTTP requests with "+class+" status", nil, nil)
+	}
 
 	return r, nil
 }
@@ -453,7 +479,15 @@ func (r *Registry) History(name string, dur time.Duration) HistorySeries {
 	from := time.Now().Add(-dur)
 	q := Query{Name: name, From: from, To: time.Now()}
 	aggs, err := r.storage.Query(ctx, q)
-	if err != nil || len(aggs) == 0 {
+	if err != nil {
+		return HistorySeries{Name: name}
+	}
+	// Append the aggregator's in-flight window so a freshly started process
+	// or sparse traffic still yields a current point instead of "no data".
+	if pw, ok := r.agg.partial(name); ok {
+		aggs = append(aggs, pw)
+	}
+	if len(aggs) == 0 {
 		return HistorySeries{Name: name}
 	}
 
@@ -479,11 +513,38 @@ func (r *Registry) History(name string, dur time.Duration) HistorySeries {
 			HistogramBuckets: a.HistogramBuckets,
 		})
 	}
+	// Storage may hold bucket slices in arbitrary order (map-iteration order
+	// is scrambled at flush time); normalize each point to the metric's
+	// bounds order with the overflow bucket last. This also repairs data
+	// already at rest, and matches the client's index-against-bounds layout.
+	if len(histogramBounds) > 0 {
+		for i := range pts {
+			pts[i].HistogramBuckets = orderedBuckets(pts[i].HistogramBuckets, histogramBounds)
+		}
+	}
 	return HistorySeries{
 		Name:            name,
 		Points:          pts,
 		HistogramBounds: histogramBounds,
 	}
+}
+
+// orderedBuckets rebuilds a stored bucket slice into bounds order, with the
+// overflow bucket (UpperBound 0) trailing. Buckets missing from the slice
+// count as zero; unknown boundaries are dropped.
+func orderedBuckets(buckets []HistogramBucket, bounds []float64) []HistogramBucket {
+	byBound := make(map[float64]int64, len(buckets))
+	for _, b := range buckets {
+		byBound[b.UpperBound] = b.Count
+	}
+	out := make([]HistogramBucket, 0, len(bounds)+1)
+	for _, bound := range bounds {
+		out = append(out, HistogramBucket{UpperBound: bound, Count: byBound[bound]})
+	}
+	if c, ok := byBound[0]; ok {
+		out = append(out, HistogramBucket{UpperBound: 0, Count: c})
+	}
+	return out
 }
 
 // EndpointLatency returns per-endpoint latency snapshots (p50/p95/p99) for the

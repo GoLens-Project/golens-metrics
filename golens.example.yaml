@@ -31,6 +31,10 @@ otlp:
 ui:
   enabled: true
   poll_interval: 5s          # HTMX auto-refresh interval
+  # File the dashboard layout (pinned charts, panel and section ordering) is
+  # persisted to via GET/PUT/DELETE /metrics/config. Empty = memory only, and
+  # browsers fall back to localStorage.
+  # dashboard_config: /var/lib/myapp/golens-dashboard.json
 
 # --- Ingestion & memory ---
 # The hot path enqueues onto a bounded channel and never blocks a request. When
