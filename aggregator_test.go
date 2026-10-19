@@ -106,7 +106,7 @@ func TestAggregatorHistogramDeltaWindows(t *testing.T) {
 	}
 	// Each window gained exactly one ≤1 sample — window 2 as a delta of 1
 	// over the baseline, never the lifetime count of 2. Exactly one window
-	// saw the overflow sample.
+	// saw the overflow sample, stored under the histOverflowBound sentinel.
 	for _, agg := range res {
 		for _, b := range agg.HistogramBuckets {
 			if b.UpperBound == 1 && b.Count != 1 {
@@ -117,7 +117,7 @@ func TestAggregatorHistogramDeltaWindows(t *testing.T) {
 	overflowWindows := 0
 	for _, agg := range res {
 		for _, b := range agg.HistogramBuckets {
-			if b.UpperBound == 0 && b.Count > 0 {
+			if b.UpperBound == histOverflowBound && b.Count > 0 {
 				overflowWindows++
 			}
 		}

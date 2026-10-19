@@ -348,6 +348,36 @@ func TestOrderedBuckets(t *testing.T) {
 	}
 }
 
+// Rows written since the overflow sentinel carry the +Inf count under
+// histOverflowBound and normalize to the trailing UpperBound-0 slot. A legacy
+// UpperBound-0 row only means overflow while 0 is not itself a bound — when 0
+// is a real bound, the row is that bound's count and must not be duplicated
+// as overflow.
+func TestOrderedBucketsOverflowMarkers(t *testing.T) {
+	got := orderedBuckets([]HistogramBucket{
+		{UpperBound: histOverflowBound, Count: 7},
+		{UpperBound: 1, Count: 2},
+		{UpperBound: 0.5, Count: 9},
+	}, []float64{0.5, 1})
+	wantCounts := []int64{9, 2, 7}
+	if len(got) != 3 {
+		t.Fatalf("got %d buckets, want 3 (bounds + trailing overflow)", len(got))
+	}
+	for i, c := range wantCounts {
+		if got[i].UpperBound != []float64{0.5, 1, 0}[i] || got[i].Count != c {
+			t.Errorf("bucket[%d] = {bound %v, count %d}, want {bound %v, count %d}", i, got[i].UpperBound, got[i].Count, []float64{0.5, 1, 0}[i], c)
+		}
+	}
+
+	got = orderedBuckets([]HistogramBucket{{UpperBound: 0, Count: 5}}, []float64{0})
+	if len(got) != 1 {
+		t.Fatalf("got %d buckets, want 1 (legacy 0-row is the bound's own count, not overflow)", len(got))
+	}
+	if got[0].UpperBound != 0 || got[0].Count != 5 {
+		t.Errorf("bucket[0] = {bound %v, count %d}, want {bound 0, count 5}", got[0].UpperBound, got[0].Count)
+	}
+}
+
 // History normalizes a scrambled stored bucket slice into bounds order with
 // the overflow bucket last, matching the client's index-against-bounds
 // layout.
@@ -387,6 +417,41 @@ func TestHistoryNormalizesBucketOrder(t *testing.T) {
 	}
 	wantBounds := []float64{0.5, 1, 0} // bounds order, overflow last
 	wantCounts := []int64{3, 2, 1}
+	for i := range wantBounds {
+		if got[i].UpperBound != wantBounds[i] || got[i].Count != wantCounts[i] {
+			t.Errorf("bucket[%d] = {bound %v, count %d}, want {bound %v, count %d}", i, got[i].UpperBound, got[i].Count, wantBounds[i], wantCounts[i])
+		}
+	}
+}
+
+// A histogram with a real 0.0 bound keeps the bound's count and the overflow
+// count distinct end to end: live samples aggregate the overflow count under
+// the histOverflowBound sentinel, storage round-trips it, and History emits
+// bounds order with the overflow count trailing by position.
+func TestHistoryZeroBoundDistinctFromOverflow(t *testing.T) {
+	r := newTestRegistry(t, DefaultConfig())
+	ctx, cancel := context.WithCancel(context.Background())
+	r.Start(ctx)
+	defer func() { cancel(); r.Close() }()
+
+	r.Register("hist_zero_bound", HistogramType, "hist", nil, []float64{0, 1}, 0, 0)
+	r.Record("hist_zero_bound", 0)  // ≤0: bound 0.0
+	r.Record("hist_zero_bound", -3) // ≤0: bound 0.0
+	r.Record("hist_zero_bound", 0.5)
+	r.Record("hist_zero_bound", 9) // above every bound: overflow
+	waitForDrain(r)
+	time.Sleep(20 * time.Millisecond) // let the window flush so History reads one stored point
+
+	series := r.History("hist_zero_bound", time.Hour)
+	if len(series.Points) != 1 {
+		t.Fatalf("got %d points, want 1", len(series.Points))
+	}
+	got := series.Points[0].HistogramBuckets
+	if len(got) != 3 {
+		t.Fatalf("got %d buckets, want 3", len(got))
+	}
+	wantBounds := []float64{0, 1, 0} // bounds order, overflow last by position
+	wantCounts := []int64{2, 1, 1}
 	for i := range wantBounds {
 		if got[i].UpperBound != wantBounds[i] || got[i].Count != wantCounts[i] {
 			t.Errorf("bucket[%d] = {bound %v, count %d}, want {bound %v, count %d}", i, got[i].UpperBound, got[i].Count, wantBounds[i], wantCounts[i])

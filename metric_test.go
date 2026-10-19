@@ -115,6 +115,32 @@ func TestHistogramZeroCount(t *testing.T) {
 	}
 }
 
+// A 0.0 bound keeps its own counter: the overflow (+Inf) bucket lives in a
+// dedicated counter, not the bound-keyed map, so samples at or below 0.0 and
+// samples above every bound never share a count.
+func TestHistogramZeroBoundDistinctFromOverflow(t *testing.T) {
+	m := newMetric("zero_bound", HistogramType, "", nil, []float64{0, 1}, 0, 0)
+	m.Record(0)  // ≤0: bound 0.0
+	m.Record(-2) // ≤0: bound 0.0
+	m.Record(0.5)
+	m.Record(42) // above every bound: overflow
+	s := m.Snapshot()
+	if len(s.Buckets) != 3 {
+		t.Fatalf("buckets = %d, want 3", len(s.Buckets))
+	}
+	want := []struct {
+		bound    float64
+		count    int64
+		overflow bool
+	}{{0, 2, false}, {1, 1, false}, {0, 1, true}}
+	for i, w := range want {
+		b := s.Buckets[i]
+		if b.UpperBound != w.bound || b.Count != w.count || b.Overflow != w.overflow {
+			t.Errorf("bucket[%d] = {bound %v, count %d, overflow %v}, want {bound %v, count %d, overflow %v}", i, b.UpperBound, b.Count, b.Overflow, w.bound, w.count, w.overflow)
+		}
+	}
+}
+
 func floatEq(a, b float64) bool {
 	const eps = 1e-6
 	d := a - b

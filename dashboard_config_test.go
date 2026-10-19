@@ -242,6 +242,41 @@ func TestDashboardConfigPutPersistFailureKeepsLastDoc(t *testing.T) {
 	}
 }
 
+// The persist temp file never outlives the PUT: a failed rename (target path
+// is a directory) and the happy path both leave no <path>.tmp behind.
+func TestDashboardConfigPersistLeavesNoTempFile(t *testing.T) {
+	dir := t.TempDir()
+	cfg := DefaultConfig()
+	// A directory as the file path makes the temp write succeed but the
+	// rename onto the target fail.
+	cfg.UI.DashboardConfig = filepath.Join(dir, "dash.json")
+	if err := os.MkdirAll(cfg.UI.DashboardConfig, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	h := newConfigRegistry(t, cfg).dashboardConfigHandler()
+	tmp := cfg.UI.DashboardConfig + ".tmp"
+
+	rec := configRequest(h, http.MethodPut, `{"version":1,"panels":[{"id":"p1","metric":"m"}]}`)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("PUT status = %d, want 500 (rename onto a directory fails)", rec.Code)
+	}
+	if _, err := os.Stat(tmp); !os.IsNotExist(err) {
+		t.Errorf("failed rename left %s behind", tmp)
+	}
+
+	// Happy path: the rename consumes the temp file; nothing lingers.
+	if err := os.Remove(cfg.UI.DashboardConfig); err != nil {
+		t.Fatal(err)
+	}
+	rec = configRequest(h, http.MethodPut, `{"version":1,"panels":[{"id":"p1","metric":"m"}]}`)
+	if rec.Code != 200 {
+		t.Fatalf("PUT status = %d, body %s", rec.Code, rec.Body.String())
+	}
+	if _, err := os.Stat(tmp); !os.IsNotExist(err) {
+		t.Errorf("successful persist left %s behind", tmp)
+	}
+}
+
 // The saved document drives the card builders: a panel's chart_type and size
 // override the per-kind default, an unhonorable saved chart falls back to the
 // default view, and the HTTP card view selects the column set.

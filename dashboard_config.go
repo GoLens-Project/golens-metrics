@@ -100,6 +100,10 @@ func (r *Registry) persistDashboardConfig(d *DashboardConfig) error {
 		return err
 	}
 	tmp := r.dashPath + ".tmp"
+	// Best-effort cleanup: a failed write (partial file) or a failed rename
+	// must not leave the temp file behind. After a successful rename there is
+	// nothing left to remove and the error is ignored.
+	defer os.Remove(tmp)
 	if err := os.WriteFile(tmp, data, 0o644); err != nil {
 		return err
 	}

@@ -7,6 +7,7 @@ import (
 	"log"
 	"regexp"
 	"runtime"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -530,8 +531,10 @@ func (r *Registry) History(name string, dur time.Duration) HistorySeries {
 }
 
 // orderedBuckets rebuilds a stored bucket slice into bounds order, with the
-// overflow bucket (UpperBound 0) trailing. Buckets missing from the slice
-// count as zero; unknown boundaries are dropped.
+// overflow bucket trailing. Overflow is stored under histOverflowBound; rows
+// written before that sentinel existed carry it as UpperBound 0, which is
+// only recognizable while 0 is not itself a bound. Buckets missing from the
+// slice count as zero; unknown boundaries are dropped.
 func orderedBuckets(buckets []HistogramBucket, bounds []float64) []HistogramBucket {
 	byBound := make(map[float64]int64, len(buckets))
 	for _, b := range buckets {
@@ -541,8 +544,10 @@ func orderedBuckets(buckets []HistogramBucket, bounds []float64) []HistogramBuck
 	for _, bound := range bounds {
 		out = append(out, HistogramBucket{UpperBound: bound, Count: byBound[bound]})
 	}
-	if c, ok := byBound[0]; ok {
+	if c, ok := byBound[histOverflowBound]; ok {
 		out = append(out, HistogramBucket{UpperBound: 0, Count: c})
+	} else if c, ok := byBound[0]; ok && !slices.Contains(bounds, 0) {
+		out = append(out, HistogramBucket{UpperBound: 0, Count: c}) // legacy overflow marker
 	}
 	return out
 }
