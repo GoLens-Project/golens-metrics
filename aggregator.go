@@ -74,8 +74,7 @@ func (a *aggregator) add(name string, v float64, m *Metric) {
 			state = &histState{m: m, last: make(map[float64]int64)}
 			a.lastHist[name] = state
 		}
-		for bound, counter := range m.value.hist {
-			cur := counter.Load()
+		apply := func(bound float64, cur int64) {
 			delta := cur - state.last[bound]
 			if delta < 0 {
 				delta = cur // defensive: counter went backwards on this instance
@@ -83,6 +82,10 @@ func (a *aggregator) add(name string, v float64, m *Metric) {
 			state.last[bound] = cur
 			w.histogramBuckets[bound] += delta
 		}
+		for bound, counter := range m.value.hist {
+			apply(bound, counter.Load())
+		}
+		apply(histOverflowBound, m.value.overflow.Load())
 		m.value.mu.RUnlock()
 	}
 }

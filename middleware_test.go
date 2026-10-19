@@ -4,7 +4,6 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
-	"strconv"
 	"testing"
 	"time"
 )
@@ -55,6 +54,71 @@ func TestMiddlewareRecordsErrors(t *testing.T) {
 	errs, _ := r.Snapshot("http_request_errors_total")
 	if errs.Value != 1 {
 		t.Errorf("errors_total = %v, want 1", errs.Value)
+	}
+}
+
+// The middleware feeds the dashboard's HTTP status breakdown by recording
+// fixed per-class child counters (zero label cardinality) next to the
+// labeled parent.
+func TestMiddlewareRecordsStatusClasses(t *testing.T) {
+	r, cleanup := startTestRegistry(t)
+	defer cleanup()
+
+	h := r.Middleware(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch req.URL.Path {
+		case "/ok":
+			w.WriteHeader(200)
+		case "/redirect":
+			w.WriteHeader(301)
+		case "/notfound":
+			w.WriteHeader(404)
+		default:
+			w.WriteHeader(500)
+		}
+	}))
+
+	for _, path := range []string{"/ok", "/ok", "/redirect", "/notfound", "/boom"} {
+		h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", path, nil))
+	}
+	waitForDrain(r)
+
+	want := map[string]float64{
+		"http_requests_total_2xx": 2,
+		"http_requests_total_3xx": 1,
+		"http_requests_total_4xx": 1,
+		"http_requests_total_5xx": 1,
+	}
+	for name, wantN := range want {
+		s, ok := r.Snapshot(name)
+		if !ok {
+			t.Errorf("%s not recorded", name)
+			continue
+		}
+		if s.Value != wantN {
+			t.Errorf("%s = %v, want %v", name, s.Value, wantN)
+		}
+	}
+}
+
+func TestStatusClassName(t *testing.T) {
+	cases := map[int]string{
+		0:   "",
+		100: "",
+		199: "",
+		200: "2xx",
+		299: "2xx",
+		300: "3xx",
+		399: "3xx",
+		400: "4xx",
+		499: "4xx",
+		500: "5xx",
+		599: "5xx",
+		600: "",
+	}
+	for status, want := range cases {
+		if got := statusClassName(status); got != want {
+			t.Errorf("statusClassName(%d) = %q, want %q", status, got, want)
+		}
 	}
 }
 
@@ -137,67 +201,5 @@ func TestMiddlewareFuncEquivalent(t *testing.T) {
 	s, _ := r.Snapshot("http_requests_total")
 	if s.Value != 1 {
 		t.Errorf("MiddlewareFunc did not record: %v", s.Value)
-	}
-}
-
-func TestStatusClassName(t *testing.T) {
-	tests := []struct {
-		status int
-		want   string
-	}{
-		{100, ""}, {199, ""}, // informational statuses have no class counter
-		{200, "2xx"}, {204, "2xx"}, {299, "2xx"},
-		{301, "3xx"}, {399, "3xx"},
-		{400, "4xx"}, {404, "4xx"}, {499, "4xx"},
-		{500, "5xx"}, {503, "5xx"}, {599, "5xx"},
-		{600, ""},
-	}
-	for _, tc := range tests {
-		if got := statusClassName(tc.status); got != tc.want {
-			t.Errorf("statusClassName(%d) = %q, want %q", tc.status, got, tc.want)
-		}
-	}
-}
-
-// The middleware maintains the fixed per-class child counters that power the
-// dashboard's HTTP status breakdown; statuses outside 2xx-5xx land in the
-// parent total only.
-func TestMiddlewareRecordsStatusClassCounters(t *testing.T) {
-	tests := []struct {
-		status    int
-		wantClass string
-	}{
-		{200, "2xx"},
-		{302, "3xx"},
-		{404, "4xx"},
-		{500, "5xx"},
-		{101, ""}, // switching protocols: parent total only
-	}
-	for _, tc := range tests {
-		t.Run(strconv.Itoa(tc.status), func(t *testing.T) {
-			r, cleanup := startTestRegistry(t)
-			defer cleanup()
-
-			h := r.Middleware(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-				w.WriteHeader(tc.status)
-			}))
-			h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/orders", nil))
-			waitForDrain(r)
-
-			total, _ := r.Snapshot("http_requests_total")
-			if total.Value != 1 {
-				t.Errorf("http_requests_total = %v, want 1", total.Value)
-			}
-			for _, class := range []string{"2xx", "3xx", "4xx", "5xx"} {
-				want := 0.0
-				if class == tc.wantClass {
-					want = 1
-				}
-				s, _ := r.Snapshot("http_requests_total_" + class)
-				if s.Value != want {
-					t.Errorf("http_requests_total_%s = %v, want %v", class, s.Value, want)
-				}
-			}
-		})
 	}
 }

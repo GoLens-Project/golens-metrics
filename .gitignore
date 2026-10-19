@@ -24,6 +24,3 @@ i*.swp
 
 #config
 .daedalus/
-
-# Working notes (design/decision docs live in the tasks folder)
-backlog/

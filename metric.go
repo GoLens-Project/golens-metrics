@@ -1,6 +1,7 @@
 package golens
 
 import (
+	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -70,6 +71,7 @@ type metricValue struct {
 	counter    atomic.Int64 // fixed-point (scaled) for counter/gauge
 	gauge      atomic.Int64
 	hist       map[float64]*atomic.Int64 // bucket boundary -> count
+	overflow   atomic.Int64              // +Inf bucket count; kept out of hist so a real 0.0 bound cannot share it
 	bounds     []float64
 	sum        atomic.Int64
 	count      atomic.Int64
@@ -94,13 +96,11 @@ func newMetric(name string, mtype MetricType, desc string, labels []string, boun
 			bounds = DefaultHistogramBounds
 		}
 		m.value.bounds = bounds
-		m.value.hist = make(map[float64]*atomic.Int64, len(bounds)+1)
+		m.value.hist = make(map[float64]*atomic.Int64, len(bounds))
 		for _, b := range bounds {
 			v := atomic.Int64{}
 			m.value.hist[b] = &v
 		}
-		v := atomic.Int64{}  // +Inf bucket
-		m.value.hist[0] = &v // key 0 reserved as overflow bucket
 	}
 	return m
 }
@@ -131,9 +131,7 @@ func (m *Metric) Record(v float64) {
 			}
 		}
 		if !placed {
-			if c, ok := m.value.hist[0]; ok { // overflow bucket
-				c.Add(1)
-			}
+			m.value.overflow.Add(1) // +Inf bucket
 		}
 	}
 }
@@ -189,11 +187,18 @@ func (m *Metric) histogramBuckets() []BucketSnapshot {
 			out = append(out, BucketSnapshot{UpperBound: b, Count: c.Load()})
 		}
 	}
-	if c, ok := m.value.hist[0]; ok {
-		out = append(out, BucketSnapshot{UpperBound: 0, Count: c.Load(), Overflow: true})
-	}
+	out = append(out, BucketSnapshot{UpperBound: 0, Count: m.value.overflow.Load(), Overflow: true})
 	return out
 }
+
+// histOverflowBound marks the +Inf bucket in per-window and stored bucket
+// slices (aggregator.add / orderedBuckets). It must survive encoding/json —
+// the SQLite store persists bucket slices verbatim — so +Inf itself is
+// unusable.
+// ponytail: any finite sentinel can in principle collide with a user
+// registered bound of the same value; removing that entirely needs an
+// overflow flag on the stored bucket row.
+const histOverflowBound = math.MaxFloat64
 
 // MetricSnapshot is a serializable view of a metric, used by the UI and OTLP.
 // The JSON tags are the stable public API contract for /metrics/data.

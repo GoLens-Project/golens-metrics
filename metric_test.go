@@ -1,6 +1,8 @@
 package golens
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -113,6 +115,32 @@ func TestHistogramZeroCount(t *testing.T) {
 	}
 }
 
+// A 0.0 bound keeps its own counter: the overflow (+Inf) bucket lives in a
+// dedicated counter, not the bound-keyed map, so samples at or below 0.0 and
+// samples above every bound never share a count.
+func TestHistogramZeroBoundDistinctFromOverflow(t *testing.T) {
+	m := newMetric("zero_bound", HistogramType, "", nil, []float64{0, 1}, 0, 0)
+	m.Record(0)  // ≤0: bound 0.0
+	m.Record(-2) // ≤0: bound 0.0
+	m.Record(0.5)
+	m.Record(42) // above every bound: overflow
+	s := m.Snapshot()
+	if len(s.Buckets) != 3 {
+		t.Fatalf("buckets = %d, want 3", len(s.Buckets))
+	}
+	want := []struct {
+		bound    float64
+		count    int64
+		overflow bool
+	}{{0, 2, false}, {1, 1, false}, {0, 1, true}}
+	for i, w := range want {
+		b := s.Buckets[i]
+		if b.UpperBound != w.bound || b.Count != w.count || b.Overflow != w.overflow {
+			t.Errorf("bucket[%d] = {bound %v, count %d, overflow %v}, want {bound %v, count %d, overflow %v}", i, b.UpperBound, b.Count, b.Overflow, w.bound, w.count, w.overflow)
+		}
+	}
+}
+
 func floatEq(a, b float64) bool {
 	const eps = 1e-6
 	d := a - b
@@ -120,4 +148,43 @@ func floatEq(a, b float64) bool {
 		d = -d
 	}
 	return d < eps
+}
+
+// The JSON encoding of MetricSnapshot and BucketSnapshot is the stable
+// public API contract for /metrics/data: snake_case keys, labels as
+// name/value objects, and an overflow flag that is present even when false
+// so clients can filter on the flag instead of the bound value.
+func TestSnapshotJSONContract(t *testing.T) {
+	s := MetricSnapshot{
+		Name:        "m",
+		Type:        "histogram",
+		Description: "d",
+		Labels:      []string{"code"},
+		LabelValues: []Label{{Name: "code", Value: "200"}},
+		Value:       1,
+		Count:       2,
+		Sum:         3,
+		Avg:         1.5,
+		UpdatedAt:   7,
+		Buckets: []BucketSnapshot{
+			{UpperBound: 1, Count: 2},
+			{UpperBound: 0, Count: 0, Overflow: true},
+		},
+	}
+	b, err := json.Marshal(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := string(b)
+	for _, key := range []string{
+		`"name":"m"`, `"type":"histogram"`, `"description":"d"`,
+		`"labels":["code"]`, `"label_values":[{"name":"code","value":"200"}]`,
+		`"value":1`, `"count":2`, `"sum":3`, `"avg":1.5`, `"updated_at":7`,
+		`"upper_bound":1,"count":2,"overflow":false`,
+		`"overflow":true`,
+	} {
+		if !strings.Contains(out, key) {
+			t.Errorf("serialized snapshot missing %s: %s", key, out)
+		}
+	}
 }

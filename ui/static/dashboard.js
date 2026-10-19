@@ -48,6 +48,12 @@ function setHTTPView(view) {
   if (dashRemote && window.htmx) htmx.ajax('GET', '/metrics/data', '#charts');
 }
 
+// Backoff state for the server-document PUT: dashRemote stays true on a
+// failure (the server copy remains the source of truth) and the change is
+// retried with doubling delay up to a 60s ceiling.
+var dashRetryTimer = null;
+var dashRetryMs = 0;
+
 function persistDash() {
   // localStorage write-through cache first, so the layout survives even if
   // the server PUT fails.
@@ -59,13 +65,18 @@ function persistDash() {
     localStorage.setItem('golens.httpview', dashCfg.http_card_view || '');
   } catch (e) {}
   if (!dashRemote) return;
-  fetch('/metrics/config', {
+  fetchJSON('/metrics/config', {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(dashCfg)
-  }).then(function (r) {
-    if (!r.ok) { dashRemote = false; showToast('changes are local only'); }
-  }).catch(function () { dashRemote = false; showToast('changes are local only'); });
+  }).then(function () {
+    dashRetryMs = 0;
+  }).catch(function () {
+    if (!dashRetryMs) showToast('changes are local only — retrying');
+    dashRetryMs = dashRetryMs ? Math.min(dashRetryMs * 2, 60000) : 2000;
+    clearTimeout(dashRetryTimer);
+    dashRetryTimer = setTimeout(persistDash, dashRetryMs);
+  });
 }
 
 // applyDash re-hydrates the UI from the current config document.
@@ -229,16 +240,85 @@ var moAlert = new MutationObserver(function () {
 });
 moAlert.observe(document.body, { attributes: true, attributeFilter: ['data-alert-add'] });
 
-// Add the searched/selected metric as a pinned chart (no navigation).
+// Add the searched/selected metric as a pinned chart (no navigation). A
+// partial or unknown name can never pin: an exact match with the rendered
+// list is required, otherwise Enter falls back to the first filtered match.
 function addChart() {
   var st = Alpine.store('ui');
-  var n = st.name;
+  var q = (st.name || '').toLowerCase();
+  var list = metricNames().filter(function (n) { return n.toLowerCase().indexOf(q) >= 0; });
+  var n = list.indexOf(st.name) >= 0 ? st.name : list[0];
   st.add = false;
   if (n) st.pin(n);
   st.name = '';
 }
 
 function saveOrder(o) { dashCfg.order.all_metrics = o; persistDash(); }
+
+// --- shared reorder path -------------------------------------------------------
+// Every reorderable surface (All Metrics, Hooks, My Charts, Endpoint Latency,
+// Runtime Health) moves through moveCard, so drag and the move buttons share
+// one code path.
+
+// moveCard moves items[from] to items[to]'s position and persists. Works on
+// both live DOM node lists (moves the node after/before the target, the same
+// placement the drag handlers use) and plain arrays (splices), then calls
+// persist. Returns true when a move happened.
+function moveCard(items, from, to, persist) {
+  if (from === to || from < 0 || to < 0 || from >= items.length || to >= items.length) return false;
+  var item = items[from], target = items[to];
+  if (typeof target.after === 'function') {
+    if (from < to) target.after(item); else target.before(item);
+  } else {
+    items.splice(to, 0, items.splice(from, 1)[0]);
+  }
+  persist();
+  return true;
+}
+
+// neighborIndex returns the index of the nearest visible card in direction
+// dir (-1 | 1) from cards[i], or -1 at the visible edge. Search-filtered
+// cards are skipped so a move is always visible in the grid.
+function neighborIndex(cards, i, dir) {
+  for (var j = i + dir; j >= 0 && j < cards.length; j += dir) {
+    if (cards[j].style.display !== 'none') return j;
+  }
+  return -1;
+}
+
+// moveGridCard is the move-button entry point for the server-rendered metric
+// grids. #charts (All Metrics) and #hooks share the cards template, so the
+// handler dispatches the persist call on which grid the card sits in.
+function moveGridCard(btn, dir) {
+  var card = btn.closest('[data-metric]');
+  if (!card) return;
+  var hooksGrid = card.closest('#hooks');
+  var grid = hooksGrid || card.closest('#charts');
+  if (!grid) return;
+  var cards = Array.from(grid.querySelectorAll('[data-metric]'));
+  var from = cards.indexOf(card);
+  moveCard(cards, from, neighborIndex(cards, from, dir), function () {
+    var names = Array.from(grid.querySelectorAll('[data-metric]')).map(function (el) { return el.dataset.metric; });
+    if (hooksGrid) saveHookOrder(names); else saveOrder(names);
+  });
+}
+
+// moveCharts reorders the pinned charts store through moveCard and persists
+// (the My Charts drag handler and its move buttons both land here).
+function moveCharts(from, to) {
+  var st = Alpine.store('ui');
+  moveCard(st.charts, from, to, function () {
+    dashCfg.panels = chartsToPanels(st.charts);
+    persistDash();
+    renderPinned();
+  });
+}
+
+// pinCard pins a card's metric to My Charts (the + button on each card).
+function pinCard(btn) {
+  var card = btn.closest('[data-metric]');
+  if (card) Alpine.store('ui').pin(card.dataset.metric);
+}
 
 function metricNames() {
   return Array.from(document.querySelectorAll('#charts [data-metric]')).map(function (el) { return el.dataset.metric; });
@@ -258,14 +338,16 @@ function pinSizeClass(name) {
 }
 
 // Clone each pinned metric's server-rendered card from #charts into its slot.
+// Identical HTML is skipped so a poll that changed nothing doesn't destroy
+// hover tooltips or an in-progress text selection.
 function renderPinned() {
   document.querySelectorAll('#pinned [data-pin]').forEach(function (body) {
     var name = body.getAttribute('data-pin');
     var slot = body.closest('.pin-slot');
     if (slot) slot.className = 'pin-slot card card-grab ' + pinSizeClass(name);
     var card = document.querySelector('#charts [data-metric="' + cssEsc(name) + '"]');
-    if (card) { body.innerHTML = card.innerHTML; }
-    else { body.innerHTML = '<div class="pin-missing">metric unavailable</div>'; }
+    var html = card ? card.innerHTML : '<div class="pin-missing">metric unavailable</div>';
+    if (body.innerHTML !== html) body.innerHTML = html;
   });
   drawLineCharts();
 }
@@ -381,13 +463,14 @@ function endpointLatency() {
     },
     start(i) { this.drag = i; },
     drop(i) {
-      if (this.drag === null || this.drag === i) { this.drag = null; return; }
-      var keys = this.endpoints.map(function (e) { return e.method + ' ' + e.path; });
-      var moved = keys.splice(this.drag, 1)[0];
-      keys.splice(i, 0, moved);
-      saveEpOrder(keys);
+      if (this.drag === null) return;
+      var from = this.drag;
       this.drag = null;
-      this.bump++;
+      this.move(from, i - from);
+    },
+    move(i, d) {
+      var keys = this.endpoints.map(function (e) { return e.method + ' ' + e.path; });
+      if (moveCard(keys, i, i + d, function () { saveEpOrder(keys); })) this.bump++;
     },
     // Calculate height relative to each endpoint's p99 (the highest bar)
     h(endpoint, value) {
@@ -398,30 +481,12 @@ function endpointLatency() {
   };
 }
 
-// Hooks section: provides drag-and-drop for hook metrics
+// Hooks section: reorder support for hook metrics. The grid's drag-and-drop
+// is the delegated listener in setupDnD; move buttons share moveGridCard
+// with the All Metrics grid (both render the same cards template).
 function hooksSection() {
   return {
-    drag: null,
     init() { this.setupDnD(); },
-    start(i) { this.drag = i; },
-    drop(i) {
-      if (this.drag === null || this.drag === i) { this.drag = null; return; }
-      var grid = document.getElementById('hooks');
-      var cards = Array.from(grid.querySelectorAll('[data-metric]'));
-      if (this.drag < cards.length && i < cards.length) {
-        var dragged = cards[this.drag];
-        var target = cards[i];
-        var parent = dragged.parentNode;
-        var draggedNext = dragged.nextSibling;
-        var targetNext = target.nextSibling;
-        parent.insertBefore(dragged, targetNext);
-        parent.insertBefore(target, draggedNext);
-        // Save new order
-        var names = Array.from(grid.querySelectorAll('[data-metric]')).map(function (el) { return el.dataset.metric; });
-        saveHookOrder(names);
-      }
-      this.drag = null;
-    },
     setupDnD() {
       var grid = document.getElementById('hooks');
       if (!grid) return;
@@ -502,14 +567,80 @@ function cardinalityPanel(maxSeries) {
 
 // Boot: apply persisted All Metrics order + wire up its drag-and-drop, then
 // load the server-side dashboard layout document (falls back to the
-// localStorage boot state when unavailable).
-document.addEventListener('DOMContentLoaded', function () { sortCharts(); applyFilter(); initMetricsDnD(); loadDash(); });
+// localStorage boot state when unavailable). A pause from before a reload is
+// restored so it survives refreshes.
+document.addEventListener('DOMContentLoaded', function () {
+  sortCharts(); applyFilter(); initMetricsDnD(); loadDash();
+  try {
+    if (sessionStorage.getItem('golens.paused') === '1') {
+      setPaused(true);
+      var check = document.getElementById('pause-check');
+      if (check) check.checked = true;
+    }
+  } catch (e) {}
+});
+
+// setPaused gates every poll (HTMX trigger filters + Alpine intervals check
+// body.dataset.paused) and persists across reloads via sessionStorage.
+function setPaused(p) {
+  if (p) document.body.dataset.paused = '1';
+  else delete document.body.dataset.paused;
+  try { sessionStorage.setItem('golens.paused', p ? '1' : ''); } catch (e) {}
+}
+
+// resetLayout clears the dashboard layout everywhere: an empty server
+// document, the localStorage fallback keys, and the in-memory state.
+function resetLayout() {
+  dashCfg = { version: 1, panels: [], order: { all_metrics: [], hooks: [], endpoints: [] }, http_card_view: '' };
+  ['golens.charts', 'golens.order', 'golens.hooksorder', 'golens.eporder', 'golens.httpview'].forEach(function (k) {
+    try { localStorage.removeItem(k); } catch (e) {}
+  });
+  if (window.Alpine && Alpine.store('ui')) Alpine.store('ui').charts = [];
+  applyDash();
+  if (!dashRemote) { showToast('layout reset', 'success'); return; }
+  fetchJSON('/metrics/config', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(dashCfg)
+  }).then(function () { showToast('layout reset', 'success'); })
+    .catch(function () { showToast('layout reset locally'); });
+}
+
+// "/" focuses the search box from anywhere (unless the user is typing).
+document.addEventListener('keydown', function (e) {
+  if (e.key !== '/' || e.ctrlKey || e.metaKey || e.altKey) return;
+  var t = e.target;
+  if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) return;
+  var s = document.getElementById('search');
+  if (s) { e.preventDefault(); s.focus(); }
+});
 
 // Pause all polling while the tab is hidden; resume on return. HTMX polling
 // checks body.dataset.hidden; the Alpine components check document.hidden.
 document.addEventListener('visibilitychange', function () {
   if (document.hidden) { document.body.dataset.hidden = '1'; } else { delete document.body.dataset.hidden; }
 });
+
+// --- alert status dot + pill ----------------------------------------------------
+// Polls the alerter's firing count (when alerts are compiled in) and drives
+// the header status dot and the Alerts-link count pill; the alerts page
+// shares applyAlertStatus via its own poll.
+function applyAlertStatus(n) {
+  var dot = document.getElementById('brand-dot');
+  if (dot) dot.classList.toggle('brand-dot-alert', n > 0);
+  var pill = document.getElementById('alert-count');
+  if (pill) {
+    pill.textContent = n + ' firing';
+    pill.hidden = n === 0;
+  }
+}
+
+function pollAlertStatus() {
+  if (!GoLensConfig.alertsEnabled || document.hidden) return;
+  fetchJSON('/metrics/alerts/status').then(function (d) { applyAlertStatus((d && d.firing) || 0); }).catch(function () {});
+}
+
+setInterval(pollAlertStatus, POLL_MS);
 
 // Cooldown ring: depletes over the poll interval, shows remaining seconds,
 // resets on each HTMX refresh, and freezes while paused. Turns red when the
@@ -542,6 +673,7 @@ document.addEventListener('visibilitychange', function () {
     start = performance.now();
     var ok = evt.detail.successful;
     ring.setAttribute('stroke', ok ? '#34d399' : '#ef4444');
+    pollAlertStatus(); // refresh the status dot/pill on the same poll tick
   });
 })();
 
@@ -669,28 +801,47 @@ function runtimeHealth() {
     { key: 'cpu_usage_percent' },
     { key: 'go_goroutines' }
   ];
+  // rtCards lists the runtime cards in current DOM order. Indexes are always
+  // derived from it — never hard-coded — so drag and buttons stay correct
+  // after a reorder.
+  function rtCards() {
+    return Array.from(document.getElementById('runtime-charts').querySelectorAll('.rt-card'));
+  }
   return {
     duration: '1h',
     series: {},
     currentSysBytes: 0, currentHeapInuse: 0, currentMem: 0, currentHeapObj: 0, cpuPct: 0, currentGoro: 0,
     drag: null,
     init() { this.refresh(); setInterval(() => { if (!document.hidden) this.refresh(); }, POLL_MS); },
-    start(i) { this.drag = i; },
-    drop(i) {
-      if (this.drag === null || this.drag === i) { this.drag = null; return; }
-      // Reorder the runtime charts by moving the dragged card relative to
-      // the target card. Selecting .rt-card (not every nested div) keeps the
-      // wired 0..2 indexes aligned with the actual cards, and after/before
-      // move nodes cleanly even when the two cards live in different
-      // containers (the memory card is a direct child of #runtime-charts,
-      // the CPU/goroutine cards sit inside the inner grid).
-      var cards = document.getElementById('runtime-charts').querySelectorAll('.rt-card');
-      if (this.drag < cards.length && i < cards.length) {
-        var dragged = cards[this.drag];
-        var target = cards[i];
-        if (this.drag < i) { target.after(dragged); } else { target.before(dragged); }
-      }
+    start(e) {
+      var card = e.target.closest('.rt-card');
+      if (!card) return;
+      this.drag = rtCards().indexOf(card);
+      card.classList.add('dragging');
+    },
+    dragEnd(e) {
       this.drag = null;
+      var card = e.target.closest('.rt-card');
+      if (card) card.classList.remove('dragging');
+    },
+    drop(e) {
+      if (this.drag === null) return;
+      var from = this.drag;
+      this.drag = null;
+      var card = e.target.closest('.rt-card');
+      if (card) card.classList.remove('dragging');
+      // after/before move nodes cleanly even when the two cards live in
+      // different containers (the memory card is a direct child of
+      // #runtime-charts, the CPU/goroutine cards sit inside the inner grid).
+      var cards = rtCards();
+      moveCard(cards, from, cards.indexOf(card), function () {});
+    },
+    move(e, d) {
+      var card = e.target.closest('.rt-card');
+      if (!card) return;
+      var cards = rtCards();
+      var from = cards.indexOf(card);
+      moveCard(cards, from, neighborIndex(cards, from, d), function () {});
     },
     refresh() {
       metrics.forEach(m => {
@@ -815,6 +966,18 @@ function runtimeHealth() {
 
 // --- Histogram Time-Series component --------------------------------------------
 
+// Bucket palette shared by the stacked-area chart and its legend swatches —
+// one array, so a legend entry always matches its chart color.
+var bucketColors = [
+  'rgba(168, 85, 247, 0.7)',   // purple-500
+  'rgba(139, 92, 246, 0.7)',   // violet-500
+  'rgba(124, 58, 237, 0.7)',   // violet-600
+  'rgba(109, 40, 217, 0.7)',   // violet-700
+  'rgba(88, 28, 135, 0.7)',    // violet-900
+  'rgba(192, 132, 252, 0.7)',  // purple-400
+  'rgba(216, 180, 254, 0.7)',  // purple-300
+];
+
 function histogramTimeSeries() {
   return {
     duration: '1h',
@@ -832,11 +995,14 @@ function histogramTimeSeries() {
         var metrics = await fetchJSON('/metrics/data?format=json');
         var histogramCards = (metrics || []).filter(c => c.type === 'histogram');
 
-        // Build histogram metrics list
+        // Build histogram metrics list. The overflow bucket serializes
+        // upper_bound 0 as its marker — filter on the overflow flag, not the
+        // bound value, or a legitimately registered 0 bound would drop from
+        // the legend while the chart still draws it.
         this.histogramMetrics = histogramCards.map(card => ({
           name: card.name,
           description: card.description || '',
-          bounds: (card.buckets || []).map(b => b.upper_bound).filter(b => b > 0) // Extract bounds from buckets
+          bounds: (card.buckets || []).filter(b => !b.overflow).map(b => b.upper_bound)
         }));
         if (!this.histogramMetrics.length) return;
 
@@ -908,17 +1074,6 @@ function histogramTimeSeries() {
       });
       if (maxCount === 0) maxCount = 1;
 
-      // Purple color palette for buckets
-      var bucketColors = [
-        'rgba(168, 85, 247, 0.7)',   // purple-500
-        'rgba(139, 92, 246, 0.7)',   // violet-500
-        'rgba(124, 58, 237, 0.7)',   // violet-600
-        'rgba(109, 40, 217, 0.7)',   // violet-700
-        'rgba(88, 28, 135, 0.7)',    // violet-900
-        'rgba(192, 132, 252, 0.7)',  // purple-400
-        'rgba(216, 180, 254, 0.7)',  // purple-300
-      ];
-
       // Helper functions
       function xP(t) { return pad.left + ((t - tMin) / tRange) * cw; }
       function yP(v) { return pad.top + ch - (v / maxCount) * ch; }
@@ -987,11 +1142,7 @@ function histogramTimeSeries() {
     },
 
     getBucketColor(index) {
-      var colors = [
-        'bucket-swatch-0', 'bucket-swatch-1', 'bucket-swatch-2',
-        'bucket-swatch-3', 'bucket-swatch-4', 'bucket-swatch-5'
-      ];
-      return colors[index % colors.length];
+      return bucketColors[index % bucketColors.length];
     },
 
     formatBound(bound) {

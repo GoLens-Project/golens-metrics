@@ -37,9 +37,9 @@ const alertsPageSrc = `<!DOCTYPE html>
 <header class="topbar">
   <div class="wrap topbar-inner row">
     <div class="brand grow">
-      <span class="brand-dot brand-dot-alert"></span>
+      <span class="brand-dot" id="brand-dot"></span>
       <h1 class="brand-title">{{.ProjectName}}</h1>
-      <span class="brand-sub">alerting</span>
+      <span class="brand-sub">{{.DashboardSubtitle}}</span>
       {{if .HasNotifier}}
       <span class="status-pill status-pill-ok"><span class="status-dot status-dot-ok"></span> mailer connected</span>
       {{else}}
@@ -79,7 +79,8 @@ const alertsPageSrc = `<!DOCTYPE html>
             <template x-for="r in rules" :key="r.id">
               <tr>
                 <td>
-                  <button type="button" @click="toggleRule(r)" class="check-switch"
+                  <button type="button" @click="toggleRule(r)" class="check-switch" role="switch"
+                          :aria-checked="r.enabled ? 'true' : 'false'" :aria-label="r.name"
                           :class="r.enabled ? 'check-switch-on' : ''">
                     <span class="check-knob" :class="r.enabled ? 'check-knob-on' : ''"></span>
                   </button>
@@ -91,7 +92,9 @@ const alertsPageSrc = `<!DOCTYPE html>
                 <td class="cell-dim" x-text="fmtDur(r.cooldown)"></td>
                 <td class="cell-dim" x-text="r.last_fired ? timeAgo(r.last_fired) : '—'"></td>
                 <td class="cell-num">
-                  <button @click="deleteRule(r.id)" class="btn btn-danger-hover">Delete</button>
+                  <!-- Two-phase delete: first click asks, second click fires. -->
+                  <button @click="deleteRule(r.id)" class="btn btn-danger-hover"
+                          x-text="confirmId === r.id ? 'Confirm delete' : 'Delete'"></button>
                 </td>
               </tr>
             </template>
@@ -110,6 +113,9 @@ const alertsPageSrc = `<!DOCTYPE html>
       <h2 class="section-title">Alert Log</h2>
       <span class="meta-faint" x-text="'· ' + log.length + ' events'"></span>
       <button @click="refreshLog()" class="btn btn-link grow">Refresh</button>
+      <label class="pause-toggle">
+        <input type="checkbox" class="check" x-model="paused"> pause
+      </label>
     </div>
     <div class="data-card">
       <div class="table-scroll">
@@ -208,8 +214,8 @@ const alertsPageSrc = `<!DOCTYPE html>
               </div>
             </div>
             <div class="form-row">
-              <label class="field-label">Cooldown (e.g. 5m, 1h)</label>
-              <input type="text" x-model="$store.ui.alertForm.cooldown" placeholder="5m" class="input">
+              <label class="field-label">Cooldown (number + ms|s|m|h, e.g. 5m)</label>
+              <input type="text" x-model="$store.ui.alertForm.cooldown" pattern="[0-9]+(ms|s|m|h)" title="Duration: a number followed by ms, s, m, or h" placeholder="5m" class="input">
             </div>
             {{if .HasNotifier}}
             <hr class="form-sep">
@@ -269,7 +275,7 @@ const alertsPageSrc = `<!DOCTYPE html>
   </div>
 
   <!-- Toast (driven by common.js showToast) -->
-  <div id="app-toast" class="toast"></div>
+  <div id="app-toast" class="toast" aria-live="polite"></div>
 
 </main>
 

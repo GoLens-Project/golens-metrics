@@ -148,23 +148,90 @@ func filepathJoin(parts ...string) string {
 	return out
 }
 
-// The dashboard JS indexes histogram_buckets entries and reads b.count, and
-// the SQLite backend round-trips buckets through JSON: the lowercase keys are
-// the wire contract, not a styling choice.
-func TestHistogramBucketJSONKeys(t *testing.T) {
-	data, err := json.Marshal(HistogramBucket{UpperBound: 5, Count: 3})
+// Legacy rows persisted before the snake_case rename carry TitleCase keys
+// ("UpperBound", "Count"). JSON key matching folds case but not underscores,
+// so plain tags would decode the legacy bound as 0 — the boundary silently
+// lost. The decode must accept both key styles, prefer the current keys when
+// both are present, and leave null elements untouched.
+func TestHistogramBucketUnmarshalLegacyKeys(t *testing.T) {
+	tests := []struct {
+		name           string
+		input          string
+		wantLen        int
+		wantBound      float64
+		wantCount      int64
+		wantErr        bool
+		wantNullKeptAt int // index of a null element decoded as the zero bucket; -1 = none
+	}{
+		{
+			name:      "pre-upgrade legacy keys",
+			input:     `[{"UpperBound":5,"Count":7}]`,
+			wantLen:   1,
+			wantBound: 5, wantCount: 7,
+			wantNullKeptAt: -1,
+		},
+		{
+			name:      "current wire keys",
+			input:     `[{"upper_bound":5,"count":7}]`,
+			wantLen:   1,
+			wantBound: 5, wantCount: 7,
+			wantNullKeptAt: -1,
+		},
+		{
+			name:      "mixed keys: current wins over legacy",
+			input:     `[{"upper_bound":1,"UpperBound":5,"count":2,"Count":7}]`,
+			wantLen:   1,
+			wantBound: 1, wantCount: 2,
+			wantNullKeptAt: -1,
+		},
+		{
+			name:      "null element is a no-op",
+			input:     `[{"UpperBound":5,"Count":7},null]`,
+			wantLen:   2,
+			wantBound: 5, wantCount: 7,
+			wantNullKeptAt: 1,
+		},
+		{
+			name:    "malformed json errors",
+			input:   `[{"UpperBound":}]`,
+			wantErr: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var buckets []HistogramBucket
+			err := json.Unmarshal([]byte(tc.input), &buckets)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("input %s: want error, got buckets %+v", tc.input, buckets)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unmarshal %s: %v", tc.input, err)
+			}
+			if len(buckets) != tc.wantLen {
+				t.Fatalf("got %d buckets, want %d", len(buckets), tc.wantLen)
+			}
+			if buckets[0].UpperBound != tc.wantBound || buckets[0].Count != tc.wantCount {
+				t.Errorf("bucket = %+v, want {bound %v, count %d}", buckets[0], tc.wantBound, tc.wantCount)
+			}
+			if tc.wantNullKeptAt >= 0 && buckets[tc.wantNullKeptAt] != (HistogramBucket{}) {
+				t.Errorf("null element mutated: %+v", buckets[tc.wantNullKeptAt])
+			}
+		})
+	}
+}
+
+// Marshaling always emits the current snake_case wire keys — the shape every
+// post-upgrade persisted row carries. Pinning the exact bytes stops a future
+// tag rename from silently re-breaking rows at rest.
+func TestHistogramBucketMarshalWireKeys(t *testing.T) {
+	out, err := json.Marshal([]HistogramBucket{{UpperBound: 5, Count: 7}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(data) != `{"upper_bound":5,"count":3}` {
-		t.Errorf("marshaled = %s, want lowercase keys", data)
-	}
-
-	var back HistogramBucket
-	if err := json.Unmarshal(data, &back); err != nil {
-		t.Fatal(err)
-	}
-	if back != (HistogramBucket{UpperBound: 5, Count: 3}) {
-		t.Errorf("round-trip = %+v", back)
+	if got := string(out); got != `[{"upper_bound":5,"count":7}]` {
+		t.Errorf("marshal = %s, want exact wire shape", got)
 	}
 }

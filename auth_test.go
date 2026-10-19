@@ -92,51 +92,48 @@ func TestAuthEnvPassword(t *testing.T) {
 	}
 }
 
-// A password without a username is a configuration error: auth was clearly
-// intended, so startup must fail rather than silently serve an
-// unauthenticated dashboard.
+// A supplied credential that cannot be honored is a startup error, never a
+// silent fallback to an unauthenticated dashboard.
 func TestAuthRequiresUsername(t *testing.T) {
-	cfg := DefaultConfig()
-	cfg.UI.Auth.Password = "s3cret" // no username
-	if _, err := New(cfg); err == nil {
-		t.Fatal("New must reject a password configured without a username")
-	}
-}
-
-// resolveAuth must wipe the plaintext before anything else, so no failure
-// path — unhashable password, missing username — leaves it behind.
-func TestResolveAuthWipesPlaintextOnFailure(t *testing.T) {
 	tests := []struct {
-		name string
-		cfg  AuthConfig
+		name     string
+		password string
+		hash     string
 	}{
-		{"unhashable password", AuthConfig{Username: "admin", Password: strings.Repeat("x", 73)}}, // bcrypt's hard limit is 72 bytes
-		{"missing username", AuthConfig{Password: "s3cret"}},
+		{name: "password without username", password: "s3cret"},
+		{name: "password_hash without username", hash: "$2a$10$abcdefghijklmnopqrstuvOO7nNnNnNnNnNnNnNnNnNnNnNnNnNnN"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			st, err := resolveAuth(&tc.cfg)
+			cfg := DefaultConfig()
+			cfg.UI.Auth.Password = tc.password
+			cfg.UI.Auth.PasswordHash = tc.hash
+			r, err := New(cfg)
 			if err == nil {
-				t.Fatalf("resolveAuth accepted %+v", tc.cfg)
+				t.Fatal("credential without username must fail startup, not deactivate auth silently")
 			}
-			if st.active() {
-				t.Error("error path must not activate auth")
+			if !strings.Contains(err.Error(), "username is required") {
+				t.Errorf("error = %q, want username-required message", err)
 			}
-			if tc.cfg.Password != "" {
-				t.Error("plaintext password was not wiped on the failure path")
+			if r != nil {
+				t.Error("registry must be nil when auth resolution fails")
 			}
 		})
 	}
 }
 
-// No credential configured: auth is intentionally off and this is not an error.
-func TestResolveAuthNoCredential(t *testing.T) {
-	st, err := resolveAuth(&AuthConfig{})
-	if err != nil {
-		t.Fatalf("resolveAuth with no credential returned error: %v", err)
+// A plaintext password bcrypt cannot hash (over its 72-byte limit) is a
+// startup error, not a silent deactivation of the configured auth.
+func TestAuthRejectsUnhashablePassword(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.UI.Auth.Username = "admin"
+	cfg.UI.Auth.Password = strings.Repeat("x", 100)
+	r, err := New(cfg)
+	if err == nil {
+		t.Fatal("over-limit password must fail startup")
 	}
-	if st.active() {
-		t.Error("auth must stay inactive with no credential configured")
+	if r != nil {
+		t.Error("registry must be nil when auth resolution fails")
 	}
 }
 
