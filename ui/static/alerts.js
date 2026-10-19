@@ -94,12 +94,23 @@ function alertsApp() {
   return {
     rules: [],
     log: [],
+    paused: false,        // pauses the 10s refresh (the dashboard's pause control, mirrored)
+    confirmId: '',        // rule awaiting its second "Confirm delete" click
+    confirmTimer: null,
 
     init: function () {
       this.refreshRules();
       this.refreshLog();
-      // Auto-refresh log every 10s
-      setInterval(function () { this.refreshLog(); }.bind(this), 10000);
+      this.refreshStatus();
+      // Auto-refresh rules and log every 10s so last_fired and the rules
+      // list never freeze on screen; gated on tab visibility and the pause
+      // control.
+      setInterval(function () {
+        if (document.hidden || this.paused) return;
+        this.refreshRules();
+        this.refreshLog();
+        this.refreshStatus();
+      }.bind(this), 10000);
       // Listen for alert creation / failure from the modal store
       var self = this;
       document.addEventListener('alert:created', function (e) {
@@ -115,7 +126,7 @@ function alertsApp() {
       var self = this;
       fetchJSON('/metrics/alerts/rules', { headers: { 'Accept': 'application/json' } })
         .then(function (d) { self.rules = d || []; })
-        .catch(function () { showToast('Failed to load rules'); });
+        .catch(function () {});
     },
 
     refreshLog: function () {
@@ -125,8 +136,26 @@ function alertsApp() {
         .catch(function () { showToast('Failed to load alert log'); });
     },
 
+    // refreshStatus drives the header dot: emerald when nothing is firing,
+    // rose while any enabled rule's condition holds.
+    refreshStatus: function () {
+      fetchJSON('/metrics/alerts/status').then(function (d) {
+        var dot = document.getElementById('brand-dot');
+        if (dot) dot.classList.toggle('brand-dot-alert', (d && d.firing) > 0);
+      }).catch(function () {});
+    },
+
     deleteRule: function (id) {
       var self = this;
+      // Two-phase: first click arms the button for ~3s, second click fires.
+      if (this.confirmId !== id) {
+        this.confirmId = id;
+        clearTimeout(this.confirmTimer);
+        this.confirmTimer = setTimeout(function () { self.confirmId = ''; }, 3000);
+        return;
+      }
+      clearTimeout(this.confirmTimer);
+      this.confirmId = '';
       fetch('/metrics/alerts/rules/' + id, { method: 'DELETE' })
         .then(function (r) {
           if (!r.ok) throw new Error('Delete failed');
@@ -169,7 +198,9 @@ function alertsApp() {
     fmtTime: function (t) {
       if (!t) return '—';
       var d = new Date(t);
-      return d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
+      // Full date + time: hour:minute:second alone is ambiguous the moment
+      // an entry is more than a day old.
+      return d.toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
     },
 
     timeAgo: function (t) {

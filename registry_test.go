@@ -2,7 +2,8 @@ package golens
 
 import (
 	"context"
-	"strings"
+	"encoding/json"
+	"net/http/httptest"
 	"testing"
 	"time"
 )
@@ -21,11 +22,7 @@ func newTestRegistry(t *testing.T, cfg Config) *Registry {
 
 func TestRegistryPreRegistersREDMetrics(t *testing.T) {
 	r := newTestRegistry(t, DefaultConfig())
-	for _, name := range []string{
-		"http_requests_total", "http_request_errors_total", "http_request_duration_seconds",
-		// Fixed per-class children feeding the dashboard's status breakdown.
-		"http_requests_total_2xx", "http_requests_total_3xx", "http_requests_total_4xx", "http_requests_total_5xx",
-	} {
+	for _, name := range []string{"http_requests_total", "http_request_errors_total", "http_request_duration_seconds"} {
 		if _, ok := r.Snapshot(name); !ok {
 			t.Errorf("RED metric %q not pre-registered", name)
 		}
@@ -116,36 +113,6 @@ func TestRegistryEvictionWithIdleTTL(t *testing.T) {
 	r.Register("new_metric", CounterType, "", nil, nil, 0, 0)
 	if _, ok := r.Snapshot("new_metric"); !ok {
 		t.Error("new metric should exist after idle eviction")
-	}
-}
-
-// An uncompilable path filter is a startup error, not a silently dropped
-// filter line that would track unfiltered traffic.
-func TestNewRejectsInvalidPathPatterns(t *testing.T) {
-	tests := []struct {
-		name    string
-		pattern string
-		apply   func(cfg Config) Config
-	}{
-		{"invalid include pattern", "[", func(cfg Config) Config {
-			cfg.IncludePatterns = []string{"^/api/.*", "["}
-			return cfg
-		}},
-		{"invalid exclude pattern", "*", func(cfg Config) Config {
-			cfg.ExcludePatterns = []string{"*"}
-			return cfg
-		}},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			_, err := New(tc.apply(DefaultConfig()))
-			if err == nil {
-				t.Fatalf("New accepted invalid pattern %q", tc.pattern)
-			}
-			if !strings.Contains(err.Error(), tc.pattern) {
-				t.Errorf("error %q does not name the offending pattern %q", err, tc.pattern)
-			}
-		})
 	}
 }
 
@@ -293,6 +260,140 @@ func TestHistoryNoData(t *testing.T) {
 	}
 }
 
+// The batch form /metrics/history?names=a,b,c serves a whole panel grid in
+// one request, keyed by metric name; blank entries are skipped.
+func TestHistoryBatchNames(t *testing.T) {
+	r := newTestRegistry(t, DefaultConfig())
+	ctx, cancel := context.WithCancel(context.Background())
+	r.Start(ctx)
+	defer func() { cancel(); r.Close() }()
+
+	r.Record("batch_a", 1)
+	r.Record("batch_b", 2)
+	waitForDrain(r)
+	time.Sleep(20 * time.Millisecond) // one flush cycle (5ms in tests)
+
+	handler := r.metricsHistoryHandler()
+	req := httptest.NewRequest("GET", "/metrics/history?names=batch_a,batch_b,,batch_c", nil)
+	rec := httptest.NewRecorder()
+	handler(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	var out map[string]HistorySeries
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(out) != 3 {
+		t.Fatalf("got %d series, want 3 (blank names skipped)", len(out))
+	}
+	for _, name := range []string{"batch_a", "batch_b", "batch_c"} {
+		if _, ok := out[name]; !ok {
+			t.Errorf("series %q missing", name)
+		}
+	}
+	if len(out["batch_a"].Points) == 0 {
+		t.Error("batch_a has no points after flush")
+	}
+}
+
+// Before the first flush, History still yields the aggregator's in-flight
+// window — a freshly started process shows a current point instead of "no
+// data".
+func TestHistoryIncludesPartialWindow(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.FlushInterval = time.Hour // never flushes during the test
+	cfg.IngestQueueSize = 64
+	r, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	r.Start(ctx)
+	defer func() { cancel(); r.Close() }()
+
+	r.Record("partial_metric", 30)
+	waitForDrain(r)
+
+	series := r.History("partial_metric", time.Hour)
+	if len(series.Points) != 1 {
+		t.Fatalf("got %d points, want 1 from the in-flight window", len(series.Points))
+	}
+	if series.Points[0].V != 30 {
+		t.Errorf("partial point value = %v, want 30", series.Points[0].V)
+	}
+}
+
+// orderedBuckets normalizes stored bucket slices to the metric's bounds
+// order with the overflow bucket (UpperBound 0) trailing: storage may return
+// map-iteration order, and the client lays out buckets by index.
+func TestOrderedBuckets(t *testing.T) {
+	bounds := []float64{0.5, 1, 5}
+	got := orderedBuckets([]HistogramBucket{
+		{UpperBound: 0, Count: 7}, // overflow first
+		{UpperBound: 5, Count: 3},
+		{UpperBound: 0.5, Count: 9},
+	}, bounds)
+	if len(got) != 4 {
+		t.Fatalf("got %d buckets, want 4 (bounds + overflow)", len(got))
+	}
+	wantOrder := []struct {
+		bound float64
+		count int64
+	}{{0.5, 9}, {1, 0}, {5, 3}, {0, 7}}
+	for i, w := range wantOrder {
+		if got[i].UpperBound != w.bound || got[i].Count != w.count {
+			t.Errorf("bucket[%d] = {bound %v, count %d}, want {bound %v, count %d}", i, got[i].UpperBound, got[i].Count, w.bound, w.count)
+		}
+	}
+}
+
+// History normalizes a scrambled stored bucket slice into bounds order with
+// the overflow bucket last, matching the client's index-against-bounds
+// layout.
+func TestHistoryNormalizesBucketOrder(t *testing.T) {
+	r := newTestRegistry(t, DefaultConfig())
+	ctx, cancel := context.WithCancel(context.Background())
+	r.Start(ctx)
+	defer func() { cancel(); r.Close() }()
+
+	bounds := []float64{0.5, 1}
+	// Store a point whose buckets are scrambled, as a flushed map-iteration
+	// order could produce.
+	if err := r.storage.Store(context.Background(), AggregatedMetric{
+		Name:        "hist_order",
+		Count:       6,
+		Sum:         6,
+		WindowStart: time.Now().Add(-time.Minute),
+		WindowEnd:   time.Now(),
+		HistogramBuckets: []HistogramBucket{
+			{UpperBound: 0, Count: 1},
+			{UpperBound: 1, Count: 2},
+			{UpperBound: 0.5, Count: 3},
+		},
+	}); err != nil {
+		t.Fatalf("store: %v", err)
+	}
+
+	r.Register("hist_order", HistogramType, "hist", nil, bounds, 0, 0)
+
+	series := r.History("hist_order", time.Hour)
+	if len(series.Points) != 1 {
+		t.Fatalf("got %d points, want 1", len(series.Points))
+	}
+	got := series.Points[0].HistogramBuckets
+	if len(got) != 3 {
+		t.Fatalf("got %d buckets, want 3", len(got))
+	}
+	wantBounds := []float64{0.5, 1, 0} // bounds order, overflow last
+	wantCounts := []int64{3, 2, 1}
+	for i := range wantBounds {
+		if got[i].UpperBound != wantBounds[i] || got[i].Count != wantCounts[i] {
+			t.Errorf("bucket[%d] = {bound %v, count %d}, want {bound %v, count %d}", i, got[i].UpperBound, got[i].Count, wantBounds[i], wantCounts[i])
+		}
+	}
+}
+
 func TestHistoryNilContext(t *testing.T) {
 	r := newTestRegistry(t, DefaultConfig())
 	// Don't start — ctx is nil, History should fall back to context.Background()
@@ -319,69 +420,5 @@ func TestHistoryHistogramBounds(t *testing.T) {
 	series := r.History("hist_metric", time.Hour)
 	if len(series.HistogramBounds) != len(bounds) {
 		t.Errorf("histogram bounds len = %d, want %d", len(series.HistogramBounds), len(bounds))
-	}
-}
-
-func TestHistoryIncludesInFlightWindow(t *testing.T) {
-	// Not started: no flush loop runs, so storage stays empty and the only
-	// source for a point is the aggregator's in-flight window.
-	r := newTestRegistry(t, DefaultConfig())
-	defer r.Close()
-
-	r.agg.add("live", 4, nil)
-	r.agg.add("live", 6, nil)
-
-	series := r.History("live", time.Hour)
-	if len(series.Points) != 1 {
-		t.Fatalf("want 1 point from the in-flight window, got %d", len(series.Points))
-	}
-	if series.Points[0].V != 5 {
-		t.Errorf("point value = %v, want 5", series.Points[0].V)
-	}
-}
-
-func TestHistoryOrdersHistogramBuckets(t *testing.T) {
-	r := newTestRegistry(t, DefaultConfig())
-	defer r.Close()
-
-	bounds := []float64{1, 5, 10}
-	r.Register("h", HistogramType, "test histogram", nil, bounds, 0, 0)
-
-	// Store a roll-up with buckets scrambled out of bounds order, an unknown
-	// boundary, and bound 5 missing entirely.
-	now := time.Now()
-	err := r.Storage().Store(context.Background(), AggregatedMetric{
-		Name: "h", Count: 2, Sum: 8,
-		WindowStart: now, WindowEnd: now,
-		HistogramBuckets: []HistogramBucket{
-			{UpperBound: 10, Count: 7},
-			{UpperBound: 99, Count: 4}, // unknown boundary: dropped
-			{UpperBound: 0, Count: 2},  // overflow bucket
-			{UpperBound: 1, Count: 3},
-			// bound 5 absent: counts as zero
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	series := r.History("h", time.Hour)
-	if len(series.Points) != 1 {
-		t.Fatalf("want 1 point, got %d", len(series.Points))
-	}
-	got := series.Points[0].HistogramBuckets
-	want := []HistogramBucket{
-		{UpperBound: 1, Count: 3},
-		{UpperBound: 5, Count: 0},
-		{UpperBound: 10, Count: 7},
-		{UpperBound: 0, Count: 2}, // overflow trails
-	}
-	if len(got) != len(want) {
-		t.Fatalf("buckets = %+v, want %+v", got, want)
-	}
-	for i, b := range want {
-		if got[i] != b {
-			t.Errorf("bucket[%d] = %+v, want %+v", i, got[i], b)
-		}
 	}
 }

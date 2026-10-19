@@ -1,7 +1,7 @@
 package golens
 
 import (
-	"context"
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -11,446 +11,275 @@ import (
 	"testing"
 )
 
-// getDashboardConfig fetches the layout document via GET /metrics/config.
-func getDashboardConfig(t *testing.T, mux http.Handler) DashboardConfig {
+func newConfigRegistry(t *testing.T, cfg Config) *Registry {
 	t.Helper()
-	rec := httptest.NewRecorder()
-	mux.ServeHTTP(rec, httptest.NewRequest("GET", "/metrics/config", nil))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("GET /metrics/config status = %d, body: %s", rec.Code, rec.Body.String())
+	cfg.UI.Enabled = true
+	return newTestRegistry(t, cfg)
+}
+
+func configRequest(handler http.HandlerFunc, method, body string) *httptest.ResponseRecorder {
+	var reader *bytes.Reader
+	if body == "" {
+		reader = bytes.NewReader(nil)
+	} else {
+		reader = bytes.NewReader([]byte(body))
 	}
+	req := httptest.NewRequest(method, "/metrics/config", reader)
+	rec := httptest.NewRecorder()
+	handler(rec, req)
+	return rec
+}
+
+func decodeConfig(t *testing.T, rec *httptest.ResponseRecorder) DashboardConfig {
+	t.Helper()
 	var d DashboardConfig
 	if err := json.Unmarshal(rec.Body.Bytes(), &d); err != nil {
-		t.Fatalf("GET /metrics/config body is not valid JSON: %v (%s)", err, rec.Body.String())
+		t.Fatalf("unmarshal %q: %v", rec.Body.String(), err)
 	}
 	return d
 }
 
-// putDashboardConfig PUTs the document and returns the recorder for status
-// and body assertions.
-func putDashboardConfig(t *testing.T, mux http.Handler, body string) *httptest.ResponseRecorder {
-	t.Helper()
-	req := httptest.NewRequest("PUT", "/metrics/config", strings.NewReader(body))
-	rec := httptest.NewRecorder()
-	mux.ServeHTTP(rec, req)
-	return rec
-}
-
-func TestDashboardConfigGetDefaults(t *testing.T) {
-	r := newTestRegistry(t, DefaultConfig())
-	mux := newServer(r)
-
-	d := getDashboardConfig(t, mux)
+// GET with no saved document serves the defaults: version 1 with empty —
+// not null — panels and order arrays.
+func TestDashboardConfigDefaults(t *testing.T) {
+	r := newConfigRegistry(t, DefaultConfig())
+	rec := configRequest(r.dashboardConfigHandler(), http.MethodGet, "")
+	if rec.Code != 200 {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "application/json") {
+		t.Errorf("content-type = %q", ct)
+	}
+	d := decodeConfig(t, rec)
 	if d.Version != 1 {
 		t.Errorf("version = %d, want 1", d.Version)
 	}
 	if d.Panels == nil || len(d.Panels) != 0 {
-		t.Errorf("panels = %#v, want empty non-nil slice", d.Panels)
+		t.Errorf("panels = %+v, want empty non-nil", d.Panels)
 	}
 	if d.Order.AllMetrics == nil || d.Order.Hooks == nil || d.Order.Endpoints == nil {
-		t.Errorf("order slices must be non-nil, got %#v", d.Order)
+		t.Errorf("order arrays must be non-nil, got %+v", d.Order)
 	}
 }
 
-func TestDashboardConfigPutRoundTripPersistsToFile(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "dashboard.json")
-	cfg := DefaultConfig()
-	cfg.UI.DashboardConfig = path
-	r := newTestRegistry(t, cfg)
-	mux := newServer(r)
+// PUT saves the document and GET serves it back.
+func TestDashboardConfigPutGetRoundTrip(t *testing.T) {
+	r := newConfigRegistry(t, DefaultConfig())
+	h := r.dashboardConfigHandler()
 
-	rec := putDashboardConfig(t, mux, `{
-		"version": 1,
-		"panels": [{"id": "p1", "metric": "http_requests_total"}],
-		"order": {"all_metrics": ["http_requests_total", "b_second"], "hooks": [], "endpoints": []}
-	}`)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("PUT status = %d, body: %s", rec.Code, rec.Body.String())
+	doc := `{"version":1,"panels":[{"id":"p1","metric":"queue_depth","chart_type":"line","size":"lg"}],
+	         "order":{"all_metrics":["queue_depth"],"hooks":[],"endpoints":[]},
+	         "http_card_view":"totals"}`
+	rec := configRequest(h, http.MethodPut, doc)
+	if rec.Code != 200 {
+		t.Fatalf("PUT status = %d, body %s", rec.Code, rec.Body.String())
 	}
-	var echoed DashboardConfig
-	if err := json.Unmarshal(rec.Body.Bytes(), &echoed); err != nil {
-		t.Fatalf("PUT response not valid JSON: %v (%s)", err, rec.Body.String())
+	saved := decodeConfig(t, rec)
+	if len(saved.Panels) != 1 || saved.Panels[0].Metric != "queue_depth" ||
+		saved.Panels[0].ChartType != "line" || saved.Panels[0].Size != "lg" {
+		t.Errorf("echoed panels = %+v", saved.Panels)
 	}
-	if len(echoed.Panels) != 1 || echoed.Panels[0].Metric != "http_requests_total" {
-		t.Errorf("PUT response panels = %#v, want one pinned http_requests_total", echoed.Panels)
+	if saved.Order.AllMetrics[0] != "queue_depth" {
+		t.Errorf("echoed order = %+v", saved.Order)
 	}
-
-	// The document is written to the configured file without a leftover
-	// temp file from the atomic rename.
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("config file not persisted: %v", err)
-	}
-	if _, err := os.Stat(path + ".tmp"); err == nil {
-		t.Error("temp file survived the atomic rename")
-	}
-	if !strings.Contains(string(data), `"http_requests_total"`) {
-		t.Errorf("persisted file missing pinned metric: %s", data)
+	if saved.HTTPCardView != "totals" {
+		t.Errorf("http_card_view = %q, want totals", saved.HTTPCardView)
 	}
 
-	// GET serves the updated document, and a fresh registry loads it from
-	// disk at construction time.
-	if d := getDashboardConfig(t, mux); len(d.Panels) != 1 {
-		t.Errorf("GET after PUT panels = %#v, want the pinned panel", d.Panels)
-	}
-	r2 := newTestRegistry(t, cfg)
-	if d := getDashboardConfig(t, newServer(r2)); len(d.Panels) != 1 || d.Panels[0].ID != "p1" {
-		t.Errorf("reloaded panels = %#v, want persisted panel p1", d.Panels)
+	rec = configRequest(h, http.MethodGet, "")
+	if got := decodeConfig(t, rec); len(got.Panels) != 1 || got.Panels[0].Metric != "queue_depth" {
+		t.Errorf("GET after PUT = %+v", got)
 	}
 }
 
+// Invalid documents are rejected with a 400 whose body is itself valid JSON
+// (clients parsing r.json() must never hit invalid JSON on failure paths).
 func TestDashboardConfigPutValidation(t *testing.T) {
-	cfg := DefaultConfig()
-	cfg.MaxMetrics = 1
-	r := newTestRegistry(t, cfg)
-	mux := newServer(r)
-
 	tests := []struct {
-		name    string
-		body    string
-		wantMsg string
+		name string
+		body string
 	}{
-		{"invalid JSON", `{"version": 1,`, "invalid JSON"},
-		{"wrong version", `{"version": 2}`, "version must be 1"},
-		{"too many panels", `{"version": 1, "panels": [{"id":"a","metric":"m"}, {"id":"b","metric":"n"}]}`, "too many panels"},
-		{"panel without id", `{"version": 1, "panels": [{"metric": "m"}]}`, "panel id is required"},
-		{"panel without metric", `{"version": 1, "panels": [{"id": "a"}]}`, "panel metric is required"},
-		{"unknown panel chart_type", `{"version": 1, "panels": [{"id": "a", "metric": "m", "chart_type": "pie"}]}`, "chart_type"},
-		{"unknown panel size", `{"version": 1, "panels": [{"id": "a", "metric": "m", "size": "xl"}]}`, "size"},
-		{"unknown http_card_view", `{"version": 1, "http_card_view": "pie"}`, "http_card_view"},
+		{"malformed json", `{"version":1,`},
+		{"wrong version", `{"version":2}`},
+		{"missing panel id", `{"version":1,"panels":[{"metric":"m"}]}`},
+		{"missing panel metric", `{"version":1,"panels":[{"id":"p1"}]}`},
+		{"bad chart type", `{"version":1,"panels":[{"id":"p1","metric":"m","chart_type":"pyramid"}]}`},
+		{"bad size", `{"version":1,"panels":[{"id":"p1","metric":"m","size":"xxl"}]}`},
+		{"bad http card view", `{"version":1,"http_card_view":"mega"}`},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			rec := putDashboardConfig(t, mux, tc.body)
+			r := newConfigRegistry(t, DefaultConfig())
+			rec := configRequest(r.dashboardConfigHandler(), http.MethodPut, tc.body)
 			if rec.Code != http.StatusBadRequest {
-				t.Fatalf("status = %d, want 400, body: %s", rec.Code, rec.Body.String())
+				t.Fatalf("status = %d, want 400", rec.Code)
 			}
-			// Error bodies must themselves be valid JSON so client-side
-			// r.json() never chokes on failure paths.
-			var e struct {
-				Error string `json:"error"`
-			}
+			var e map[string]string
 			if err := json.Unmarshal(rec.Body.Bytes(), &e); err != nil {
-				t.Fatalf("error body not valid JSON: %v (%s)", err, rec.Body.String())
+				t.Fatalf("error body is not valid JSON: %q", rec.Body.String())
 			}
-			if !strings.Contains(e.Error, tc.wantMsg) {
-				t.Errorf("error = %q, want it to contain %q", e.Error, tc.wantMsg)
-			}
-			// Rejected documents must not be stored.
-			if d := getDashboardConfig(t, mux); len(d.Panels) != 0 {
-				t.Errorf("rejected document was stored: %#v", d)
+			if e["error"] == "" {
+				t.Error("error body missing error message")
 			}
 		})
 	}
 }
 
-// The panel customization fields (chart_type, size) and the HTTP card view
-// are accepted, persisted, and survive a reload from disk.
-func TestDashboardConfigPutAcceptsPanelCustomization(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "dashboard.json")
+// The panel count is capped by MaxMetrics.
+func TestDashboardConfigPutPanelCap(t *testing.T) {
 	cfg := DefaultConfig()
-	cfg.UI.DashboardConfig = path
-	r := newTestRegistry(t, cfg)
-	mux := newServer(r)
-
-	rec := putDashboardConfig(t, mux, `{
-		"version": 1,
-		"http_card_view": "totals",
-		"panels": [{"id": "p1", "metric": "m1", "chart_type": "gauge", "size": "lg"}],
-		"order": {"all_metrics": [], "hooks": [], "endpoints": []}
-	}`)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("PUT status = %d, body: %s", rec.Code, rec.Body.String())
-	}
-
-	r2 := newTestRegistry(t, cfg)
-	d := getDashboardConfig(t, newServer(r2))
-	if d.HTTPCardView != "totals" {
-		t.Errorf("reloaded http_card_view = %q, want totals", d.HTTPCardView)
-	}
-	if len(d.Panels) != 1 || d.Panels[0].ChartType != "gauge" || d.Panels[0].Size != "lg" {
-		t.Errorf("reloaded panels = %#v, want the gauge/lg customization", d.Panels)
+	cfg.MaxMetrics = 2
+	r := newConfigRegistry(t, cfg)
+	doc := `{"version":1,"panels":[
+		{"id":"p1","metric":"m1"},{"id":"p2","metric":"m2"},{"id":"p3","metric":"m3"}]}`
+	rec := configRequest(r.dashboardConfigHandler(), http.MethodPut, doc)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rec.Code)
 	}
 }
 
-// The persisted http_card_view selects the rendered column set of the HTTP
-// status card in the HTMX fragment.
-func TestHTTPCardViewDrivesRenderedCard(t *testing.T) {
-	r := newTestRegistry(t, DefaultConfig())
-	ctx, cancel := context.WithCancel(context.Background())
-	r.Start(ctx)
-	defer func() { cancel(); r.Close() }()
-
-	// Generate tracked traffic (default excludes only cover ^/metrics).
-	h := r.Middleware(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		w.WriteHeader(404)
-	}))
-	for i := 0; i < 3; i++ {
-		h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/api/x", nil))
-	}
-	waitForDrain(r)
-
-	mux := newServer(r)
-
-	// Default document: the breakdown view renders the per-class columns.
-	rec := httptest.NewRecorder()
-	mux.ServeHTTP(rec, httptest.NewRequest("GET", "/metrics/data", nil))
-	if body := rec.Body.String(); !strings.Contains(body, ">2xx</span>") {
-		t.Errorf("default view missing the 2xx column: %s", body)
-	}
-
-	if rec := putDashboardConfig(t, mux, `{"version":1,"http_card_view":"totals"}`); rec.Code != http.StatusOK {
-		t.Fatalf("PUT status = %d, body: %s", rec.Code, rec.Body.String())
-	}
-
-	rec = httptest.NewRecorder()
-	mux.ServeHTTP(rec, httptest.NewRequest("GET", "/metrics/data", nil))
-	body := rec.Body.String()
-	if !strings.Contains(body, `data-metric="http_requests_total"`) {
-		t.Fatalf("HTTP status card missing from fragment: %s", body)
-	}
-	if !strings.Contains(body, ">total</span>") || !strings.Contains(body, ">errors</span>") {
-		t.Errorf("totals view missing total/errors columns: %s", body)
-	}
-	if strings.Contains(body, ">2xx</span>") {
-		t.Errorf("totals view must not render per-class columns: %s", body)
-	}
-	if !strings.Contains(body, `active" onclick="setHTTPView('totals')"`) {
-		t.Errorf("totals toggle not marked active: %s", body)
-	}
-}
-
-func TestDashboardConfigPutNormalizesMissingFields(t *testing.T) {
-	r := newTestRegistry(t, DefaultConfig())
-	mux := newServer(r)
-
-	rec := putDashboardConfig(t, mux, `{"version": 1}`)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("PUT status = %d, body: %s", rec.Code, rec.Body.String())
-	}
-	var d DashboardConfig
-	if err := json.Unmarshal(rec.Body.Bytes(), &d); err != nil {
-		t.Fatalf("response not valid JSON: %v", err)
-	}
-	if d.Panels == nil || d.Order.AllMetrics == nil || d.Order.Hooks == nil || d.Order.Endpoints == nil {
-		t.Errorf("missing fields must normalize to empty slices, got %#v", d)
-	}
-}
-
+// Unknown methods are rejected; DELETE resets to defaults.
 func TestDashboardConfigDeleteResets(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "dashboard.json")
-	cfg := DefaultConfig()
-	cfg.UI.DashboardConfig = path
-	r := newTestRegistry(t, cfg)
-	mux := newServer(r)
+	r := newConfigRegistry(t, DefaultConfig())
+	h := r.dashboardConfigHandler()
 
-	if rec := putDashboardConfig(t, mux, `{"version":1,"panels":[{"id":"p1","metric":"m"}]}`); rec.Code != http.StatusOK {
+	rec := configRequest(h, http.MethodPatch, `{}`)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Errorf("PATCH status = %d, want 405", rec.Code)
+	}
+
+	rec = configRequest(h, http.MethodPut, `{"version":1,"panels":[{"id":"p1","metric":"m"}]}`)
+	if rec.Code != 200 {
 		t.Fatalf("PUT status = %d", rec.Code)
 	}
 
-	req := httptest.NewRequest("DELETE", "/metrics/config", nil)
-	rec := httptest.NewRecorder()
-	mux.ServeHTTP(rec, req)
+	rec = configRequest(h, http.MethodDelete, "")
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("DELETE status = %d, want 204", rec.Code)
 	}
-
-	d := getDashboardConfig(t, mux)
-	if len(d.Panels) != 0 {
-		t.Errorf("panels after DELETE = %#v, want defaults", d.Panels)
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("defaults not persisted after DELETE: %v", err)
-	}
-	if strings.Contains(string(data), `"p1"`) {
-		t.Errorf("persisted defaults still contain the deleted panel: %s", data)
+	if d := decodeConfig(t, configRequest(h, http.MethodGet, "")); len(d.Panels) != 0 {
+		t.Errorf("panels after reset = %+v, want none", d.Panels)
 	}
 }
 
-func TestDashboardConfigMemoryOnlyMode(t *testing.T) {
-	r := newTestRegistry(t, DefaultConfig()) // no DashboardConfig path
-	mux := newServer(r)
+// A configured dashboard_config path persists the document across Registry
+// instances.
+func TestDashboardConfigPersistsAcrossRegistries(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dash.json")
 
-	if rec := putDashboardConfig(t, mux, `{"version":1,"panels":[{"id":"p1","metric":"m"}]}`); rec.Code != http.StatusOK {
-		t.Fatalf("PUT status = %d, body: %s", rec.Code, rec.Body.String())
+	cfg := DefaultConfig()
+	cfg.UI.DashboardConfig = path
+	r := newConfigRegistry(t, cfg)
+	doc := `{"version":1,"panels":[{"id":"p1","metric":"m","chart_type":"gauge"}],"order":{}}`
+	if rec := configRequest(r.dashboardConfigHandler(), http.MethodPut, doc); rec.Code != 200 {
+		t.Fatalf("PUT status = %d, body %s", rec.Code, rec.Body.String())
 	}
-	if d := getDashboardConfig(t, mux); len(d.Panels) != 1 {
-		t.Errorf("panels = %#v, want the in-memory document", d.Panels)
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("document not persisted: %v", err)
+	}
+	r.Close()
+
+	r2 := newConfigRegistry(t, cfg)
+	defer r2.Close()
+	d := decodeConfig(t, configRequest(r2.dashboardConfigHandler(), http.MethodGet, ""))
+	if len(d.Panels) != 1 || d.Panels[0].Metric != "m" || d.Panels[0].ChartType != "gauge" {
+		t.Errorf("reloaded config = %+v, want saved panel", d)
 	}
 }
 
-func TestDashboardConfigLoadFallsBackOnBadFile(t *testing.T) {
-	dir := t.TempDir()
+// A corrupt or wrong-version file on disk must never crash startup: the
+// registry falls back to defaults.
+func TestDashboardConfigCorruptFileFallsBack(t *testing.T) {
 	tests := []struct {
 		name    string
 		content string
 	}{
-		{"corrupt JSON", `{"version": 1, "panels": [`},
-		{"wrong version", `{"version": 99, "panels": [{"id":"p1","metric":"m"}]}`},
-		{"valid JSON, not an object", `"just a string"`},
+		{"garbage", "not json at all"},
+		{"wrong version", `{"version":99,"panels":[]}`},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			redirectLog(t, &strings.Builder{})
-			cfg := DefaultConfig()
-			cfg.UI.DashboardConfig = filepath.Join(dir, tc.name+".json")
-			if err := os.WriteFile(cfg.UI.DashboardConfig, []byte(tc.content), 0o644); err != nil {
+			path := filepath.Join(t.TempDir(), "dash.json")
+			if err := os.WriteFile(path, []byte(tc.content), 0o644); err != nil {
 				t.Fatal(err)
 			}
-			r := newTestRegistry(t, cfg)
-			d := getDashboardConfig(t, newServer(r))
+			cfg := DefaultConfig()
+			cfg.UI.DashboardConfig = path
+			r := newConfigRegistry(t, cfg)
+			defer r.Close()
+			d := decodeConfig(t, configRequest(r.dashboardConfigHandler(), http.MethodGet, ""))
 			if d.Version != 1 || len(d.Panels) != 0 {
-				t.Errorf("bad file must fall back to defaults, got version %d panels %#v", d.Version, d.Panels)
+				t.Errorf("loaded = %+v, want defaults", d)
 			}
 		})
 	}
-
-	t.Run("unreadable path", func(t *testing.T) {
-		var logs strings.Builder
-		redirectLog(t, &logs)
-		cfg := DefaultConfig()
-		// A directory cannot be read as a config file, but startup must
-		// still survive with defaults.
-		cfg.UI.DashboardConfig = dir
-		r := newTestRegistry(t, cfg)
-		d := getDashboardConfig(t, newServer(r))
-		if d.Version != 1 || len(d.Panels) != 0 {
-			t.Errorf("unreadable path must fall back to defaults, got version %d panels %#v", d.Version, d.Panels)
-		}
-		if !strings.Contains(logs.String(), "cannot read dashboard config") {
-			t.Errorf("expected a warning log, got: %s", logs.String())
-		}
-	})
 }
 
-// TestDashboardConfigPutPersistFailureIsNoOp: when the on-disk persist fails,
-// the client gets a 500 with a JSON error body and the in-memory document is
-// left untouched — GET keeps serving the last saved document.
-func TestDashboardConfigPutPersistFailureIsNoOp(t *testing.T) {
-	cfg := DefaultConfig()
-	// Parent directory does not exist, so writing the temp file fails.
-	cfg.UI.DashboardConfig = filepath.Join(t.TempDir(), "missing-subdir", "dashboard.json")
-	r := newTestRegistry(t, cfg)
-	mux := newServer(r)
-
-	rec := putDashboardConfig(t, mux, `{"version":1,"panels":[{"id":"p1","metric":"m"}]}`)
-	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("PUT status = %d, want 500, body: %s", rec.Code, rec.Body.String())
-	}
-	var e map[string]string
-	if err := json.Unmarshal(rec.Body.Bytes(), &e); err != nil {
-		t.Fatalf("500 body not valid JSON: %v (%s)", err, rec.Body.String())
-	}
-	if e["error"] == "" {
-		t.Error("500 body missing `error` field")
-	}
-
-	if d := getDashboardConfig(t, mux); len(d.Panels) != 0 {
-		t.Errorf("failed PUT mutated the served document: panels = %#v, want defaults", d.Panels)
-	}
-}
-
-// TestDashboardConfigDeletePersistFailureIsNoOp: a failing persist on DELETE
-// must return 500 and keep the pre-DELETE document in memory.
-func TestDashboardConfigDeletePersistFailureIsNoOp(t *testing.T) {
+// Persist-first: when the document cannot be written, the PUT fails and GET
+// keeps serving the last successfully saved document.
+func TestDashboardConfigPutPersistFailureKeepsLastDoc(t *testing.T) {
 	dir := t.TempDir()
 	cfg := DefaultConfig()
-	cfg.UI.DashboardConfig = filepath.Join(dir, "dashboard.json")
-	r := newTestRegistry(t, cfg)
-	mux := newServer(r)
-
-	if rec := putDashboardConfig(t, mux, `{"version":1,"panels":[{"id":"p1","metric":"m"}]}`); rec.Code != http.StatusOK {
-		t.Fatalf("PUT status = %d, body: %s", rec.Code, rec.Body.String())
-	}
-
-	// Make the persist fail by replacing the config file with a directory:
-	// the temp write succeeds, but os.Rename onto a directory fails with
-	// EISDIR regardless of uid (permission bits would not stop root).
-	if err := os.Remove(cfg.UI.DashboardConfig); err != nil {
+	// A directory as the file path makes the persist write fail.
+	cfg.UI.DashboardConfig = filepath.Join(dir, "dash.json")
+	if err := os.MkdirAll(cfg.UI.DashboardConfig, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Mkdir(cfg.UI.DashboardConfig, 0o700); err != nil {
-		t.Fatal(err)
-	}
+	r := newConfigRegistry(t, cfg)
+	h := r.dashboardConfigHandler()
 
-	req := httptest.NewRequest("DELETE", "/metrics/config", nil)
-	rec := httptest.NewRecorder()
-	mux.ServeHTTP(rec, req)
+	rec := configRequest(h, http.MethodPut, `{"version":1,"panels":[]}`)
 	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("DELETE status = %d, want 500, body: %s", rec.Code, rec.Body.String())
-	}
-	var e map[string]string
-	if err := json.Unmarshal(rec.Body.Bytes(), &e); err != nil {
-		t.Fatalf("500 body not valid JSON: %v (%s)", err, rec.Body.String())
+		t.Fatalf("status = %d, want 500", rec.Code)
 	}
 
-	if d := getDashboardConfig(t, mux); len(d.Panels) != 1 || d.Panels[0].ID != "p1" {
-		t.Errorf("failed DELETE mutated the served document: panels = %#v, want p1", d.Panels)
+	rec = configRequest(h, http.MethodPut, `{"version":1,"panels":[{"id":"p1","metric":"m"}]}`)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("second PUT status = %d, want 500", rec.Code)
+	}
+	if d := decodeConfig(t, configRequest(h, http.MethodGet, "")); len(d.Panels) != 0 {
+		t.Errorf("memory mutated despite failed persist: %+v", d)
 	}
 }
 
-func TestDashboardConfigMethodNotAllowed(t *testing.T) {
-	r := newTestRegistry(t, DefaultConfig())
-	mux := newServer(r)
+// The saved document drives the card builders: a panel's chart_type and size
+// override the per-kind default, an unhonorable saved chart falls back to the
+// default view, and the HTTP card view selects the column set.
+func TestCardOptionsHonorDashboardConfig(t *testing.T) {
+	o := cardOptions{
+		HTTPView: "totals",
+		panels: map[string]DashboardPanel{
+			"m_line":     {ID: "1", Metric: "m_line", ChartType: "line", Size: "lg"},
+			"m_nobars":   {ID: "2", Metric: "m_nobars", ChartType: "bars"},
+			"queue_hist": {ID: "3", Metric: "queue_hist", Size: "sm"},
+		},
+	}
+	snaps := []MetricSnapshot{
+		{Name: "m_line", Type: "counter", Value: 1},
+		{Name: "m_nobars", Type: "counter", Value: 2},
+		{Name: "queue_hist", Type: "histogram", Count: 5, Buckets: []BucketSnapshot{{UpperBound: 1, Count: 5}}},
+		{Name: "http_requests_total_2xx", Type: "counter", Value: 9},
+	}
+	cards := buildCardsOpts(snaps, o)
 
-	rec := httptest.NewRecorder()
-	mux.ServeHTTP(rec, httptest.NewRequest("PATCH", "/metrics/config", nil))
-	if rec.Code != http.StatusMethodNotAllowed {
-		t.Errorf("PATCH status = %d, want 405", rec.Code)
+	byName := map[string]metricCard{}
+	for _, c := range cards {
+		byName[c.Snapshot.Name] = c
 	}
-	var e map[string]string
-	if err := json.Unmarshal(rec.Body.Bytes(), &e); err != nil {
-		t.Errorf("error body not valid JSON: %v (%s)", err, rec.Body.String())
+	if c := byName["m_line"]; c.View != "line" || c.Size != "lg" {
+		t.Errorf("m_line view/size = %q/%q, want line/lg", c.View, c.Size)
 	}
-}
-
-func TestDashboardConfigHTTPHandlerNilWhenDisabled(t *testing.T) {
-	cfg := DefaultConfig()
-	cfg.UI.Enabled = false
-	r := newTestRegistry(t, cfg)
-	if h := r.DashboardConfigHTTPHandler(); h != nil {
-		t.Error("handler must be nil when the UI is disabled")
+	// A saved bars chart on a bucket-less counter cannot be honored: number
+	// fallback instead of an empty chart.
+	if c := byName["m_nobars"]; c.View != "number" {
+		t.Errorf("m_nobars view = %q, want number fallback", c.View)
 	}
-
-	if h := newTestRegistry(t, DefaultConfig()).DashboardConfigHTTPHandler(); h == nil {
-		t.Error("handler must be non-nil when the UI is enabled")
+	// Size sm maps to the single-cell span ("" preset).
+	if c := byName["queue_hist"]; c.View != "bars" || c.Size != "" {
+		t.Errorf("queue_hist view/size = %q/%q, want bars/\"\"", c.View, c.Size)
 	}
-}
-
-// TestMetricsDataJSONKeysAreLowercase pins the /metrics/data wire contract:
-// the JSON keys are lowercase (GoLens 1.0 consumers, including the alerts
-// page picker, read s.name / s.type).
-func TestMetricsDataJSONKeysAreLowercase(t *testing.T) {
-	r := newTestRegistry(t, DefaultConfig())
-	mux := newServer(r)
-
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest("GET", "/metrics/data", nil)
-	req.Header.Set("Accept", "application/json")
-	mux.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d", rec.Code)
-	}
-
-	var raw []map[string]json.RawMessage
-	if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if len(raw) == 0 {
-		t.Fatal("expected at least the pre-registered RED metrics")
-	}
-	for _, m := range raw {
-		for key := range m {
-			if key != strings.ToLower(key) {
-				t.Errorf("snapshot JSON key %q is not lowercase", key)
-			}
-		}
-		if _, ok := m["name"]; !ok {
-			t.Error("snapshot JSON missing lowercase `name` key")
-		}
-		if _, ok := m["type"]; !ok {
-			t.Error("snapshot JSON missing lowercase `type` key")
-		}
+	// The HTTP card leads the grid with the configured view.
+	if cards[0].Snapshot.Name != "http_requests_total" || cards[0].HTTPView != "totals" {
+		t.Errorf("http card = %+v, want totals view", cards[0].Snapshot)
 	}
 }

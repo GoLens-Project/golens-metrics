@@ -296,6 +296,145 @@ func TestAlertRuleDeleteHandler(t *testing.T) {
 	}
 }
 
+// The firing-status endpoint (GET /metrics/alerts/status) reports the live
+// count of enabled rules whose condition currently holds — the figure behind
+// the dashboard's status dot and firing-count pill. Cooldown suppression does
+// not apply, and disabled or unknown-metric rules are never counted.
+func TestAlertStatusHandler(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Alerts.Enabled = true
+	r := newTestRegistry(t, cfg)
+	ctx, cancel := context.WithCancel(context.Background())
+	r.Start(ctx)
+	defer func() { cancel(); r.Close() }()
+
+	// A gauge: recorded values replace, so the easing phase below can lower
+	// the observed value.
+	r.Register("job_depth", GaugeType, "job depth", nil, nil, 0, 0)
+	r.Record("job_depth", 15)
+	waitForDrain(r)
+
+	al := r.Alerter()
+	if _, err := al.AddRule(AlertRule{Name: "hot", Metric: "job_depth", Condition: ConditionGT, Threshold: 10}); err != nil {
+		t.Fatalf("AddRule hot: %v", err)
+	}
+	if _, err := al.AddRule(AlertRule{Name: "cold", Metric: "job_depth", Condition: ConditionLT, Threshold: 1}); err != nil {
+		t.Fatalf("AddRule cold: %v", err)
+	}
+	if _, err := al.AddRule(AlertRule{Name: "ghost", Metric: "no_such_metric", Condition: ConditionGT, Threshold: 0}); err != nil {
+		t.Fatalf("AddRule ghost: %v", err)
+	}
+	sleeping, err := al.AddRule(AlertRule{Name: "sleeping", Metric: "job_depth", Condition: ConditionGT, Threshold: 0})
+	if err != nil {
+		t.Fatalf("AddRule sleeping: %v", err)
+	}
+	if err := al.ToggleRule(sleeping.ID, false); err != nil {
+		t.Fatalf("ToggleRule: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	r.alertStatusHandler().ServeHTTP(rec, httptest.NewRequest("GET", "/metrics/alerts/status", nil))
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "application/json") {
+		t.Errorf("content-type = %q, want application/json", ct)
+	}
+	var got struct {
+		Firing int `json:"firing"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal %q: %v", rec.Body.String(), err)
+	}
+	// Only "hot" fires: "cold" and the disabled rule do not hold, "ghost"
+	// has no snapshots to evaluate against.
+	if got.Firing != 1 {
+		t.Errorf("firing = %d, want 1", got.Firing)
+	}
+
+	// The count is live: easing the metric value drops it to zero on the
+	// next request, no evaluation tick needed. Cooldown suppression does not
+	// apply either — an evaluation pass that fires and starts the cooldown
+	// leaves the firing figure at 1 while the condition still holds.
+	al.evaluate(context.Background())
+	rec = httptest.NewRecorder()
+	r.alertStatusHandler().ServeHTTP(rec, httptest.NewRequest("GET", "/metrics/alerts/status", nil))
+	got.Firing = -1
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.Firing != 1 {
+		t.Errorf("firing during cooldown = %d, want 1 (status reflects the condition, not suppression)", got.Firing)
+	}
+
+	r.Record("job_depth", 1)
+	waitForDrain(r)
+	rec = httptest.NewRecorder()
+	r.alertStatusHandler().ServeHTTP(rec, httptest.NewRequest("GET", "/metrics/alerts/status", nil))
+	got.Firing = -1
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.Firing != 0 {
+		t.Errorf("firing after easing = %d, want 0", got.Firing)
+	}
+}
+
+// Histogram rules compare the window average in the firing count, matching
+// the evaluate path.
+func TestAlertStatusHandlerHistogramUsesAvg(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Alerts.Enabled = true
+	r := newTestRegistry(t, cfg)
+	ctx, cancel := context.WithCancel(context.Background())
+	r.Start(ctx)
+	defer func() { cancel(); r.Close() }()
+
+	r.Register("latency", HistogramType, "latency", nil, []float64{5}, 0, 0)
+	r.Record("latency", 10)
+	r.Record("latency", 10)
+	waitForDrain(r)
+
+	al := r.Alerter()
+	// A histogram snapshot carries no Value (0), only Avg — samples 10,10
+	// give avg=10. avg > 5 fires; a raw-value comparison (0 > 5) would not,
+	// so a count of 1 proves the avg path is taken.
+	if _, err := al.AddRule(AlertRule{Name: "avg", Metric: "latency", Condition: ConditionGT, Threshold: 5}); err != nil {
+		t.Fatalf("AddRule: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	r.alertStatusHandler().ServeHTTP(rec, httptest.NewRequest("GET", "/metrics/alerts/status", nil))
+	var got struct {
+		Firing int `json:"firing"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.Firing != 1 {
+		t.Errorf("firing = %d, want 1 (histogram compares avg, not raw value)", got.Firing)
+	}
+}
+
+// The status endpoint is mounted on the mux alongside the other alert
+// routes.
+func TestAlertStatusRouteMounted(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Alerts.Enabled = true
+	r := newTestRegistry(t, cfg)
+	mux := http.NewServeMux()
+	r.MountUI(mux)
+
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest("GET", "/metrics/alerts/status", nil))
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), `"firing"`) {
+		t.Errorf("body = %q, want firing key", rec.Body.String())
+	}
+}
+
 func TestAlertLogHandler(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.Alerts.Enabled = true
@@ -332,6 +471,40 @@ func TestAlertsPageHandler(t *testing.T) {
 	}
 	if !strings.Contains(body, "Alert Log") {
 		t.Error("missing Alert Log section")
+	}
+}
+
+// The alerts page shares the vendored asset set and the configurable
+// subtitle with the dashboard — no CDN references, and the brand dot is
+// addressable so its state is driven by /metrics/alerts/status, not a
+// hard-coded alarm style.
+func TestAlertsPageBranding(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Alerts.Enabled = true
+	r := newTestRegistry(t, cfg)
+	ctx, cancel := context.WithCancel(context.Background())
+	r.Start(ctx)
+	defer func() { cancel(); r.Close() }()
+
+	rec := httptest.NewRecorder()
+	r.alertsPageHandler().ServeHTTP(rec, httptest.NewRequest("GET", "/metrics/alerts", nil))
+	body := rec.Body.String()
+
+	if !strings.Contains(body, "discovery dashboard") {
+		t.Error("alerts page missing the configurable dashboard subtitle")
+	}
+	for _, asset := range []string{"/metrics/static/styles.css", "/metrics/static/common.js", "/metrics/static/alerts.js", "/metrics/static/alpine.min.js"} {
+		if !strings.Contains(body, asset) {
+			t.Errorf("vendored asset %s not referenced", asset)
+		}
+	}
+	for _, cdn := range []string{"cdn.tailwindcss.com", "unpkg.com", "fonts.googleapis.com"} {
+		if strings.Contains(body, cdn) {
+			t.Errorf("alerts page still references external CDN %s", cdn)
+		}
+	}
+	if !strings.Contains(body, `id="brand-dot"`) {
+		t.Error("alerts page missing status brand dot")
 	}
 }
 
@@ -1538,6 +1711,12 @@ func TestAlertsHTTPHandlers(t *testing.T) {
 		t.Error("AlertLogHTTPHandler returned nil")
 	}
 
+	// Test AlertStatusHTTPHandler
+	h = r.AlertStatusHTTPHandler()
+	if h == nil {
+		t.Error("AlertStatusHTTPHandler returned nil")
+	}
+
 	// Test AlertTemplatesHTTPHandler
 	h = r.AlertTemplatesHTTPHandler()
 	if h == nil {
@@ -1565,6 +1744,9 @@ func TestAlertsHTTPHandlersDisabled(t *testing.T) {
 	}
 	if h := r.AlertLogHTTPHandler(); h != nil {
 		t.Error("AlertLogHTTPHandler should be nil when alerts disabled")
+	}
+	if h := r.AlertStatusHTTPHandler(); h != nil {
+		t.Error("AlertStatusHTTPHandler should be nil when alerts disabled")
 	}
 	if h := r.AlertTemplatesHTTPHandler(); h != nil {
 		t.Error("AlertTemplatesHTTPHandler should be nil when alerts disabled")

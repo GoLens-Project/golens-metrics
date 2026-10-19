@@ -1,6 +1,8 @@
 package golens
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -120,4 +122,43 @@ func floatEq(a, b float64) bool {
 		d = -d
 	}
 	return d < eps
+}
+
+// The JSON encoding of MetricSnapshot and BucketSnapshot is the stable
+// public API contract for /metrics/data: snake_case keys, labels as
+// name/value objects, and an overflow flag that is present even when false
+// so clients can filter on the flag instead of the bound value.
+func TestSnapshotJSONContract(t *testing.T) {
+	s := MetricSnapshot{
+		Name:        "m",
+		Type:        "histogram",
+		Description: "d",
+		Labels:      []string{"code"},
+		LabelValues: []Label{{Name: "code", Value: "200"}},
+		Value:       1,
+		Count:       2,
+		Sum:         3,
+		Avg:         1.5,
+		UpdatedAt:   7,
+		Buckets: []BucketSnapshot{
+			{UpperBound: 1, Count: 2},
+			{UpperBound: 0, Count: 0, Overflow: true},
+		},
+	}
+	b, err := json.Marshal(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := string(b)
+	for _, key := range []string{
+		`"name":"m"`, `"type":"histogram"`, `"description":"d"`,
+		`"labels":["code"]`, `"label_values":[{"name":"code","value":"200"}]`,
+		`"value":1`, `"count":2`, `"sum":3`, `"avg":1.5`, `"updated_at":7`,
+		`"upper_bound":1,"count":2,"overflow":false`,
+		`"overflow":true`,
+	} {
+		if !strings.Contains(out, key) {
+			t.Errorf("serialized snapshot missing %s: %s", key, out)
+		}
+	}
 }

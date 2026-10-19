@@ -339,6 +339,44 @@ func (a *alerter) ListRules() []AlertRule {
 	return out
 }
 
+// FiringCount returns the number of enabled rules whose condition currently
+// holds against the latest metric snapshots. Evaluated on request from the
+// same value logic as evaluate (histograms compare their average), it is the
+// live "firing now" figure behind the dashboard status dot; cooldown
+// suppression does not apply.
+func (a *alerter) FiringCount() int {
+	a.mu.RLock()
+	rules := make([]AlertRule, 0, len(a.rules))
+	for _, r := range a.rules {
+		if r.Enabled {
+			rules = append(rules, *r)
+		}
+	}
+	a.mu.RUnlock()
+
+	snapshots := a.registry.Snapshots()
+	byName := make(map[string]MetricSnapshot, len(snapshots))
+	for _, s := range snapshots {
+		byName[s.Name] = s
+	}
+
+	n := 0
+	for _, r := range rules {
+		snap, ok := byName[r.Metric]
+		if !ok {
+			continue
+		}
+		v := snap.Value
+		if snap.Type == "histogram" && snap.Count > 0 {
+			v = snap.Avg
+		}
+		if evaluateCondition(v, r.Condition, r.Threshold) {
+			n++
+		}
+	}
+	return n
+}
+
 // ToggleRule enables or disables a rule by ID.
 func (a *alerter) ToggleRule(id string, enabled bool) error {
 	a.mu.Lock()

@@ -25,7 +25,11 @@
   --text-soft: #cbd5e1;
   --text-muted: #94a3b8;
   --text-faint: #64748b;
-  --text-ghost: #475569;
+  /* ghost is reserved for placeholders/decorative separators, and it is
+     pinned to the faint value so "dim but legible" is the floor — the old
+     #475569 sat at 2.36:1 on the surface, illegible for anything
+     informative (which now uses faint or muted directly). */
+  --text-ghost: #64748b;
   --accent: #34d399;
   --accent-ink: #020617;
   --danger: #ef4444;
@@ -50,7 +54,7 @@ html.light {
   --text-soft: #334155;
   --text-muted: #475569;
   --text-faint: #64748b;
-  --text-ghost: #94a3b8;
+  --text-ghost: #64748b;
   --scrollbar: #cbd5e1;
 }
 
@@ -108,7 +112,7 @@ h1, h2, h3 { margin: 0; font-weight: 600; }
   font-weight: 400;
   text-transform: uppercase;
   letter-spacing: 0.05em;
-  color: var(--text-faint);
+  color: var(--text-muted);
 }
 .section-title-accent { color: #c084fc; }
 .nowrap { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -204,6 +208,9 @@ h1, h2, h3 { margin: 0; font-weight: 600; }
   color: var(--text-faint);
 }
 .status-pill-ok { border-color: rgba(16, 185, 129, 0.3); background: rgba(16, 185, 129, 0.1); color: #34d399; }
+.status-pill-alert { border-color: rgba(244, 63, 94, 0.3); background: rgba(244, 63, 94, 0.1); color: #fb7185; }
+/* The base rule's display beats the UA [hidden] style, so un-hide explicitly. */
+.status-pill[hidden] { display: none; }
 .status-dot { display: inline-block; width: 0.375rem; height: 0.375rem; border-radius: 9999px; background: var(--text-ghost); }
 .status-dot-ok { background: #34d399; }
 
@@ -335,9 +342,31 @@ select.input { font-family: var(--font-mono); }
 }
 .dragging { opacity: 0.4; outline: 2px solid rgba(52, 211, 153, 0.6); outline-offset: -2px; }
 
+/* Card-header reorder buttons: move earlier/later (keyboard- and
+   touch-reachable) and pin-to-My-Charts. */
+.move-btns { display: flex; gap: 0.25rem; flex-shrink: 0; }
+.move-btn, .pin-add {
+  width: 1.25rem;
+  height: 1.25rem;
+  padding: 0;
+  border-radius: 0.25rem;
+  border: 1px solid var(--border);
+  background: none;
+  color: var(--text-faint);
+  font-size: 0.75rem;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: background-color 0.15s ease, color 0.15s ease;
+}
+.move-btn:hover, .pin-add:hover { background: var(--raised); color: var(--text-body); }
+.pin-add { color: var(--text-muted); }
+
 .card-head { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; margin-bottom: 0.5rem; }
 .card-head .meta { min-width: 0; }
-.card-name { font-family: var(--font-mono); font-size: 0.75rem; color: var(--text-faint); }
+.card-name { font-family: var(--font-mono); font-size: 0.75rem; color: var(--text-muted); }
 .card-desc { font-size: 0.875rem; color: var(--text-muted); }
 .card-sub { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; margin-bottom: 0.25rem; }
 .card-stat { font-family: var(--font-mono); font-size: 0.75rem; color: var(--text-muted); }
@@ -389,6 +418,9 @@ select.input { font-family: var(--font-mono); }
 }
 .bar-histogram { background: #a855f7; }
 .bar-histogram:hover { background: #c084fc; }
+/* Empty bucket: a 1px hollow tick on the baseline so the axis stays legible
+   without implying data. */
+.bar-zero { height: 0; border-top: 1px dashed var(--raised-hover); border-radius: 0; cursor: default; }
 .bar-tip {
   position: absolute;
   top: -1.75rem;
@@ -472,8 +504,6 @@ select.input { font-family: var(--font-mono); }
 .gauge-dial-box { position: relative; width: 10rem; height: 5rem; margin: 0 auto; overflow: hidden; }
 .gauge-dial { position: absolute; inset: 0; width: 100%; height: 100%; }
 .gauge-track { stroke: var(--raised); }
-.gauge-zone-danger { stroke: #ef4444; }
-.gauge-zone-safe { stroke: #22c55e; }
 .gauge-needle { stroke: var(--text); }
 .gauge-hub { fill: var(--text); }
 .gauge-value-row { display: flex; align-items: baseline; justify-content: center; margin-top: 0.5rem; }
@@ -565,7 +595,7 @@ html.light .cell-danger { color: #b45309; }
 }
 .disclose-caret { width: 0.75rem; height: 0.75rem; color: var(--text-faint); transition: transform 0.2s ease; }
 .disclose-caret-open { transform: rotate(90deg); }
-.disclose:hover .section-title { color: var(--text-muted); }
+.disclose:hover .section-title { color: var(--text-soft); }
 .disclose .section-title { transition: color 0.15s ease; }
 
 /* --- modals ------------------------------------------------------------------- */
@@ -649,11 +679,11 @@ details.tpl-help summary:hover { color: var(--text-muted); }
 
 /* --- pinned section ------------------------------------------------------------ */
 
-.pin-remove {
-  position: absolute;
-  top: 0.5rem;
-  right: 0.5rem;
-  z-index: 10;
+/* Pin-slot actions sit top-right; each pinned clone's own card buttons are
+   inert (the clone has no data-metric), so only these show. */
+.pin-actions { position: absolute; top: 0.5rem; right: 0.5rem; z-index: 10; display: flex; gap: 0.25rem; }
+#pinned .move-btns { display: none; }
+.pin-remove, .pin-btn {
   width: 1.5rem;
   height: 1.5rem;
   border-radius: 9999px;
@@ -668,6 +698,7 @@ details.tpl-help summary:hover { color: var(--text-muted); }
   transition: background-color 0.15s ease;
 }
 .pin-remove:hover { background: rgba(244, 63, 94, 0.85); }
+.pin-btn:hover { background: var(--raised-hover); }
 .pin-missing { padding: 1.25rem; font-family: var(--font-mono); font-size: 0.75rem; color: var(--text-ghost); }
 .pin-slot { position: relative; }
 
@@ -731,12 +762,8 @@ details.tpl-help summary:hover { color: var(--text-muted); }
 /* --- canvas chart text (theme-aware via JS-read tokens) ----------------------------- */
 
 .chart-legend-bucket { display: flex; flex-wrap: wrap; gap: 0.5rem; font-family: var(--font-mono); font-size: 0.625rem; color: var(--text-ghost); margin-top: 0.25rem; }
-.bucket-swatch-0 { color: #c084fc; }
-.bucket-swatch-1 { color: #a78bfa; }
-.bucket-swatch-2 { color: #8b5cf6; }
-.bucket-swatch-3 { color: #7c3aed; }
-.bucket-swatch-4 { color: #6d28d9; }
-.bucket-swatch-5 { color: #d8b4fe; }
+/* Legend swatch colors come from the same JS palette array that draws the
+   chart (bucketColors in dashboard.js), set inline per entry. */
 
 /* --- late additions ----------------------------------------------------------------- */
 

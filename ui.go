@@ -55,6 +55,7 @@ func (r *Registry) MountUI(mux *http.ServeMux) {
 	// Alert subsystem routes.
 	if r.alerter != nil {
 		mux.Handle("/metrics/alerts", wrap(r.alertsPageHandler()))
+		mux.Handle("/metrics/alerts/status", wrap(r.alertStatusHandler()))
 		mux.Handle("/metrics/alerts/rules", wrap(r.alertRulesHandler()))
 		mux.Handle("/metrics/alerts/rules/", wrap(r.alertRuleDeleteHandler()))
 		mux.Handle("/metrics/alerts/log", wrap(r.alertLogHandler()))
@@ -165,6 +166,16 @@ func (r *Registry) AlertsPageHTTPHandler() http.Handler {
 		return nil
 	}
 	return r.alertsPageHandler()
+}
+
+// AlertStatusHTTPHandler returns the alert firing-status handler
+// (GET /metrics/alerts/status, body {firing: n}). Returns nil if alerts are
+// disabled.
+func (r *Registry) AlertStatusHTTPHandler() http.Handler {
+	if r.alerter == nil {
+		return nil
+	}
+	return r.alertStatusHandler()
 }
 
 // AlertRulesHTTPHandler returns the alert rules CRUD handler (GET list, POST create/update).
@@ -357,8 +368,9 @@ func (r *Registry) alertsPageHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, req *http.Request) {
 		hasNotifier := r.alerter != nil && r.alerter.HasNotifier()
 		data := map[string]interface{}{
-			"ProjectName": r.cfg.ProjectName,
-			"HasNotifier": hasNotifier,
+			"ProjectName":       r.cfg.ProjectName,
+			"DashboardSubtitle": r.cfg.DashboardSubtitle,
+			"HasNotifier":       hasNotifier,
 		}
 		var buf bytes.Buffer
 		if err := alertsPageTpl.Execute(&buf, data); err != nil {
@@ -367,6 +379,14 @@ func (r *Registry) alertsPageHandler() http.HandlerFunc {
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = w.Write(buf.Bytes())
+	}
+}
+
+// alertStatusHandler returns the current alert firing count as JSON, polling
+// the dashboard's status dot and firing-count pill.
+func (r *Registry) alertStatusHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, req *http.Request) {
+		writeJSON(w, map[string]int{"firing": r.alerter.FiringCount()})
 	}
 }
 
@@ -450,6 +470,7 @@ type metricCard struct {
 	Size         string // grid span preset: "" single cell, "md" half width, "lg" full width
 	DisplayValue string // formatted numeric value
 	Unit         string // value unit label
+	Hook         bool   // rendered in the Hooks grid (not pinnable — it has no All Metrics card)
 	Bars         []histBar
 	HTTPColumns  []httpColumn // for the HTTP status card
 	HTTPView     string       // status card column set: breakdown / totals
@@ -464,6 +485,7 @@ type histBar struct {
 	HeightPct int    // 0..100 relative to the busiest bucket
 	Label     string // tooltip text, e.g. "≤0.005s: 50"
 	Axis      string // axis label, e.g. "0.005" or "+Inf"
+	Zero      bool   // empty bucket: rendered as a 1px hollow tick, not a bar
 }
 
 type httpColumn struct {
@@ -668,7 +690,7 @@ func buildHookCards(snaps []MetricSnapshot) []metricCard {
 		if !isHookMetric(s.Name) {
 			continue
 		}
-		c := metricCard{Snapshot: s}
+		c := metricCard{Snapshot: s, Hook: true}
 		applyCardDefaults(&c, s, DashboardPanel{})
 		cards = append(cards, c)
 	}
@@ -810,7 +832,8 @@ func sumMetrics(snaps []MetricSnapshot) float64 {
 }
 
 // buildBars turns histogram buckets into render-ready bars. The busiest bucket
-// is 100% height; empty buckets get a 2% sliver so the axis stays legible.
+// is 100% height; empty buckets render as a 1px hollow baseline tick (Zero
+// sets the style hook) so the axis stays legible without implying data.
 func buildBars(buckets []BucketSnapshot) []histBar {
 	var max int64
 	for _, b := range buckets {
@@ -820,7 +843,7 @@ func buildBars(buckets []BucketSnapshot) []histBar {
 	}
 	bars := make([]histBar, 0, len(buckets))
 	for _, b := range buckets {
-		h := 2
+		h := 0
 		if max > 0 && b.Count > 0 {
 			h = int(b.Count * 100 / max)
 			if h < 2 {
@@ -836,7 +859,7 @@ func buildBars(buckets []BucketSnapshot) []histBar {
 			label = "≤" + s + "s: " + strconv.FormatInt(b.Count, 10)
 			axis = s
 		}
-		bars = append(bars, histBar{HeightPct: h, Label: label, Axis: axis})
+		bars = append(bars, histBar{HeightPct: h, Label: label, Axis: axis, Zero: b.Count == 0})
 	}
 	return bars
 }
@@ -927,7 +950,7 @@ const dashboardSrc = `<!DOCTYPE html>
 <link rel="stylesheet" href="/metrics/static/styles.css">
 <script src="/metrics/static/htmx.min.js" defer></script>
 <script>
-  window.GoLensConfig = { pollMs: {{.PollMs}}, hasNotifier: {{if .HasNotifier}}true{{else}}false{{end}} };
+  window.GoLensConfig = { pollMs: {{.PollMs}}, hasNotifier: {{if .HasNotifier}}true{{else}}false{{end}}, alertsEnabled: {{if .AlertsEnabled}}true{{else}}false{{end}} };
 </script>
 <script>
   // Apply the saved theme before paint to avoid a flash of the wrong theme.
@@ -949,21 +972,23 @@ const dashboardSrc = `<!DOCTYPE html>
 <header class="topbar">
   <div class="wrap topbar-inner row">
     <div class="brand grow">
-      <span class="brand-dot"></span>
+      <span class="brand-dot" id="brand-dot"></span>
       <h1 class="brand-title">{{.ProjectName}}</h1>
       <span class="brand-sub">{{.DashboardSubtitle}}</span>
     </div>
-    <input id="search" type="text" placeholder="Search metrics..." class="search" oninput="applyFilter()">
+    <input id="search" type="text" placeholder="Search metrics..." aria-label="Search metrics" class="search" oninput="applyFilter()">
     <button onclick="document.body.dataset.add='1'" class="btn">+ Add Chart</button>
     {{if .AlertsEnabled}}
     <a href="/metrics/alerts" class="btn">Alerts</a>
+    <span id="alert-count" class="status-pill status-pill-alert" hidden></span>
     <button onclick="document.body.dataset.alertAdd='1'" class="btn">+ Add Alert</button>
     {{end}}
     <label class="pause-toggle">
-      <input type="checkbox" class="check" onchange="document.body.dataset.paused=this.checked?'1':''"> pause
+      <input type="checkbox" class="check" id="pause-check" onchange="setPaused(this.checked)"> pause
     </label>
+    <button onclick="resetLayout()" class="btn" title="Reset layout: clears pinned charts, ordering, and saved layout">Reset layout</button>
     <!-- Cooldown ring: depletes over the poll interval, resets on each HTMX refresh -->
-    <div class="cooldown" title="next refresh">
+    <div class="cooldown" title="time until next refresh — polling pauses while paused">
       <svg viewBox="0 0 36 36">
         <circle cx="18" cy="18" r="14" fill="none" stroke="#1e293b" stroke-width="3"></circle>
         <circle id="cooldown-ring" cx="18" cy="18" r="14" fill="none" stroke="#34d399" stroke-width="3" stroke-linecap="round"></circle>
@@ -991,15 +1016,20 @@ const dashboardSrc = `<!DOCTYPE html>
 
     <!-- Runtime charts container for drag-to-reorder. Cards carry the
          rt-card class so the drop handler selects exactly the card elements
-         (never their inner header/legend divs). -->
+         (never their inner header/legend divs). Drag and button moves derive
+         indexes from the element's current position, so they stay correct
+         after a reorder. -->
     <div id="runtime-charts" class="stack">
       <!-- Memory Overview (full width) -->
       <div draggable="true"
-           @dragstart="start(0)" @dragover.prevent @drop="drop(0)" @dragend="drag=null"
-           :class="drag===0 ? 'dragging' : ''"
+           @dragstart="start($event)" @dragover.prevent @drop="drop($event)" @dragend="dragEnd($event)"
            class="card card-grab rt-card">
         <div class="card-sub">
           <span class="card-name">Memory Overview</span>
+          <span class="move-btns">
+            <button type="button" class="move-btn" title="move earlier" aria-label="Move Memory Overview earlier" @click="move($event,-1)">&larr;</button>
+            <button type="button" class="move-btn" title="move later" aria-label="Move Memory Overview later" @click="move($event,1)">&rarr;</button>
+          </span>
           <div class="row-tight meta">
             <span>sys: <span x-text="fmtBytes(currentSysBytes)"></span></span>
             <span>heap: <span x-text="fmtBytes(currentHeapInuse)"></span></span>
@@ -1007,7 +1037,8 @@ const dashboardSrc = `<!DOCTYPE html>
             <span>obj: <span x-text="fmtCount(currentHeapObj)"></span></span>
           </div>
         </div>
-        <canvas id="rt-mem" class="chart-canvas" height="100"></canvas>
+        <canvas id="rt-mem" class="chart-canvas" height="100" role="img"
+                aria-label="Memory overview time-series chart: sys, heap in use, and alloc bytes, with heap objects on the right axis"></canvas>
         <div class="chart-legend">
           <span class="legend-accent">sys bytes</span>
           <span class="legend-teal">heap inuse</span>
@@ -1020,28 +1051,36 @@ const dashboardSrc = `<!DOCTYPE html>
       <div class="grid grid-half">
         <!-- CPU -->
         <div draggable="true"
-             @dragstart="start(1)" @dragover.prevent @drop="drop(1)" @dragend="drag=null"
-             :class="drag===1 ? 'dragging' : ''"
+             @dragstart="start($event)" @dragover.prevent @drop="drop($event)" @dragend="dragEnd($event)"
              class="card card-grab rt-card">
           <div class="card-sub">
             <span class="card-name">CPU Usage</span>
+            <span class="move-btns">
+              <button type="button" class="move-btn" title="move earlier" aria-label="Move CPU Usage earlier" @click="move($event,-1)">&larr;</button>
+              <button type="button" class="move-btn" title="move later" aria-label="Move CPU Usage later" @click="move($event,1)">&rarr;</button>
+            </span>
             <span class="card-name" x-text="cpuPct.toFixed(1) + '%'"></span>
           </div>
-          <canvas id="rt-cpu" class="chart-canvas" height="120"></canvas>
+          <canvas id="rt-cpu" class="chart-canvas" height="120" role="img"
+                  aria-label="CPU usage time-series chart with goroutines on the right axis"></canvas>
           <div class="chart-legend">
             <span>cpu %</span><span>goroutines (right)</span>
           </div>
         </div>
         <!-- Goroutines -->
         <div draggable="true"
-             @dragstart="start(2)" @dragover.prevent @drop="drop(2)" @dragend="drag=null"
-             :class="drag===2 ? 'dragging' : ''"
+             @dragstart="start($event)" @dragover.prevent @drop="drop($event)" @dragend="dragEnd($event)"
              class="card card-grab rt-card">
           <div class="card-sub">
             <span class="card-name">App Goroutines</span>
+            <span class="move-btns">
+              <button type="button" class="move-btn" title="move earlier" aria-label="Move App Goroutines earlier" @click="move($event,-1)">&larr;</button>
+              <button type="button" class="move-btn" title="move later" aria-label="Move App Goroutines later" @click="move($event,1)">&rarr;</button>
+            </span>
             <span class="card-name" x-text="currentGoro"></span>
           </div>
-          <canvas id="rt-goro" class="chart-canvas" height="120"></canvas>
+          <canvas id="rt-goro" class="chart-canvas" height="120" role="img"
+                  aria-label="Goroutines time-series chart"></canvas>
         </div>
       </div>
     </div>
@@ -1068,10 +1107,11 @@ const dashboardSrc = `<!DOCTYPE html>
             <span class="card-name card-name-accent" x-text="metric.name"></span>
             <span class="card-name" x-text="metric.description"></span>
           </div>
-          <canvas :id="'hist-ts-' + metric.name" class="chart-canvas" height="150"></canvas>
+          <canvas :id="'hist-ts-' + metric.name" class="chart-canvas" height="150" role="img"
+                  :aria-label="metric.name + ' bucket distribution over time'"></canvas>
           <div class="chart-legend-bucket">
             <template x-for="(bound, index) in metric.bounds" :key="index">
-              <span :class="getBucketColor(index)" x-text="'≤' + formatBound(bound)"></span>
+              <span :style="'color:' + getBucketColor(index)" x-text="'≤' + formatBound(bound)"></span>
             </template>
           </div>
         </div>
@@ -1107,14 +1147,10 @@ const dashboardSrc = `<!DOCTYPE html>
   <section x-show="$store.ui.charts.length" x-cloak
            x-data="{ drag: null,
                      start(i){ this.drag = i; },
-                     drop(i){ if(this.drag===null || this.drag===i){ this.drag=null; return; }
-                              const c = Alpine.store('ui').charts;
-                              const m = c.splice(this.drag, 1)[0];
-                              c.splice(i, 0, m);
-                              dashCfg.panels = chartsToPanels(c);
-                              persistDash();
-                              this.drag = null;
-                              this.$nextTick(() => renderPinned()); } }"
+                     drop(i){ if(this.drag===null){ return; }
+                              const from = this.drag; this.drag = null;
+                              moveCharts(from, i); },
+                     move(i, d){ moveCharts(i, i + d); } }"
            x-effect="$store.ui.charts.length; renderPinned()">
     <div class="row">
       <h2 class="section-title">My Charts</h2>
@@ -1130,7 +1166,11 @@ const dashboardSrc = `<!DOCTYPE html>
              @dragend="drag=null"
              :class="drag===idx ? 'dragging' : ''"
              class="card card-grab pin-slot">
-          <button title="remove" @click="$store.ui.remove(name)" class="pin-remove">×</button>
+          <div class="pin-actions">
+            <button type="button" class="pin-btn" title="move earlier" :aria-label="'Move ' + name + ' earlier'" @click="move(idx,-1)">&larr;</button>
+            <button type="button" class="pin-btn" title="move later" :aria-label="'Move ' + name + ' later'" @click="move(idx,1)">&rarr;</button>
+            <button type="button" class="pin-remove" title="remove" :aria-label="'Remove ' + name + ' pin'" @click="$store.ui.remove(name)">×</button>
+          </div>
           <div class="pin-body" :data-pin="name"></div>
         </div>
       </template>
@@ -1162,6 +1202,10 @@ const dashboardSrc = `<!DOCTYPE html>
           <div class="card-head">
             <span class="badge badge-method" x-text="e.method"></span>
             <span class="card-name nowrap" x-text="e.path"></span>
+            <span class="move-btns">
+              <button type="button" class="move-btn" title="move earlier" :aria-label="'Move ' + e.path + ' earlier'" @click="move(idx,-1)">&larr;</button>
+              <button type="button" class="move-btn" title="move later" :aria-label="'Move ' + e.path + ' later'" @click="move(idx,1)">&rarr;</button>
+            </span>
           </div>
           <div class="ep-meta"><span x-text="e.count"></span> requests · avg <span x-text="fmt(e.avg)"></span>s</div>
           <div class="ep-chart">
@@ -1299,7 +1343,7 @@ const dashboardSrc = `<!DOCTYPE html>
     </div>
     <div class="modal-footer">
       <button @click="$store.ui.add=false" class="btn">Cancel</button>
-      <button @click="addChart()" class="btn-primary">Add</button>
+      <button @click="addChart()" class="btn-primary" :disabled="list.indexOf($store.ui.name || '') < 0">Add</button>
     </div>
   </div>
 </div>
@@ -1369,8 +1413,8 @@ const dashboardSrc = `<!DOCTYPE html>
             </div>
           </div>
           <div class="form-row">
-            <label class="field-label">Cooldown (e.g. 5m, 1h)</label>
-            <input type="text" x-model="$store.ui.alertForm.cooldown" placeholder="5m" class="input">
+            <label class="field-label">Cooldown (number + ms|s|m|h, e.g. 5m)</label>
+            <input type="text" x-model="$store.ui.alertForm.cooldown" pattern="[0-9]+(ms|s|m|h)" title="Duration: a number followed by ms, s, m, or h" placeholder="5m" class="input">
           </div>
           {{if .HasNotifier}}
           <hr class="form-sep">
@@ -1429,7 +1473,7 @@ const dashboardSrc = `<!DOCTYPE html>
 {{end}}
 
 <!-- Toast -->
-<div id="app-toast" class="toast"></div>
+<div id="app-toast" class="toast" aria-live="polite"></div>
 
 </body>
 </html>`
@@ -1449,6 +1493,13 @@ const cardsSrc = `{{define "cards"}}
     <div class="card-head">
       <span class="badge badge-{{.BadgeTone}}">{{.Badge}}</span>
       <span class="card-name nowrap">{{.Snapshot.Name}}</span>
+      <span class="move-btns">
+        {{if not .Hook}}
+        <button type="button" class="pin-add" title="pin to My Charts" aria-label="Pin {{.Snapshot.Name}} to My Charts" onclick="pinCard(this)">+</button>
+        {{end}}
+        <button type="button" class="move-btn" title="move earlier" aria-label="Move {{.Snapshot.Name}} earlier" onclick="moveGridCard(this,-1)">&larr;</button>
+        <button type="button" class="move-btn" title="move later" aria-label="Move {{.Snapshot.Name}} later" onclick="moveGridCard(this,1)">&rarr;</button>
+      </span>
     </div>
     <p class="card-desc">{{or .Snapshot.Description "—"}}</p>
   </div>
@@ -1475,9 +1526,16 @@ const cardsSrc = `{{define "cards"}}
   <div>
     <div class="bar-chart">
       {{range .Bars}}
+      {{if .Zero}}
+      <!-- empty bucket: hollow baseline tick, no implied data -->
+      <div class="bar bar-zero">
+        <div class="bar-tip">{{.Label}}</div>
+      </div>
+      {{else}}
       <div class="bar bar-histogram" style="height:{{.HeightPct}}%">
         <div class="bar-tip">{{.Label}}</div>
       </div>
+      {{end}}
       {{end}}
     </div>
     <div class="bar-axis">
@@ -1490,14 +1548,13 @@ const cardsSrc = `{{define "cards"}}
     </div>
   </div>
   {{else if eq .View "gauge"}}
-  <!-- gauge: semi-circle with danger/safe zones -->
+  <!-- gauge: neutral semi-circle dial (no danger/safe zones — which side is
+       "dangerous" depends on the metric, and a hard-coded split lies) -->
   <div>
     <div class="gauge">
       <div class="gauge-dial-box">
-        <svg viewBox="0 0 100 50" class="gauge-dial">
+        <svg viewBox="0 0 100 50" class="gauge-dial" role="img" aria-label="{{.Snapshot.Name}} gauge: {{.DisplayValue}} on a scale from {{fmt .MinValue}} to {{fmt .MaxValue}}">
           <path class="gauge-track" d="M 10 50 A 40 40 0 0 1 90 50" fill="none" stroke-width="8"/>
-          <path class="gauge-zone-danger" d="M 10 50 A 40 40 0 0 1 50 10" fill="none" stroke-width="8" stroke-dasharray="62.83" stroke-dashoffset="0"/>
-          <path class="gauge-zone-safe" d="M 50 10 A 40 40 0 0 1 90 50" fill="none" stroke-width="8" stroke-dasharray="62.83" stroke-dashoffset="0"/>
           <line class="gauge-needle" x1="50" y1="50" x2="50" y2="10" stroke-width="2" transform="rotate({{.NeedleDeg}} 50 50)" style="transform-origin: 50px 50px;"/>
           <circle class="gauge-hub" cx="50" cy="50" r="3"/>
         </svg>
@@ -1522,7 +1579,8 @@ const cardsSrc = `{{define "cards"}}
       <span class="metric-value">{{.DisplayValue}}</span>
       {{if .Unit}}<span class="metric-unit">{{.Unit}}</span>{{end}}
     </div>
-    <canvas class="chart-canvas" data-history="{{.Snapshot.Name}}" height="120"></canvas>
+    <canvas class="chart-canvas" data-history="{{.Snapshot.Name}}" height="120" role="img"
+            aria-label="{{.Snapshot.Name}} time-series, last hour"></canvas>
     {{if .Snapshot.LabelValues}}
     <div class="labels-row">
       {{range .Snapshot.LabelValues}}<span class="chip">{{.Name}}={{.Value}}</span>{{end}}

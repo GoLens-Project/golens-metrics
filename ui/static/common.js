@@ -61,6 +61,45 @@ function showToast(msg, type) {
   _toastTimer = setTimeout(function () { el.className = 'toast'; }, 4000);
 }
 
+// --- modal focus trap ------------------------------------------------------------
+
+// trapFocus wires a minimal focus trap onto a modal overlay: while the modal
+// is open, Tab cycles among its focusable elements, and closing returns focus
+// to the element that invoked it. Open/close is tracked via the overlay's
+// inline style, which is exactly what Alpine's x-show toggles.
+function trapFocus(overlay) {
+  var invoker = null;
+  function focusables() {
+    return Array.from(overlay.querySelectorAll('button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'))
+      .filter(function (el) { return !el.disabled && el.offsetParent !== null; });
+  }
+  overlay.addEventListener('keydown', function (e) {
+    if (e.key !== 'Tab') return;
+    var els = focusables();
+    if (!els.length) return;
+    var first = els[0], last = els[els.length - 1];
+    if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+    else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+  });
+  new MutationObserver(function () {
+    var open = overlay.style.display !== 'none';
+    if (open) {
+      invoker = document.activeElement;
+      var els = focusables();
+      if (els.length) els[0].focus();
+    } else if (invoker) {
+      invoker.focus();
+      invoker = null;
+    }
+  }).observe(overlay, { attributes: true, attributeFilter: ['style'] });
+}
+
+// Both pages mark their modals with .modal-overlay — install the trap on all
+// of them once the DOM is ready.
+document.addEventListener('DOMContentLoaded', function () {
+  document.querySelectorAll('.modal-overlay').forEach(trapFocus);
+});
+
 // Number formatting shared by chart code (kept out of per-page scripts).
 function fmtBytes(b) {
   if (b < 1024) return b.toFixed(0) + ' B';
