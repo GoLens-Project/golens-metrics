@@ -297,14 +297,16 @@ func TestAlertRuleDeleteHandler(t *testing.T) {
 	}
 }
 
-// failDeleteStore wraps a working store and fails rule deletion with a fixed
-// error, so the delete handler's error path sees a controlled message.
-type failDeleteStore struct {
+// failRuleStore wraps a working store and fails rule writes (SaveRule and
+// DeleteRule) with a fixed error, so the create and delete error paths see a
+// controlled message.
+type failRuleStore struct {
 	AlertStore
 	err error
 }
 
-func (s failDeleteStore) DeleteRule(context.Context, string) error { return s.err }
+func (s failRuleStore) SaveRule(context.Context, AlertRule) error { return s.err }
+func (s failRuleStore) DeleteRule(context.Context, string) error  { return s.err }
 
 // Handler error bodies must be valid JSON even when the message contains
 // double quotes: every error path routes through writeJSONError's
@@ -314,9 +316,9 @@ func TestAlertHandlerQuotedErrorRoundTrip(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.Alerts.Enabled = true
 	r := newTestRegistry(t, cfg)
-	// Swap in a store whose DeleteRule fails with a quoted message; AddRule
-	// still works against it (save failures are swallowed by the alerter).
-	r.alerter = newAlerter(r, failDeleteStore{
+	// Swap in a store whose SaveRule and DeleteRule fail with a quoted message,
+	// so the create and delete error paths surface that exact message.
+	r.alerter = newAlerter(r, failRuleStore{
 		AlertStore: newMemoryAlertStore(),
 		err:        errors.New(`db: rule "abc-123" is locked`),
 	}, cfg.Alerts)
@@ -336,6 +338,19 @@ func TestAlertHandlerQuotedErrorRoundTrip(t *testing.T) {
 				req := httptest.NewRequest("DELETE", "/metrics/alerts/rules/abc-123", nil)
 				rec := httptest.NewRecorder()
 				r.alertRuleDeleteHandler().ServeHTTP(rec, req)
+				return rec
+			},
+			wantCode: http.StatusInternalServerError,
+			wantMsg:  `db: rule "abc-123" is locked`,
+		},
+		{
+			name: "create store failure",
+			act: func() *httptest.ResponseRecorder {
+				body, _ := json.Marshal(AlertRule{Name: "x", Metric: "m", Condition: ConditionGT, Threshold: 1})
+				req := httptest.NewRequest("POST", "/metrics/alerts/rules", bytes.NewReader(body))
+				req.Header.Set("Content-Type", "application/json")
+				rec := httptest.NewRecorder()
+				r.alertRulesHandler().ServeHTTP(rec, req)
 				return rec
 			},
 			wantCode: http.StatusInternalServerError,
@@ -378,6 +393,126 @@ func TestAlertHandlerQuotedErrorRoundTrip(t *testing.T) {
 				t.Errorf("error = %q, want %q", body["error"], tc.wantMsg)
 			}
 		})
+	}
+}
+
+// A SaveRule failure must propagate out of AddRule and leave the in-memory
+// rule set untouched — the rule is persisted before it becomes visible, so a
+// failed save can never diverge memory from the store (regression for the
+// swallowed-error + mutate-first ordering bug).
+func TestAddRuleStoreFailureKeepsMemory(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Alerts.Enabled = true
+	r := newTestRegistry(t, cfg)
+	ctx, cancel := context.WithCancel(context.Background())
+	r.Start(ctx)
+	defer func() { cancel(); r.Close() }()
+
+	storeErr := errors.New(`db: rule "abc-123" is locked`)
+	al := r.Alerter()
+
+	t.Run("new rule", func(t *testing.T) {
+		al.store = failRuleStore{AlertStore: newMemoryAlertStore(), err: storeErr}
+		_, err := al.AddRule(AlertRule{Name: "new", Metric: "m", Condition: ConditionGT, Threshold: 1})
+		if !errors.Is(err, storeErr) {
+			t.Fatalf("AddRule: err = %v, want store error propagated", err)
+		}
+		if rules := al.ListRules(); len(rules) != 0 {
+			t.Errorf("after failed save: got %d rules, want 0", len(rules))
+		}
+	})
+
+	t.Run("existing rule", func(t *testing.T) {
+		al.store = newMemoryAlertStore()
+		saved, err := al.AddRule(AlertRule{Name: "kept", Metric: "m", Condition: ConditionGT, Threshold: 1})
+		if err != nil {
+			t.Fatalf("AddRule: %v", err)
+		}
+
+		al.store = failRuleStore{AlertStore: newMemoryAlertStore(), err: storeErr}
+		update := saved
+		update.Threshold = 99
+		if _, err := al.AddRule(update); !errors.Is(err, storeErr) {
+			t.Fatalf("AddRule update: err = %v, want store error propagated", err)
+		}
+
+		rules := al.ListRules()
+		if len(rules) != 1 || rules[0].ID != saved.ID {
+			t.Fatalf("after failed update: got %+v, want only %q", rules, saved.ID)
+		}
+		if rules[0].Threshold != 1 {
+			t.Errorf("threshold = %g, want pre-failure 1", rules[0].Threshold)
+		}
+	})
+}
+
+// A DeleteRule failure must leave the rule in memory: RemoveRule deletes from
+// the store first, so a store error means the deletion never took effect
+// anywhere (regression for the delete-from-memory-first ordering bug).
+func TestRemoveRuleStoreFailureKeepsRule(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Alerts.Enabled = true
+	r := newTestRegistry(t, cfg)
+	ctx, cancel := context.WithCancel(context.Background())
+	r.Start(ctx)
+	defer func() { cancel(); r.Close() }()
+
+	al := r.Alerter()
+	saved, err := al.AddRule(AlertRule{Name: "kept", Metric: "m", Condition: ConditionGT, Threshold: 1})
+	if err != nil {
+		t.Fatalf("AddRule: %v", err)
+	}
+
+	storeErr := errors.New(`db: rule "abc-123" is locked`)
+	al.store = failRuleStore{AlertStore: newMemoryAlertStore(), err: storeErr}
+	if err := al.RemoveRule(saved.ID); !errors.Is(err, storeErr) {
+		t.Fatalf("RemoveRule: err = %v, want store error propagated", err)
+	}
+
+	rules := al.ListRules()
+	if len(rules) != 1 || rules[0].ID != saved.ID {
+		t.Errorf("after failed delete: got %+v, want %q still present", rules, saved.ID)
+	}
+}
+
+// A SaveRule failure must leave the rule's Enabled state untouched: ToggleRule
+// persists the new state before publishing it, so a failed toggle changes
+// nothing in memory (regression for the mutate-memory-before-save ordering
+// bug shared with AddRule/RemoveRule).
+func TestToggleRuleStoreFailureKeepsState(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Alerts.Enabled = true
+	r := newTestRegistry(t, cfg)
+	ctx, cancel := context.WithCancel(context.Background())
+	r.Start(ctx)
+	defer func() { cancel(); r.Close() }()
+
+	al := r.Alerter()
+	saved, err := al.AddRule(AlertRule{Name: "toggled", Metric: "m", Condition: ConditionGT, Threshold: 1})
+	if err != nil {
+		t.Fatalf("AddRule: %v", err)
+	}
+	// Unknown IDs are a nil no-op, toggle or not.
+	if err := al.ToggleRule("no-such-id", true); err != nil {
+		t.Errorf("ToggleRule missing id: err = %v, want nil no-op", err)
+	}
+
+	storeErr := errors.New(`db: rule "abc-123" is locked`)
+	al.store = failRuleStore{AlertStore: newMemoryAlertStore(), err: storeErr}
+	if err := al.ToggleRule(saved.ID, false); !errors.Is(err, storeErr) {
+		t.Fatalf("ToggleRule: err = %v, want store error propagated", err)
+	}
+	if rules := al.ListRules(); len(rules) != 1 || !rules[0].Enabled {
+		t.Errorf("after failed toggle: got %+v, want Enabled still true", rules)
+	}
+
+	// Success path: the flip lands in memory only after the save succeeds.
+	al.store = newMemoryAlertStore()
+	if err := al.ToggleRule(saved.ID, false); err != nil {
+		t.Fatalf("ToggleRule success: %v", err)
+	}
+	if rules := al.ListRules(); len(rules) != 1 || rules[0].Enabled {
+		t.Errorf("after successful toggle: got %+v, want Enabled false", rules)
 	}
 }
 

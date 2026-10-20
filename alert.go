@@ -288,6 +288,8 @@ func (a *alerter) Templates() []AlertTemplate {
 
 // AddRule registers a new alert rule or updates an existing one.
 // New rules default to Enabled=true; updates preserve the caller's Enabled field.
+// The rule is persisted before it becomes visible in memory, so a store
+// failure returns an error and leaves the in-memory set unchanged.
 func (a *alerter) AddRule(rule AlertRule) (AlertRule, error) {
 	if rule.ID == "" {
 		rule.ID = generateID()
@@ -296,35 +298,36 @@ func (a *alerter) AddRule(rule AlertRule) (AlertRule, error) {
 		rule.Cooldown = a.cooldown
 	}
 
-	a.mu.Lock()
+	a.mu.RLock()
 	_, exists := a.rules[rule.ID]
+	a.mu.RUnlock()
 	if !exists {
 		rule.Enabled = true // new rules default to enabled
 	}
-	a.rules[rule.ID] = &rule
-	a.mu.Unlock()
 
 	if a.store != nil {
 		if err := a.store.SaveRule(context.Background(), rule); err != nil {
-			if a.debug {
-				log.Printf("[golens] alert store save rule failed: %v", err)
-			}
+			return rule, err
 		}
 	}
+
+	a.mu.Lock()
+	a.rules[rule.ID] = &rule
+	a.mu.Unlock()
 	return rule, nil
 }
 
 // RemoveRule deletes a rule by ID. Removes from store if available.
 func (a *alerter) RemoveRule(id string) error {
-	a.mu.Lock()
-	delete(a.rules, id)
-	a.mu.Unlock()
-
 	if a.store != nil {
 		if err := a.store.DeleteRule(context.Background(), id); err != nil {
 			return err
 		}
 	}
+
+	a.mu.Lock()
+	delete(a.rules, id)
+	a.mu.Unlock()
 	return nil
 }
 
@@ -377,7 +380,9 @@ func (a *alerter) FiringCount() int {
 	return n
 }
 
-// ToggleRule enables or disables a rule by ID.
+// ToggleRule enables or disables a rule by ID. The new state is persisted
+// before it is published, so a store failure returns an error and leaves the
+// in-memory rule unchanged.
 func (a *alerter) ToggleRule(id string, enabled bool) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -386,13 +391,15 @@ func (a *alerter) ToggleRule(id string, enabled bool) error {
 	if !ok {
 		return nil
 	}
-	r.Enabled = enabled
 
 	if a.store != nil {
-		if err := a.store.SaveRule(context.Background(), *r); err != nil {
+		persisted := *r
+		persisted.Enabled = enabled
+		if err := a.store.SaveRule(context.Background(), persisted); err != nil {
 			return err
 		}
 	}
+	r.Enabled = enabled
 	return nil
 }
 
