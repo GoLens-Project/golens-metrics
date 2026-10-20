@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -293,6 +294,90 @@ func TestAlertRuleDeleteHandler(t *testing.T) {
 	}
 	if len(al.ListRules()) != 0 {
 		t.Error("rule not deleted")
+	}
+}
+
+// failDeleteStore wraps a working store and fails rule deletion with a fixed
+// error, so the delete handler's error path sees a controlled message.
+type failDeleteStore struct {
+	AlertStore
+	err error
+}
+
+func (s failDeleteStore) DeleteRule(context.Context, string) error { return s.err }
+
+// Handler error bodies must be valid JSON even when the message contains
+// double quotes: every error path routes through writeJSONError's
+// json.Encoder, never string interpolation (regression coverage for the
+// hand-concatenation bug — an interpolated body would not unmarshal).
+func TestAlertHandlerQuotedErrorRoundTrip(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Alerts.Enabled = true
+	r := newTestRegistry(t, cfg)
+	// Swap in a store whose DeleteRule fails with a quoted message; AddRule
+	// still works against it (save failures are swallowed by the alerter).
+	r.alerter = newAlerter(r, failDeleteStore{
+		AlertStore: newMemoryAlertStore(),
+		err:        errors.New(`db: rule "abc-123" is locked`),
+	}, cfg.Alerts)
+	ctx, cancel := context.WithCancel(context.Background())
+	r.Start(ctx)
+	defer func() { cancel(); r.Close() }()
+
+	tests := []struct {
+		name     string
+		act      func() *httptest.ResponseRecorder
+		wantCode int
+		wantMsg  string
+	}{
+		{
+			name: "delete store failure",
+			act: func() *httptest.ResponseRecorder {
+				req := httptest.NewRequest("DELETE", "/metrics/alerts/rules/abc-123", nil)
+				rec := httptest.NewRecorder()
+				r.alertRuleDeleteHandler().ServeHTTP(rec, req)
+				return rec
+			},
+			wantCode: http.StatusInternalServerError,
+			wantMsg:  `db: rule "abc-123" is locked`,
+		},
+		{
+			name: "create invalid json",
+			act: func() *httptest.ResponseRecorder {
+				req := httptest.NewRequest("POST", "/metrics/alerts/rules", strings.NewReader(`{`))
+				rec := httptest.NewRecorder()
+				r.alertRulesHandler().ServeHTTP(rec, req)
+				return rec
+			},
+			wantCode: http.StatusBadRequest,
+			wantMsg:  "invalid JSON",
+		},
+		{
+			name: "create missing fields",
+			act: func() *httptest.ResponseRecorder {
+				req := httptest.NewRequest("POST", "/metrics/alerts/rules", strings.NewReader(`{}`))
+				rec := httptest.NewRecorder()
+				r.alertRulesHandler().ServeHTTP(rec, req)
+				return rec
+			},
+			wantCode: http.StatusBadRequest,
+			wantMsg:  "name and metric are required",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := tc.act()
+			if rec.Code != tc.wantCode {
+				t.Fatalf("status = %d, want %d", rec.Code, tc.wantCode)
+			}
+			var body map[string]string
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+				t.Fatalf("error body is not valid JSON: %q", rec.Body.String())
+			}
+			if body["error"] != tc.wantMsg {
+				t.Errorf("error = %q, want %q", body["error"], tc.wantMsg)
+			}
+		})
 	}
 }
 
