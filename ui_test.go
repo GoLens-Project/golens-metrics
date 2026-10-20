@@ -874,6 +874,57 @@ func TestHistoryHTTPHandler(t *testing.T) {
 	if rec4.Code != 200 {
 		t.Errorf("default duration: status = %d, want 200", rec4.Code)
 	}
+
+	// Batch form: ?names=a,b returns a {name: HistorySeries} map so a panel
+	// grid refresh costs one request instead of one per panel.
+	r.Record("second_metric", 5)
+	waitForDrain(r)
+
+	req5 := httptest.NewRequest("GET", "/history?names=test_metric,second_metric&duration=1h", nil)
+	rec5 := httptest.NewRecorder()
+	handler.ServeHTTP(rec5, req5)
+	if rec5.Code != 200 {
+		t.Fatalf("batch: status = %d, body %s", rec5.Code, rec5.Body.String())
+	}
+	var batch map[string]HistorySeries
+	if err := json.Unmarshal(rec5.Body.Bytes(), &batch); err != nil {
+		t.Fatalf("batch: body is not a JSON object: %v", err)
+	}
+	if len(batch) != 2 {
+		t.Errorf("batch: got %d series, want 2", len(batch))
+	}
+	for _, name := range []string{"test_metric", "second_metric"} {
+		s, ok := batch[name]
+		if !ok {
+			t.Fatalf("batch: missing series for %q", name)
+		}
+		if s.Name != name {
+			t.Errorf("batch: series name = %q, want %q", s.Name, name)
+		}
+		if len(s.Points) == 0 {
+			t.Errorf("batch: series %q has no points", name)
+		}
+	}
+
+	// Mixed known/unknown names: an unknown metric still gets its own (empty)
+	// entry so clients can tell "no data" from "not requested".
+	req6 := httptest.NewRequest("GET", "/history?names=test_metric,ghost_metric&duration=1h", nil)
+	rec6 := httptest.NewRecorder()
+	handler.ServeHTTP(rec6, req6)
+	if rec6.Code != 200 {
+		t.Fatalf("mixed: status = %d, body %s", rec6.Code, rec6.Body.String())
+	}
+	batch = nil
+	if err := json.Unmarshal(rec6.Body.Bytes(), &batch); err != nil {
+		t.Fatalf("mixed: body is not a JSON object: %v", err)
+	}
+	ghost, ok := batch["ghost_metric"]
+	if !ok {
+		t.Fatal("mixed: missing entry for unknown name")
+	}
+	if ghost.Name != "ghost_metric" || len(ghost.Points) != 0 {
+		t.Errorf("mixed: ghost series = %+v, want named empty series", ghost)
+	}
 }
 
 func TestHistoryHTTPHandlerDisabled(t *testing.T) {

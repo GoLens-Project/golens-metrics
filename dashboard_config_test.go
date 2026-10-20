@@ -277,6 +277,42 @@ func TestDashboardConfigPersistLeavesNoTempFile(t *testing.T) {
 	}
 }
 
+// A persist failure whose error text contains double quotes (the configured
+// path itself does) must still yield a valid JSON error body through
+// writeJSONError — string interpolation would emit unparseable JSON.
+func TestDashboardConfigPersistFailureQuotedErrorBody(t *testing.T) {
+	dir := t.TempDir()
+	cfg := DefaultConfig()
+	// A missing parent directory fails the temp write, and the quote in the
+	// file name surfaces in the os error text.
+	cfg.UI.DashboardConfig = filepath.Join(dir, "missing", `da"sh.json`)
+	h := newConfigRegistry(t, cfg).dashboardConfigHandler()
+
+	tests := []struct {
+		name   string
+		method string
+		body   string
+	}{
+		{"put persist failure", http.MethodPut, `{"version":1,"panels":[]}`},
+		{"delete persist failure", http.MethodDelete, ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := configRequest(h, tc.method, tc.body)
+			if rec.Code != http.StatusInternalServerError {
+				t.Fatalf("status = %d, want 500, body %s", rec.Code, rec.Body.String())
+			}
+			var e map[string]string
+			if err := json.Unmarshal(rec.Body.Bytes(), &e); err != nil {
+				t.Fatalf("error body is not valid JSON: %q", rec.Body.String())
+			}
+			if !strings.Contains(e["error"], `da"sh.json`) {
+				t.Errorf("error = %q, want the quoted path to survive intact", e["error"])
+			}
+		})
+	}
+}
+
 // The saved document drives the card builders: a panel's chart_type and size
 // override the per-kind default, an unhonorable saved chart falls back to the
 // default view, and the HTTP card view selects the column set.
