@@ -214,6 +214,47 @@ func (r *Registry) AlertTemplatesHTTPHandler() http.Handler {
 	return r.alertTemplatesHandler()
 }
 
+// --- section rendering model -------------------------------------------------
+
+// sectionView is one rendered dashboard band: its id/name plus the fixed
+// blocks it places, in order. Pinned panels are placed client-side into the
+// band's body (the panel slots never exist in the server render), so panel
+// items are not part of a sectionView.
+type sectionView struct {
+	ID     string
+	Name   string
+	Items  []string // well-known block ids, render order
+	Hidden bool     // nothing to show yet: no rendered blocks and no panel items
+}
+
+// buildSectionViews resolves the effective section list into renderable
+// bands. Blocks whose content is unavailable are dropped (runtime health
+// without runtime metrics, hooks without hook metrics); a band left without
+// any content starts hidden until the client places panels into it.
+func buildSectionViews(secs []DashboardSection, runtimeEnabled bool, hookCards []metricCard) []sectionView {
+	out := make([]sectionView, 0, len(secs))
+	for _, s := range secs {
+		v := sectionView{ID: s.ID, Name: s.Name}
+		hasPanels := false
+		for _, item := range s.Items {
+			if !wellKnownBlocks[item] {
+				hasPanels = true // panel ids are placed client-side
+				continue
+			}
+			if item == BlockRuntimeHealth && !runtimeEnabled {
+				continue
+			}
+			if item == BlockHooks && len(hookCards) == 0 {
+				continue
+			}
+			v.Items = append(v.Items, item)
+		}
+		v.Hidden = len(v.Items) == 0 && !hasPanels
+		out = append(out, v)
+	}
+	return out
+}
+
 // metricsPageHandler renders the full dashboard shell. The card grid is
 // refreshed by HTMX polling /metrics/data.
 func (r *Registry) metricsPageHandler() http.Handler {
@@ -222,11 +263,24 @@ func (r *Registry) metricsPageHandler() http.Handler {
 		if intervalMs <= 0 {
 			intervalMs = 5000
 		}
+		snaps := r.Snapshots()
+		hookCards := buildHookCards(snaps)
+		// The effective section list drives both the rendered bands and the
+		// client bootstrap, so the two can never diverge.
+		r.dashMu.Lock()
+		secs := r.effectiveSections(r.dash)
+		r.dashMu.Unlock()
+		secsJSON, err := json.Marshal(secs)
+		if err != nil {
+			secsJSON = []byte("[]")
+		}
 		data := map[string]interface{}{
 			"PollMs":            intervalMs,
 			"PollSec":           intervalMs / 1000,
-			"Cards":             buildCardsOpts(r.Snapshots(), r.cardOptions()),
-			"HookCards":         buildHookCards(r.Snapshots()),
+			"Cards":             buildCardsOpts(snaps, r.cardOptions()),
+			"HookCards":         hookCards,
+			"Sections":          buildSectionViews(secs, r.cfg.RuntimeMetrics.Enabled, hookCards),
+			"SectionsJSON":      template.JS(secsJSON),
 			"Interval":          r.cfg.UI.PollInterval.String(),
 			"RuntimeEnabled":    r.cfg.RuntimeMetrics.Enabled,
 			"ProjectName":       r.cfg.ProjectName,
@@ -950,7 +1004,7 @@ const dashboardSrc = `<!DOCTYPE html>
 <link rel="stylesheet" href="/metrics/static/styles.css">
 <script src="/metrics/static/htmx.min.js" defer></script>
 <script>
-  window.GoLensConfig = { pollMs: {{.PollMs}}, hasNotifier: {{if .HasNotifier}}true{{else}}false{{end}}, alertsEnabled: {{if .AlertsEnabled}}true{{else}}false{{end}} };
+  window.GoLensConfig = { pollMs: {{.PollMs}}, hasNotifier: {{if .HasNotifier}}true{{else}}false{{end}}, alertsEnabled: {{if .AlertsEnabled}}true{{else}}false{{end}}, sections: {{.SectionsJSON}} };
 </script>
 <script>
   // Apply the saved theme before paint to avoid a flash of the wrong theme.
@@ -977,7 +1031,7 @@ const dashboardSrc = `<!DOCTYPE html>
       <span class="brand-sub">{{.DashboardSubtitle}}</span>
     </div>
     <input id="search" type="text" placeholder="Search metrics..." aria-label="Search metrics" class="search" oninput="applyFilter()">
-    <button onclick="document.body.dataset.add='1'" class="btn">+ Add Chart</button>
+    <button onclick="document.body.dataset.add='1'" class="btn edit-only">+ Add Chart</button>
     {{if .AlertsEnabled}}
     <a href="/metrics/alerts" class="btn">Alerts</a>
     <span id="alert-count" class="status-pill status-pill-alert" hidden></span>
@@ -986,7 +1040,8 @@ const dashboardSrc = `<!DOCTYPE html>
     <label class="pause-toggle">
       <input type="checkbox" class="check" id="pause-check" onchange="setPaused(this.checked)"> pause
     </label>
-    <button onclick="resetLayout()" class="btn" title="Reset layout: clears pinned charts, ordering, and saved layout">Reset layout</button>
+    <button onclick="resetLayout()" class="btn edit-only" title="Reset layout: clears pinned charts, ordering, sections, and saved layout">Reset layout</button>
+    <button id="edit-toggle" class="btn btn-icon" title="toggle layout editing" aria-pressed="false" onclick="toggleEditMode()">&#9998;</button>
     <!-- Cooldown ring: depletes over the poll interval, resets on each HTMX refresh -->
     <div class="cooldown" title="time until next refresh — polling pauses while paused">
       <svg viewBox="0 0 36 36">
@@ -1001,300 +1056,38 @@ const dashboardSrc = `<!DOCTYPE html>
 </header>
 
 <main class="wrap stack">
-  {{if .RuntimeEnabled}}
-  <!-- Runtime Health: time-series charts for memory, CPU, goroutines -->
-  <section x-data="runtimeHealth()" x-cloak>
-    <div class="row">
-      <h2 class="section-title">Runtime Health</h2>
-      <span class="meta-faint">· drag to reorder</span>
-      <div class="row-tight">
-        <template x-for="d in ['5m','30m','1h','4h','12h','24h','1w']" :key="d">
-          <button @click="duration=d; refresh()" class="pill" :class="duration===d ? 'active' : ''" x-text="d"></button>
-        </template>
-      </div>
+  {{range .Sections}}
+  <section class="dash-section" data-section="{{.ID}}" data-name="{{.Name}}"{{if .Hidden}} hidden{{end}}>
+    <!-- Whole header is one collapse click target (rule + name + chevron);
+         the rename input below exists only in edit mode. -->
+    <div class="sec-head" role="button" tabindex="0" aria-label="Toggle section">
+      <span class="sec-rule sec-rule-lead"></span>
+      <span class="sec-name">{{.Name}}</span>
+      <span class="sec-rule"></span>
+      <svg class="sec-chev" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><path fill-rule="evenodd" d="M14.77 12.79a.75.75 0 01-1.06-.02L10 8.832 6.29 12.77a.75.75 0 11-1.08-1.04l4.25-4.5a.75.75 0 011.08 0l4.25 4.5a.75.75 0 01.02 1.06z" clip-rule="evenodd"/></svg>
     </div>
-
-    <!-- Runtime charts container for drag-to-reorder. Cards carry the
-         rt-card class so the drop handler selects exactly the card elements
-         (never their inner header/legend divs). Drag and button moves derive
-         indexes from the element's current position, so they stay correct
-         after a reorder. -->
-    <div id="runtime-charts" class="stack">
-      <!-- Memory Overview (full width) -->
-      <div draggable="true"
-           @dragstart="start($event)" @dragover.prevent @drop="drop($event)" @dragend="dragEnd($event)"
-           class="card card-grab rt-card">
-        <div class="card-sub">
-          <span class="card-name">Memory Overview</span>
-          <span class="move-btns">
-            <button type="button" class="move-btn" title="move earlier" aria-label="Move Memory Overview earlier" @click="move($event,-1)">&larr;</button>
-            <button type="button" class="move-btn" title="move later" aria-label="Move Memory Overview later" @click="move($event,1)">&rarr;</button>
-          </span>
-          <div class="row-tight meta">
-            <span>sys: <span x-text="fmtBytes(currentSysBytes)"></span></span>
-            <span>heap: <span x-text="fmtBytes(currentHeapInuse)"></span></span>
-            <span>alloc: <span x-text="fmtBytes(currentMem)"></span></span>
-            <span>obj: <span x-text="fmtCount(currentHeapObj)"></span></span>
-          </div>
-        </div>
-        <canvas id="rt-mem" class="chart-canvas" height="100" role="img"
-                aria-label="Memory overview time-series chart: sys, heap in use, and alloc bytes, with heap objects on the right axis"></canvas>
-        <div class="chart-legend">
-          <span class="legend-accent">sys bytes</span>
-          <span class="legend-teal">heap inuse</span>
-          <span class="legend-blue">alloc bytes</span>
-          <span class="legend-amber">heap objects (right)</span>
-        </div>
+    <div class="sec-rename edit-only">
+      <input type="text" class="input sec-rename-input" placeholder="section name (optional)" value="{{.Name}}" maxlength="200" aria-label="Section name" onchange="renameSection(this)">
+    </div>
+    <div class="sec-body">
+      {{range .Items}}
+      <div class="sec-block" data-block="{{.}}" draggable="true">
+        <span class="block-actions edit-only">
+          <button type="button" class="move-btn" title="move earlier" aria-label="Move {{.}} earlier" onclick="moveSectionItem(this,-1)">&larr;</button>
+          <button type="button" class="move-btn" title="move later" aria-label="Move {{.}} later" onclick="moveSectionItem(this,1)">&rarr;</button>
+        </span>
+        {{if eq . "runtime-health"}}{{template "block-runtime" $}}
+        {{else if eq . "histogram"}}{{template "block-histogram" $}}
+        {{else if eq . "hooks"}}{{template "block-hooks" $}}
+        {{else if eq . "all-metrics"}}{{template "block-all-metrics" $}}
+        {{else if eq . "endpoint-latency"}}{{template "block-endpoints" $}}
+        {{else if eq . "internals"}}{{template "block-internals" $}}
+        {{end}}
       </div>
-
-      <!-- CPU and Goroutines in grid -->
-      <div class="grid grid-half">
-        <!-- CPU -->
-        <div draggable="true"
-             @dragstart="start($event)" @dragover.prevent @drop="drop($event)" @dragend="dragEnd($event)"
-             class="card card-grab rt-card">
-          <div class="card-sub">
-            <span class="card-name">CPU Usage</span>
-            <span class="move-btns">
-              <button type="button" class="move-btn" title="move earlier" aria-label="Move CPU Usage earlier" @click="move($event,-1)">&larr;</button>
-              <button type="button" class="move-btn" title="move later" aria-label="Move CPU Usage later" @click="move($event,1)">&rarr;</button>
-            </span>
-            <span class="card-name" x-text="cpuPct.toFixed(1) + '%'"></span>
-          </div>
-          <canvas id="rt-cpu" class="chart-canvas" height="120" role="img"
-                  aria-label="CPU usage time-series chart with goroutines on the right axis"></canvas>
-          <div class="chart-legend">
-            <span>cpu %</span><span>goroutines (right)</span>
-          </div>
-        </div>
-        <!-- Goroutines -->
-        <div draggable="true"
-             @dragstart="start($event)" @dragover.prevent @drop="drop($event)" @dragend="dragEnd($event)"
-             class="card card-grab rt-card">
-          <div class="card-sub">
-            <span class="card-name">App Goroutines</span>
-            <span class="move-btns">
-              <button type="button" class="move-btn" title="move earlier" aria-label="Move App Goroutines earlier" @click="move($event,-1)">&larr;</button>
-              <button type="button" class="move-btn" title="move later" aria-label="Move App Goroutines later" @click="move($event,1)">&rarr;</button>
-            </span>
-            <span class="card-name" x-text="currentGoro"></span>
-          </div>
-          <canvas id="rt-goro" class="chart-canvas" height="120" role="img"
-                  aria-label="Goroutines time-series chart"></canvas>
-        </div>
-      </div>
+      {{end}}
     </div>
   </section>
   {{end}}
-
-  <!-- Histogram Time-Series: bucket distribution evolution over time -->
-  <section x-data="histogramTimeSeries()" class="section-histogram" x-cloak>
-    <div class="row">
-      <h2 class="section-title section-title-accent">Histogram Time-Series</h2>
-      <span class="meta-faint">· bucket distribution evolution</span>
-      <div class="row-tight">
-        <template x-for="d in ['5m','30m','1h','4h','12h','24h','1w']" :key="d">
-          <button @click="duration=d; refresh()" class="pill" :class="duration===d ? 'active' : ''" x-text="d"></button>
-        </template>
-      </div>
-    </div>
-
-    <!-- Histogram charts grid -->
-    <div id="histogram-timeseries" class="grid grid-half-lg">
-      <template x-for="metric in histogramMetrics" :key="metric.name">
-        <div class="card card-static">
-          <div class="card-sub">
-            <span class="card-name card-name-accent" x-text="metric.name"></span>
-            <span class="card-name" x-text="metric.description"></span>
-          </div>
-          <canvas :id="'hist-ts-' + metric.name" class="chart-canvas" height="150" role="img"
-                  :aria-label="metric.name + ' bucket distribution over time'"></canvas>
-          <div class="chart-legend-bucket">
-            <template x-for="(bound, index) in metric.bounds" :key="index">
-              <span :style="'color:' + getBucketColor(index)" x-text="'≤' + formatBound(bound)"></span>
-            </template>
-          </div>
-        </div>
-      </template>
-    </div>
-
-    <!-- Empty state -->
-    <div x-show="histogramMetrics.length === 0" class="empty-state">
-      <p class="empty-title">No histogram metrics with time-series data found.</p>
-      <p class="empty-hint">Histogram metrics will appear here after data collection begins.</p>
-    </div>
-  </section>
-
-  {{if .HookCards}}
-  <!-- Hooks Section: webhook and lifecycle hook metrics -->
-  <section x-data="hooksSection()" x-cloak>
-    <div class="row">
-      <h2 class="section-title">Hooks</h2>
-      <span class="meta-faint">· drag to reorder</span>
-    </div>
-    <div id="hooks"
-         hx-get="/metrics/hooks"
-         hx-trigger="every {{.PollMs}}ms [!document.body.dataset.paused && !document.body.dataset.hidden]"
-         hx-swap="innerHTML">
-      {{template "cards" .HookCards}}
-    </div>
-  </section>
-  {{end}}
-
-  <!-- My Charts: pinned metrics from the server-persisted dashboard config
-       (localStorage is a fallback cache), drag-to-reorder, kept live by
-       cloning the matching server-rendered card from #charts. -->
-  <section x-show="$store.ui.charts.length" x-cloak
-           x-data="{ drag: null,
-                     start(i){ this.drag = i; },
-                     drop(i){ if(this.drag===null){ return; }
-                              const from = this.drag; this.drag = null;
-                              moveCharts(from, i); },
-                     move(i, d){ moveCharts(i, i + d); } }"
-           x-effect="$store.ui.charts.length; renderPinned()">
-    <div class="row">
-      <h2 class="section-title">My Charts</h2>
-      <span class="meta-faint" x-text="'(' + $store.ui.charts.length + ')'"></span>
-      <span class="meta-faint">· drag to reorder</span>
-    </div>
-    <div id="pinned" class="grid grid-cards">
-      <template x-for="(name, idx) in $store.ui.charts" :key="name">
-        <div draggable="true"
-             @dragstart="start(idx)"
-             @dragover.prevent
-             @drop="drop(idx)"
-             @dragend="drag=null"
-             :class="drag===idx ? 'dragging' : ''"
-             class="card card-grab pin-slot">
-          <div class="pin-actions">
-            <button type="button" class="pin-btn" title="move earlier" :aria-label="'Move ' + name + ' earlier'" @click="move(idx,-1)">&larr;</button>
-            <button type="button" class="pin-btn" title="move later" :aria-label="'Move ' + name + ' later'" @click="move(idx,1)">&rarr;</button>
-            <button type="button" class="pin-remove" title="remove" :aria-label="'Remove ' + name + ' pin'" @click="$store.ui.remove(name)">×</button>
-          </div>
-          <div class="pin-body" :data-pin="name"></div>
-        </div>
-      </template>
-    </div>
-  </section>
-
-  <h2 class="section-title">All Metrics</h2>
-  <div id="charts"
-       hx-get="/metrics/data"
-       hx-trigger="every {{.PollMs}}ms [!document.body.dataset.paused && !document.body.dataset.hidden]"
-       hx-swap="innerHTML">
-    {{template "cards" .Cards}}
-  </div>
-
-  <!-- Endpoint latency: p50 / p95 / p99 per endpoint, polled as JSON,
-       drag-to-reorder with persisted order. -->
-  <section x-data="endpointLatency()">
-    <div class="row">
-      <h2 class="section-title">Endpoint Latency</h2>
-      <span class="meta-faint">· drag to reorder</span>
-    </div>
-    <div x-show="endpoints.length === 0" class="meta">no endpoint traffic yet.</div>
-    <div class="grid grid-cards">
-      <template x-for="(e, idx) in endpoints" :key="e.method + ' ' + e.path">
-        <div draggable="true"
-             @dragstart="start(idx)" @dragover.prevent @drop="drop(idx)" @dragend="drag=null"
-             :class="drag===idx ? 'dragging' : ''"
-             class="card card-grab">
-          <div class="card-head">
-            <span class="badge badge-method" x-text="e.method"></span>
-            <span class="card-name nowrap" x-text="e.path"></span>
-            <span class="move-btns">
-              <button type="button" class="move-btn" title="move earlier" :aria-label="'Move ' + e.path + ' earlier'" @click="move(idx,-1)">&larr;</button>
-              <button type="button" class="move-btn" title="move later" :aria-label="'Move ' + e.path + ' later'" @click="move(idx,1)">&rarr;</button>
-            </span>
-          </div>
-          <div class="ep-meta"><span x-text="e.count"></span> requests · avg <span x-text="fmt(e.avg)"></span>s</div>
-          <div class="ep-chart">
-            <template x-for="p in [{k:'p50',v:e.p50,c:'ep-bar-p50'},{k:'p95',v:e.p95,c:'ep-bar-p95'},{k:'p99',v:e.p99,c:'ep-bar-p99'}]" :key="p.k">
-              <div class="ep-col">
-                <div class="ep-col-bar" :class="p.c" :style="'height:'+h(e,p.v)+'%'"></div>
-                <span class="ep-col-tip" x-text="fmt(p.v)+'s'"></span>
-              </div>
-            </template>
-          </div>
-          <div class="ep-legend">
-            <span class="legend-accent">p50</span><span class="legend-amber">p95</span><span class="legend-rose">p99</span>
-          </div>
-        </div>
-      </template>
-    </div>
-  </section>
-
-  <!-- GoLens Internals: cardinality tracking and system stats -->
-  <section x-data="cardinalityPanel({{.MaxLabelSeries}})" x-cloak>
-    <button @click="open = !open" class="disclose">
-      <svg class="disclose-caret" :class="open ? 'disclose-caret-open' : ''" viewBox="0 0 20 20" fill="currentColor">
-        <path fill-rule="evenodd" d="M7.21 14.77a.75.75 0 01.02-1.06L11.168 10 7.23 6.29a.75.75 0 111.04-1.08l4.5 4.25a.75.75 0 010 1.08l-4.5 4.25a.75.75 0 01-1.06-.02z" clip-rule="evenodd"/>
-      </svg>
-      <h2 class="section-title">{{.ProjectName}} Internals</h2>
-      <span class="meta-faint">· cardinality &amp; system</span>
-    </button>
-    <div x-show="open" x-transition.duration.200ms class="stack">
-      <!-- Summary cards -->
-      <div class="grid grid-cards">
-        <div class="stat-tile">
-          <div class="stat-label">Total Series</div>
-          <div class="stat-value" x-text="totalSeries"></div>
-          <div class="stat-sub">across <span x-text="metricCount"></span> metrics</div>
-        </div>
-        <div class="stat-tile">
-          <div class="stat-label">Total Dropped</div>
-          <div class="stat-value" :class="totalDropped > 0 ? 'stat-value-warn' : 'stat-value-ok'" x-text="totalDropped"></div>
-          <div class="stat-sub">samples rejected by guard</div>
-        </div>
-        <div class="stat-tile">
-          <div class="stat-label">Series Cap</div>
-          <div class="stat-value" x-text="maxSeries === 0 ? '∞' : maxSeries"></div>
-          <div class="stat-sub">per metric (<span x-text="maxSeries === 0 ? 'unlimited' : 'configured'"></span>)</div>
-        </div>
-      </div>
-
-      <!-- Per-metric detail table -->
-      <div class="data-card">
-        <div class="data-card-head">
-          <span class="meta">Per-Metric Cardinality</span>
-          <span class="meta-faint" x-text="metrics.length + ' metrics'"></span>
-        </div>
-        <div class="table-scroll">
-          <table class="data-table data-table-dashboard">
-            <thead>
-              <tr>
-                <th>Metric</th>
-                <th class="cell-num">Series</th>
-                <th class="cell-num">Cap</th>
-                <th class="cell-num">Dropped</th>
-                <th>Usage</th>
-              </tr>
-            </thead>
-            <tbody>
-              <template x-for="m in metrics" :key="m.metric_name">
-                <tr>
-                  <td class="cell-mono" x-text="m.metric_name"></td>
-                  <td class="cell-num" x-text="m.series"></td>
-                  <td class="cell-dim" x-text="m.max_series === 0 ? '∞' : m.max_series"></td>
-                  <td class="cell-dim" :class="m.dropped > 0 ? 'cell-danger' : ''" x-text="m.dropped"></td>
-                  <td>
-                    <div class="meter">
-                      <div class="meter-fill"
-                           :class="usagePct(m) >= 90 ? 'meter-full' : usagePct(m) >= 70 ? 'meter-warn' : 'meter-ok'"
-                           :style="'width:' + Math.min(100, usagePct(m)) + '%'"></div>
-                    </div>
-                  </td>
-                </tr>
-              </template>
-              <tr x-show="metrics.length === 0">
-                <td colspan="5" class="cell-empty">No cardinality data yet.</td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-      </div>
-    </div>
-  </section>
 </main>
 
 <!-- Add-chart modal (Alpine): lists all currently-available metrics by default,
@@ -1476,7 +1269,256 @@ const dashboardSrc = `<!DOCTYPE html>
 <div id="app-toast" class="toast" aria-live="polite"></div>
 
 </body>
-</html>`
+</html>
+
+{{define "block-runtime"}}
+<!-- Runtime Health: time-series charts for memory, CPU, goroutines -->
+<div x-data="runtimeHealth()" x-cloak>
+  <div class="row">
+    <div class="row-tight">
+      <template x-for="d in ['5m','30m','1h','4h','12h','24h','1w']" :key="d">
+        <button @click="duration=d; refresh()" class="pill" :class="duration===d ? 'active' : ''" x-text="d"></button>
+      </template>
+    </div>
+  </div>
+
+  <!-- Runtime charts container for drag-to-reorder. Cards carry the
+       rt-card class so the drop handler selects exactly the card elements
+       (never their inner header/legend divs). Drag and button moves derive
+       indexes from the element's current position, so they stay correct
+       after a reorder. -->
+  <div id="runtime-charts" class="stack">
+    <!-- Memory Overview (full width) -->
+    <div draggable="true"
+         @dragstart="start($event)" @dragover.prevent @drop="drop($event)" @dragend="dragEnd($event)"
+         class="card card-grab rt-card">
+      <div class="card-sub">
+        <span class="card-name">Memory Overview</span>
+        <span class="move-btns edit-only">
+          <button type="button" class="move-btn" title="move earlier" aria-label="Move Memory Overview earlier" @click="move($event,-1)">&larr;</button>
+          <button type="button" class="move-btn" title="move later" aria-label="Move Memory Overview later" @click="move($event,1)">&rarr;</button>
+        </span>
+        <div class="row-tight meta">
+          <span>sys: <span x-text="fmtBytes(currentSysBytes)"></span></span>
+          <span>heap: <span x-text="fmtBytes(currentHeapInuse)"></span></span>
+          <span>alloc: <span x-text="fmtBytes(currentMem)"></span></span>
+          <span>obj: <span x-text="fmtCount(currentHeapObj)"></span></span>
+        </div>
+      </div>
+      <canvas id="rt-mem" class="chart-canvas" height="100" role="img"
+              aria-label="Memory overview time-series chart: sys, heap in use, and alloc bytes, with heap objects on the right axis"></canvas>
+      <div class="chart-legend">
+        <span class="legend-accent">sys bytes</span>
+        <span class="legend-teal">heap inuse</span>
+        <span class="legend-blue">alloc bytes</span>
+        <span class="legend-amber">heap objects (right)</span>
+      </div>
+    </div>
+
+    <!-- CPU and Goroutines in grid -->
+    <div class="grid grid-half">
+      <!-- CPU -->
+      <div draggable="true"
+           @dragstart="start($event)" @dragover.prevent @drop="drop($event)" @dragend="dragEnd($event)"
+           class="card card-grab rt-card">
+        <div class="card-sub">
+          <span class="card-name">CPU Usage</span>
+          <span class="move-btns edit-only">
+            <button type="button" class="move-btn" title="move earlier" aria-label="Move CPU Usage earlier" @click="move($event,-1)">&larr;</button>
+            <button type="button" class="move-btn" title="move later" aria-label="Move CPU Usage later" @click="move($event,1)">&rarr;</button>
+          </span>
+          <span class="card-name" x-text="cpuPct.toFixed(1) + '%'"></span>
+        </div>
+        <canvas id="rt-cpu" class="chart-canvas" height="120" role="img"
+                aria-label="CPU usage time-series chart with goroutines on the right axis"></canvas>
+        <div class="chart-legend">
+          <span>cpu %</span><span>goroutines (right)</span>
+        </div>
+      </div>
+      <!-- Goroutines -->
+      <div draggable="true"
+           @dragstart="start($event)" @dragover.prevent @drop="drop($event)" @dragend="dragEnd($event)"
+           class="card card-grab rt-card">
+        <div class="card-sub">
+          <span class="card-name">App Goroutines</span>
+          <span class="move-btns edit-only">
+            <button type="button" class="move-btn" title="move earlier" aria-label="Move App Goroutines earlier" @click="move($event,-1)">&larr;</button>
+            <button type="button" class="move-btn" title="move later" aria-label="Move App Goroutines later" @click="move($event,1)">&rarr;</button>
+          </span>
+          <span class="card-name" x-text="currentGoro"></span>
+        </div>
+        <canvas id="rt-goro" class="chart-canvas" height="120" role="img"
+                aria-label="Goroutines time-series chart"></canvas>
+      </div>
+    </div>
+  </div>
+</div>
+{{end}}
+
+{{define "block-histogram"}}
+<!-- Histogram Time-Series: bucket distribution evolution over time -->
+<div x-data="histogramTimeSeries()" class="section-histogram" x-cloak>
+  <div class="row">
+    <div class="row-tight">
+      <template x-for="d in ['5m','30m','1h','4h','12h','24h','1w']" :key="d">
+        <button @click="duration=d; refresh()" class="pill" :class="duration===d ? 'active' : ''" x-text="d"></button>
+      </template>
+    </div>
+  </div>
+
+  <!-- Histogram charts grid -->
+  <div id="histogram-timeseries" class="grid grid-half-lg">
+    <template x-for="metric in histogramMetrics" :key="metric.name">
+      <div class="card card-static">
+        <div class="card-sub">
+          <span class="card-name card-name-accent" x-text="metric.name"></span>
+          <span class="card-name" x-text="metric.description"></span>
+        </div>
+        <canvas :id="'hist-ts-' + metric.name" class="chart-canvas" height="150" role="img"
+                :aria-label="metric.name + ' bucket distribution over time'"></canvas>
+        <div class="chart-legend-bucket">
+          <template x-for="(bound, index) in metric.bounds" :key="index">
+            <span :style="'color:' + getBucketColor(index)" x-text="'≤' + formatBound(bound)"></span>
+          </template>
+        </div>
+      </div>
+    </template>
+  </div>
+
+  <!-- Empty state -->
+  <div x-show="histogramMetrics.length === 0" class="empty-state">
+    <p class="empty-title">No histogram metrics with time-series data found.</p>
+    <p class="empty-hint">Histogram metrics will appear here after data collection begins.</p>
+  </div>
+</div>
+{{end}}
+
+{{define "block-hooks"}}
+<!-- Hooks: webhook and lifecycle hook metrics -->
+<div x-data="hooksSection()">
+  <div id="hooks"
+       hx-get="/metrics/hooks"
+       hx-trigger="every {{$.PollMs}}ms [!document.body.dataset.paused && !document.body.dataset.hidden]"
+       hx-swap="innerHTML">
+    {{template "cards" $.HookCards}}
+  </div>
+</div>
+{{end}}
+
+{{define "block-all-metrics"}}
+<div>
+  <div id="charts"
+       hx-get="/metrics/data"
+       hx-trigger="every {{$.PollMs}}ms [!document.body.dataset.paused && !document.body.dataset.hidden]"
+       hx-swap="innerHTML">
+    {{template "cards" $.Cards}}
+  </div>
+</div>
+{{end}}
+
+{{define "block-endpoints"}}
+<!-- Endpoint latency: p50 / p95 / p99 per endpoint, polled as JSON,
+     drag-to-reorder with persisted order. -->
+<div x-data="endpointLatency()">
+  <div x-show="endpoints.length === 0" class="meta">no endpoint traffic yet.</div>
+  <div class="grid grid-cards">
+    <template x-for="(e, idx) in endpoints" :key="e.method + ' ' + e.path">
+      <div draggable="true"
+           @dragstart="start(idx)" @dragover.prevent @drop="drop(idx)" @dragend="drag=null"
+           :class="drag===idx ? 'dragging' : ''"
+           class="card card-grab">
+        <div class="card-head">
+          <span class="badge badge-method" x-text="e.method"></span>
+          <span class="card-name nowrap" x-text="e.path"></span>
+          <span class="move-btns edit-only">
+            <button type="button" class="move-btn" title="move earlier" :aria-label="'Move ' + e.path + ' earlier'" @click="move(idx,-1)">&larr;</button>
+            <button type="button" class="move-btn" title="move later" :aria-label="'Move ' + e.path + ' later'" @click="move(idx,1)">&rarr;</button>
+          </span>
+        </div>
+        <div class="ep-meta"><span x-text="e.count"></span> requests · avg <span x-text="fmt(e.avg)"></span>s</div>
+        <div class="ep-chart">
+          <template x-for="p in [{k:'p50',v:e.p50,c:'ep-bar-p50'},{k:'p95',v:e.p95,c:'ep-bar-p95'},{k:'p99',v:e.p99,c:'ep-bar-p99'}]" :key="p.k">
+            <div class="ep-col">
+              <div class="ep-col-bar" :class="p.c" :style="'height:'+h(e,p.v)+'%'"></div>
+              <span class="ep-col-tip" x-text="fmt(p.v)+'s'"></span>
+            </div>
+          </template>
+        </div>
+        <div class="ep-legend">
+          <span class="legend-accent">p50</span><span class="legend-amber">p95</span><span class="legend-rose">p99</span>
+        </div>
+      </div>
+    </template>
+  </div>
+</div>
+{{end}}
+
+{{define "block-internals"}}
+<!-- Internals: cardinality tracking and system stats -->
+<div x-data="cardinalityPanel({{$.MaxLabelSeries}})" x-cloak>
+  <div class="stack">
+    <!-- Summary cards -->
+    <div class="grid grid-cards">
+      <div class="stat-tile">
+        <div class="stat-label">Total Series</div>
+        <div class="stat-value" x-text="totalSeries"></div>
+        <div class="stat-sub">across <span x-text="metricCount"></span> metrics</div>
+      </div>
+      <div class="stat-tile">
+        <div class="stat-label">Total Dropped</div>
+        <div class="stat-value" :class="totalDropped > 0 ? 'stat-value-warn' : 'stat-value-ok'" x-text="totalDropped"></div>
+        <div class="stat-sub">samples rejected by guard</div>
+      </div>
+      <div class="stat-tile">
+        <div class="stat-label">Series Cap</div>
+        <div class="stat-value" x-text="maxSeries === 0 ? '∞' : maxSeries"></div>
+        <div class="stat-sub">per metric (<span x-text="maxSeries === 0 ? 'unlimited' : 'configured'"></span>)</div>
+      </div>
+    </div>
+
+    <!-- Per-metric detail table -->
+    <div class="data-card">
+      <div class="data-card-head">
+        <span class="meta">Per-Metric Cardinality</span>
+        <span class="meta-faint" x-text="metrics.length + ' metrics'"></span>
+      </div>
+      <div class="table-scroll">
+        <table class="data-table data-table-dashboard">
+          <thead>
+            <tr>
+              <th>Metric</th>
+              <th class="cell-num">Series</th>
+              <th class="cell-num">Cap</th>
+              <th class="cell-num">Dropped</th>
+              <th>Usage</th>
+            </tr>
+          </thead>
+          <tbody>
+            <template x-for="m in metrics" :key="m.metric_name">
+              <tr>
+                <td class="cell-mono" x-text="m.metric_name"></td>
+                <td class="cell-num" x-text="m.series"></td>
+                <td class="cell-dim" x-text="m.max_series === 0 ? '∞' : m.max_series"></td>
+                <td class="cell-dim" :class="m.dropped > 0 ? 'cell-danger' : ''" x-text="m.dropped"></td>
+                <td>
+                  <div class="meter">
+                    <div class="meter-fill"
+                         :class="usagePct(m) >= 90 ? 'meter-full' : usagePct(m) >= 70 ? 'meter-warn' : 'meter-ok'"
+                         :style="'width:' + Math.min(100, usagePct(m)) + '%'"></div>
+                  </div>
+                </td>
+              </tr>
+            </template>
+            <tr x-show="metrics.length === 0">
+              <td colspan="5" class="cell-empty">No cardinality data yet.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+{{end}}`
 
 // The card grid, shared by the All Metrics section, the Hooks section, and
 // the HTMX fragment endpoints. Ranges over a []metricCard slice. Each card's
@@ -1493,9 +1535,9 @@ const cardsSrc = `{{define "cards"}}
     <div class="card-head">
       <span class="badge badge-{{.BadgeTone}}">{{.Badge}}</span>
       <span class="card-name nowrap">{{.Snapshot.Name}}</span>
-      <span class="move-btns">
+      <span class="move-btns edit-only">
         {{if not .Hook}}
-        <button type="button" class="pin-add" title="pin to My Charts" aria-label="Pin {{.Snapshot.Name}} to My Charts" onclick="pinCard(this)">+</button>
+        <button type="button" class="pin-add" title="pin to a section" aria-label="Pin {{.Snapshot.Name}}" onclick="pinCard(this)">+</button>
         {{end}}
         <button type="button" class="move-btn" title="move earlier" aria-label="Move {{.Snapshot.Name}} earlier" onclick="moveGridCard(this,-1)">&larr;</button>
         <button type="button" class="move-btn" title="move later" aria-label="Move {{.Snapshot.Name}} later" onclick="moveGridCard(this,1)">&rarr;</button>

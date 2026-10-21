@@ -16,13 +16,22 @@ var HAS_NOTIFIER = !!GoLensConfig.hasNotifier;
 
 function lsJSON(key) { try { return JSON.parse(localStorage.getItem(key) || '[]'); } catch (e) { return []; } }
 
+// bootSections clones the server-rendered effective section list (same list
+// that rendered the page's bands), so the client can boot and render even
+// before /metrics/config answers.
+function bootSections() {
+  var s = GoLensConfig.sections;
+  return (s && s.length) ? JSON.parse(JSON.stringify(s)) : [];
+}
+
 // Boot from the localStorage cache; when the server document loads it
 // replaces this state (loadDash).
 var dashCfg = {
   version: 1,
   panels: lsJSON('golens.charts').map(function (n) { return { id: n, metric: n }; }),
   order: { all_metrics: lsJSON('golens.order'), hooks: lsJSON('golens.hooksorder'), endpoints: lsJSON('golens.eporder') },
-  http_card_view: localStorage.getItem('golens.httpview') || ''
+  http_card_view: localStorage.getItem('golens.httpview') || '',
+  sections: bootSections()
 };
 var dashRemote = false;
 
@@ -87,6 +96,65 @@ function applyDash() {
   sortCharts(); applyFilter(); renderPinned(); applyHookOrder();
 }
 
+// normalizeSections repairs a loaded document for the client: without
+// sections (shouldn't happen — GET projects the effective list) fall back to
+// the page's boot list; duplicate panel identities collapse (the client is
+// metric-keyed end to end — the store, every chartsToPanels rebuild, and
+// remove — and the PUT validator rejects duplicate metrics and ids, so a
+// legacy document must be healed before it is ever re-PUT); and any panel
+// not placed in a section lands in the my-charts band (or the last one), so
+// a pin is never invisible.
+function normalizeSections(d) {
+  if (!d.sections || !d.sections.length) d.sections = bootSections();
+  // Keep the last panel per metric (what the by-metric rebuild renders),
+  // then collapse duplicate ids to the first. A dropped panel's id is
+  // pruned from section items unless a kept panel still holds it, so the
+  // healed document never references an unknown panel.
+  var seenMetric = {}, kept = [], droppedIDs = {};
+  for (var i = d.panels.length - 1; i >= 0; i--) {
+    var p = d.panels[i];
+    if (seenMetric[p.metric]) { droppedIDs[p.id] = true; continue; }
+    seenMetric[p.metric] = true;
+    kept.unshift(p);
+  }
+  var seenID = {};
+  d.panels = kept.filter(function (p) {
+    if (seenID[p.id]) { droppedIDs[p.id] = true; return false; }
+    seenID[p.id] = true;
+    return true;
+  });
+  d.panels.forEach(function (p) { delete droppedIDs[p.id]; });
+  (d.sections || []).forEach(function (s) {
+    if (s.items && s.items.length) s.items = s.items.filter(function (id) { return !droppedIDs[id]; });
+  });
+  var placed = {};
+  d.sections.forEach(function (s) { (s.items || []).forEach(function (id) { placed[id] = true; }); });
+  var host = null;
+  d.sections.forEach(function (s) { if (s.id === 'my-charts') host = s; });
+  if (!host) host = d.sections[d.sections.length - 1];
+  d.panels.forEach(function (p) {
+    if (!placed[p.id] && host) {
+      if (!host.items) host.items = [];
+      host.items.push(p.id);
+      placed[p.id] = true;
+    }
+  });
+}
+
+// sanitizeLegacyPanels drops panels whose id is a reserved block id. Pre-
+// section documents could legally pin a metric named e.g. "hooks", but the
+// current PUT validator rejects such panel ids, so keeping them would brick
+// persistence (every layout PUT 400s and retries forever). Section items with
+// the same id need no cleanup: they resolve to the well-known block, not to
+// the dropped panel, on both the server and in renderPinned.
+function sanitizeLegacyPanels(d) {
+  var bad = d.panels.filter(function (p) { return RESERVED_BLOCK_IDS.indexOf(p.id) >= 0; });
+  if (!bad.length) return;
+  d.panels = d.panels.filter(function (p) { return RESERVED_BLOCK_IDS.indexOf(p.id) < 0; });
+  showToast('dropped pinned chart ' + bad.map(function (p) { return '"' + p.metric + '"'; }).join(', ') +
+    ': reserved section block ids cannot be pinned', 'error');
+}
+
 function loadDash() {
   fetchJSON('/metrics/config', { headers: { 'Accept': 'application/json' } })
     .then(function (d) {
@@ -99,6 +167,8 @@ function loadDash() {
       // HTTP card view are migrated, even when only orderings exist.
       var promoted = !(d.panels.length || dashHasOrder(d)) && (dashCfg.panels.length || dashHasOrder(dashCfg));
       if (promoted) { d.panels = dashCfg.panels; d.order = dashCfg.order; d.http_card_view = dashCfg.http_card_view; }
+      sanitizeLegacyPanels(d);
+      normalizeSections(d);
       dashCfg = d;
       dashRemote = true;
       if (promoted || d.panels.length) persistDash();
@@ -128,6 +198,13 @@ document.addEventListener('alpine:init', function () {
     charts: dashCfg.panels.map(function (p) { return p.metric; }),
     has: function (n) { return this.charts.indexOf(n) >= 0; },
     pin: function (n) {
+      // A panel's id is its metric name, and a metric sharing a reserved
+      // block id would make every layout PUT fail validation — reject the
+      // pin instead of bricking persistence.
+      if (n && RESERVED_BLOCK_IDS.indexOf(n) >= 0 && !this.has(n)) {
+        showToast('metric "' + n + '" is a reserved section block id and cannot be pinned', 'error');
+        return;
+      }
       if (n && !this.has(n)) {
         this.charts.push(n);
         dashCfg.panels = chartsToPanels(this.charts);
@@ -139,15 +216,21 @@ document.addEventListener('alpine:init', function () {
             // selection, dropping any config from a previous pin.
             p.chart_type = sel.chartType || undefined;
             p.size = sel.size || undefined;
+            placePanel(p.id);
           }
         }
         persistDash();
+        renderPinned();
       }
     },
     remove: function (n) {
+      var id = null;
+      dashCfg.panels.forEach(function (p) { if (p.metric === n) id = p.id; });
       this.charts = this.charts.filter(function (x) { return x !== n; });
       dashCfg.panels = chartsToPanels(this.charts);
+      if (id) unplacePanel(id);
       persistDash();
+      renderPinned();
     },
 
     // Alert modal state
@@ -303,17 +386,6 @@ function moveGridCard(btn, dir) {
   });
 }
 
-// moveCharts reorders the pinned charts store through moveCard and persists
-// (the My Charts drag handler and its move buttons both land here).
-function moveCharts(from, to) {
-  var st = Alpine.store('ui');
-  moveCard(st.charts, from, to, function () {
-    dashCfg.panels = chartsToPanels(st.charts);
-    persistDash();
-    renderPinned();
-  });
-}
-
 // pinCard pins a card's metric to My Charts (the + button on each card).
 function pinCard(btn) {
   var card = btn.closest('[data-metric]');
@@ -326,6 +398,330 @@ function metricNames() {
 
 function cssEsc(s) { return (window.CSS && CSS.escape) ? CSS.escape(s) : s.replace(/["\\]/g, '\\$&'); }
 
+// --- sections: pinned panels, collapse, edit mode ------------------------------
+// Sections place fixed blocks and pinned panels into horizontal bands. The
+// server renders the bands and their blocks; pinned panels are client-rendered
+// slots reconciled into the bands from dashCfg.sections. Edit mode (localStorage,
+// so it survives reloads) gates every drag/move/pin/rename/size affordance.
+// Collapse state per section id lives in localStorage only, never in the doc.
+
+// RESERVED_BLOCK_IDS mirrors the server's well-known block ids (see
+// validateDashboardSections); pin() refuses metrics with these names.
+var RESERVED_BLOCK_IDS = ['runtime-health', 'histogram', 'hooks', 'all-metrics', 'endpoint-latency', 'internals'];
+
+function panelByID(id) {
+  for (var i = 0; i < dashCfg.panels.length; i++) {
+    if (dashCfg.panels[i].id === id) return dashCfg.panels[i];
+  }
+  return null;
+}
+
+// sectionForPanels returns the band new pins land in: the my-charts band when
+// the layout has one (the default layout does), else the last band.
+function sectionForPanels() {
+  var secs = dashCfg.sections;
+  for (var i = 0; i < secs.length; i++) if (secs[i].id === 'my-charts') return secs[i];
+  if (secs.length) return secs[secs.length - 1];
+  var s = { id: 'my-charts', items: [] };
+  secs.push(s);
+  return s;
+}
+
+function placePanel(id) {
+  var s = sectionForPanels();
+  if (!s) return;
+  if (!s.items) s.items = [];
+  if (s.items.indexOf(id) < 0) s.items.push(id);
+}
+
+function unplacePanel(id) {
+  dashCfg.sections.forEach(function (s) {
+    if (s.items) s.items = s.items.filter(function (x) { return x !== id; });
+  });
+}
+
+// attrEsc makes a metric name safe inside a double-quoted HTML attribute.
+function attrEsc(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+}
+
+// makeSlot builds a pinned-panel slot: actions row (edit mode only) and the
+// body renderPinned fills by cloning the server-rendered card.
+function makeSlot(p) {
+  var slot = document.createElement('div');
+  slot.className = 'pin-slot card card-grab';
+  slot.setAttribute('data-pin-id', p.id);
+  slot.setAttribute('data-pin', p.metric);
+  slot.setAttribute('draggable', 'true');
+  var label = attrEsc(p.metric);
+  slot.innerHTML =
+    '<div class="pin-actions edit-only">' +
+    '<button type="button" class="pin-btn" title="move earlier" aria-label="Move ' + label + ' earlier" onclick="moveSectionItem(this,-1)">&larr;</button>' +
+    '<button type="button" class="pin-btn" title="move later" aria-label="Move ' + label + ' later" onclick="moveSectionItem(this,1)">&rarr;</button>' +
+    '<select class="pin-size" title="panel size" aria-label="Panel size" onchange="setPanelSize(this)">' +
+    '<option value="">default</option><option value="sm">small</option><option value="md">medium</option><option value="lg">large</option>' +
+    '</select>' +
+    '<button type="button" class="pin-remove" title="remove" aria-label="Remove ' + label + '" onclick="unpinSlot(this)">&times;</button>' +
+    '</div>' +
+    '<div class="pin-body"></div>';
+  var sel = slot.querySelector('.pin-size');
+  if (sel) sel.value = p.size || '';
+  return slot;
+}
+
+// itemKey is a section body child's config item id (block id or panel id).
+function itemKey(el) {
+  return el.hasAttribute('data-block') ? el.getAttribute('data-block') : el.getAttribute('data-pin-id');
+}
+
+function sectionItemsIn(sec) {
+  return Array.from(sec.querySelectorAll('.sec-body > [data-block], .sec-body > .pin-slot')).map(itemKey);
+}
+
+function sectionItems() {
+  return Array.from(document.querySelectorAll('.sec-body > [data-block], .sec-body > .pin-slot'));
+}
+
+// renderPinned reconciles the section bodies with dashCfg.sections (creating
+// and placing panel slots, restoring block/panel order), then fills each
+// slot by cloning its server-rendered card from #charts. Identical HTML is
+// skipped so a poll that changed nothing doesn't destroy hover tooltips or
+// an in-progress text selection.
+function renderPinned() {
+  var bodies = {};
+  document.querySelectorAll('[data-section]').forEach(function (sec) {
+    bodies[sec.getAttribute('data-section')] = sec.querySelector('.sec-body');
+  });
+  var blocks = {}, slots = {}, wantSlots = {};
+  document.querySelectorAll('.sec-body > [data-block]').forEach(function (b) { blocks[b.getAttribute('data-block')] = b; });
+  document.querySelectorAll('.sec-body > .pin-slot').forEach(function (s) { slots[s.getAttribute('data-pin-id')] = s; });
+  (dashCfg.sections || []).forEach(function (s) {
+    var body = bodies[s.id];
+    if (!body) return;
+    var nodes = [];
+    (s.items || []).forEach(function (id) {
+      var p = panelByID(id);
+      if (p) {
+        wantSlots[id] = true;
+        if (!slots[id]) { slots[id] = makeSlot(p); }
+        nodes.push(slots[id]);
+        return;
+      }
+      if (blocks[id]) nodes.push(blocks[id]);
+    });
+    // Rebuild the body order only when it drifted: appending nodes destroys
+    // hover tooltips and text selections even when the order is unchanged.
+    var cur = Array.from(body.children);
+    var same = cur.length === nodes.length && cur.every(function (el, i) { return el === nodes[i]; });
+    if (!same) nodes.forEach(function (n) { body.appendChild(n); });
+  });
+  Object.keys(slots).forEach(function (id) {
+    if (!wantSlots[id] && slots[id].parentNode) slots[id].remove();
+  });
+  document.querySelectorAll('.pin-slot').forEach(function (slot) {
+    var name = slot.getAttribute('data-pin');
+    slot.className = 'pin-slot card card-grab ' + pinSizeClass(name);
+    var body = slot.querySelector('.pin-body');
+    var card = document.querySelector('#charts [data-metric="' + cssEsc(name) + '"]');
+    var html = card ? card.innerHTML : '<div class="pin-missing">metric unavailable</div>';
+    if (body.innerHTML !== html) body.innerHTML = html;
+  });
+  refreshSections();
+  drawLineCharts();
+}
+
+// --- edit mode -----------------------------------------------------------------
+
+function editMode() { return document.body.classList.contains('edit-mode'); }
+
+// setEditMode flips the layout-editing gate. The flag persists in
+// localStorage, so a reload while editing stays in edit mode (view mode is
+// the default when the flag is absent). The body.edit-mode class drives the
+// CSS visibility of every .edit-only affordance.
+function setEditMode(on) {
+  document.body.classList.toggle('edit-mode', !!on);
+  try { localStorage.setItem('golens.editmode', on ? '1' : ''); } catch (e) {}
+  var b = document.getElementById('edit-toggle');
+  if (b) b.setAttribute('aria-pressed', on ? 'true' : 'false');
+  refreshSections();
+}
+
+function toggleEditMode() { setEditMode(!editMode()); }
+
+// --- collapse ------------------------------------------------------------------
+
+function collapsedMap() {
+  try { return JSON.parse(localStorage.getItem('golens.collapsed') || '{}') || {}; } catch (e) { return {}; }
+}
+var secCollapsed = collapsedMap();
+
+function toggleCollapse(sec) {
+  if (!sec) return;
+  var id = sec.getAttribute('data-section');
+  if (secCollapsed[id]) delete secCollapsed[id]; else secCollapsed[id] = true;
+  try { localStorage.setItem('golens.collapsed', JSON.stringify(secCollapsed)); } catch (e) {}
+  refreshSections();
+}
+
+// refreshSections applies the two client-owned visibility rules: an empty
+// band stays hidden in view mode (it is an edit-mode drop target), and a
+// collapsed band hides its body behind the header.
+function refreshSections() {
+  document.querySelectorAll('[data-section]').forEach(function (sec) {
+    var body = sec.querySelector('.sec-body');
+    if (!body) return;
+    var empty = !body.querySelector('[data-block], .pin-slot');
+    sec.hidden = !editMode() && empty;
+    body.hidden = !!secCollapsed[sec.getAttribute('data-section')];
+    var head = sec.querySelector('.sec-head');
+    if (head) head.classList.toggle('sec-collapsed', body.hidden);
+  });
+}
+
+// --- section persistence ---------------------------------------------------------
+
+// normSections renders a section list in one comparable shape: server
+// documents omit empty name/items, DOM-built bands always carry them.
+function normSections(list) {
+  return JSON.stringify((list || []).map(function (s) {
+    return { id: s.id, name: s.name || '', items: s.items || [] };
+  }));
+}
+
+// persistSectionsFromDOM serializes the section bands back into
+// dashCfg.sections (the DOM is authoritative for the items it shows) and
+// persists. No-op when nothing moved. Items the server could not render —
+// an unavailable block has no DOM node, and a wholly unavailable band has no
+// DOM section — are carried forward from dashCfg.sections, so an edit-mode
+// persist can never delete them from the saved layout; a carried block
+// re-renders (at the end of its band) once its content becomes available.
+function persistSectionsFromDOM() {
+  var prevById = {};
+  (dashCfg.sections || []).forEach(function (s) { prevById[s.id] = s; });
+  var domSecs = Array.from(document.querySelectorAll('[data-section]'));
+  var domIds = {}, inDom = {};
+  domSecs.forEach(function (sec) {
+    domIds[sec.getAttribute('data-section')] = true;
+    sectionItemsIn(sec).forEach(function (id) { inDom[id] = true; });
+  });
+  var secs = domSecs.map(function (sec) {
+    var inp = sec.querySelector('.sec-rename-input');
+    var name = inp ? inp.value.trim() : (sec.getAttribute('data-name') || '');
+    var items = sectionItemsIn(sec);
+    var prev = prevById[sec.getAttribute('data-section')];
+    if (prev && prev.items) {
+      prev.items.forEach(function (id) { if (!inDom[id]) items.push(id); });
+    }
+    return { id: sec.getAttribute('data-section'), name: name, items: items };
+  });
+  // Bands the server dropped entirely keep their saved items untouched.
+  (dashCfg.sections || []).forEach(function (s) {
+    if (!domIds[s.id]) secs.push({ id: s.id, name: s.name || '', items: (s.items || []).slice() });
+  });
+  if (normSections(secs) === normSections(dashCfg.sections)) return;
+  dashCfg.sections = secs;
+  persistDash();
+  refreshSections();
+}
+
+// moveSectionItem is the move-button entry point for blocks and pinned
+// panels: one flat list across all bands, so ←/→ cross section boundaries.
+function moveSectionItem(btn, dir) {
+  var el = btn.closest('[data-block], .pin-slot');
+  if (!el) return;
+  var items = sectionItems();
+  var from = items.indexOf(el);
+  moveCard(items, from, neighborIndex(items, from, dir), persistSectionsFromDOM);
+}
+
+function renameSection(input) {
+  var sec = input.closest('[data-section]');
+  if (!sec) return;
+  var name = input.value.trim();
+  sec.setAttribute('data-name', name);
+  var label = sec.querySelector('.sec-name');
+  if (label) label.textContent = name;
+  persistSectionsFromDOM();
+}
+
+function setPanelSize(sel) {
+  var slot = sel.closest('.pin-slot');
+  if (!slot) return;
+  var metric = slot.getAttribute('data-pin');
+  for (var i = 0; i < dashCfg.panels.length; i++) {
+    if (dashCfg.panels[i].metric === metric) dashCfg.panels[i].size = sel.value || undefined;
+  }
+  slot.className = 'pin-slot card card-grab ' + pinSizeClass(metric);
+  persistDash();
+}
+
+function unpinSlot(btn) {
+  var slot = btn.closest('.pin-slot');
+  if (slot) Alpine.store('ui').remove(slot.getAttribute('data-pin'));
+}
+
+// --- section drag & drop (edit mode only) -----------------------------------------
+
+// Cross-band and within-band moves of blocks and pinned panels: one live-move
+// delegated handler on main. Drags that begin on a nested draggable (metric
+// cards, runtime cards) belong to their own grids and are ignored here.
+var dragSectionItem = null;
+function initSectionsDnD() {
+  var main = document.querySelector('main');
+  if (!main) return;
+  main.addEventListener('dragstart', function (e) {
+    if (!editMode()) return;
+    if (e.target.closest('[data-metric]')) return;
+    var el = e.target.closest('.sec-body > [data-block], .sec-body > .pin-slot');
+    if (!el) return;
+    if (e.target.closest('[draggable="true"]') !== el) return;
+    dragSectionItem = el;
+    el.classList.add('dragging');
+    e.dataTransfer.effectAllowed = 'move';
+  });
+  main.addEventListener('dragover', function (e) {
+    if (!dragSectionItem) return;
+    var body = e.target.closest('.sec-body');
+    if (!body) return;
+    e.preventDefault();
+    var next = null;
+    var kids = Array.from(body.children);
+    for (var i = 0; i < kids.length; i++) {
+      var k = kids[i];
+      if (k === dragSectionItem) continue;
+      var r = k.getBoundingClientRect();
+      if (e.clientY < r.top + r.height / 2) { next = k; break; }
+    }
+    if (next) body.insertBefore(dragSectionItem, next); else body.appendChild(dragSectionItem);
+  });
+  main.addEventListener('drop', function (e) {
+    if (dragSectionItem) e.preventDefault();
+  });
+  main.addEventListener('dragend', function () {
+    if (!dragSectionItem) return;
+    dragSectionItem.classList.remove('dragging');
+    dragSectionItem = null;
+    persistSectionsFromDOM();
+  });
+}
+
+function initSectionsUI() {
+  var main = document.querySelector('main');
+  if (!main) return;
+  // Whole header is the collapse click target; interactive children opt out.
+  main.addEventListener('click', function (e) {
+    if (e.target.closest('.sec-rename-input, .block-actions, .pin-actions')) return;
+    var head = e.target.closest('.sec-head');
+    if (head) toggleCollapse(head.closest('[data-section]'));
+  });
+  main.addEventListener('keydown', function (e) {
+    if ((e.key !== 'Enter' && e.key !== ' ') || e.target !== e.target.closest('.sec-head')) return;
+    e.preventDefault();
+    toggleCollapse(e.target.closest('[data-section]'));
+  });
+  initSectionsDnD();
+}
+
 // pinSizeClass returns the grid span class configured for a pinned panel.
 // Mirrors the server's mapping: only md/lg widen the cell; sm (and empty)
 // render as a single cell with no span class.
@@ -335,21 +731,6 @@ function pinSizeClass(name) {
     if (p.metric === name && (p.size === 'md' || p.size === 'lg')) return 'card-' + p.size;
   }
   return '';
-}
-
-// Clone each pinned metric's server-rendered card from #charts into its slot.
-// Identical HTML is skipped so a poll that changed nothing doesn't destroy
-// hover tooltips or an in-progress text selection.
-function renderPinned() {
-  document.querySelectorAll('#pinned [data-pin]').forEach(function (body) {
-    var name = body.getAttribute('data-pin');
-    var slot = body.closest('.pin-slot');
-    if (slot) slot.className = 'pin-slot card card-grab ' + pinSizeClass(name);
-    var card = document.querySelector('#charts [data-metric="' + cssEsc(name) + '"]');
-    var html = card ? card.innerHTML : '<div class="pin-missing">metric unavailable</div>';
-    if (body.innerHTML !== html) body.innerHTML = html;
-  });
-  drawLineCharts();
 }
 
 // --- line-chart panels (chart_type "line") -------------------------------------
@@ -411,6 +792,7 @@ function initMetricsDnD() {
   var grid = document.getElementById('charts');
   if (!grid) return;
   grid.addEventListener('dragstart', function (e) {
+    if (!editMode()) return;
     var card = e.target.closest('[data-metric]');
     if (!card) return;
     dragCard = card;
@@ -461,7 +843,7 @@ function endpointLatency() {
     load() {
       fetchJSON('/metrics/endpoints').then(d => { this.raw = d || []; }).catch(() => {});
     },
-    start(i) { this.drag = i; },
+    start(i) { if (!editMode()) return; this.drag = i; },
     drop(i) {
       if (this.drag === null) return;
       var from = this.drag;
@@ -469,6 +851,7 @@ function endpointLatency() {
       this.move(from, i - from);
     },
     move(i, d) {
+      if (!editMode()) return;
       var keys = this.endpoints.map(function (e) { return e.method + ' ' + e.path; });
       if (moveCard(keys, i, i + d, function () { saveEpOrder(keys); })) this.bump++;
     },
@@ -495,6 +878,7 @@ function hooksSection() {
       // Setup drag-and-drop
       var dragCard = null;
       grid.addEventListener('dragstart', function (e) {
+        if (!editMode()) return;
         var card = e.target.closest('[data-metric]');
         if (!card) return;
         dragCard = card;
@@ -545,13 +929,14 @@ function applyHookOrder() {
   cards.forEach(function (c) { parent.appendChild(c); });
 }
 
-// Cardinality panel: polls /metrics/cardinality and shows per-metric series stats.
+// Cardinality panel: polls /metrics/cardinality and shows per-metric series
+// stats. Visibility/collapse is owned by the generic section header, so the
+// component only feeds data.
 function cardinalityPanel(maxSeries) {
   return {
-    open: false,
     metrics: [],
     maxSeries: maxSeries,
-    init() { this.load(); setInterval(() => { if (this.open && !document.hidden) this.load(); }, POLL_MS); },
+    init() { this.load(); setInterval(() => { if (!document.hidden) this.load(); }, POLL_MS); },
     load() {
       fetchJSON('/metrics/cardinality').then(d => { this.metrics = d || []; }).catch(() => {});
     },
@@ -565,12 +950,15 @@ function cardinalityPanel(maxSeries) {
   };
 }
 
-// Boot: apply persisted All Metrics order + wire up its drag-and-drop, then
-// load the server-side dashboard layout document (falls back to the
-// localStorage boot state when unavailable). A pause from before a reload is
-// restored so it survives refreshes.
+// Boot: restore edit mode, wire the section UI, apply persisted All Metrics
+// order + wire up its drag-and-drop, then load the server-side dashboard
+// layout document (falls back to the localStorage boot state when
+// unavailable). A pause from before a reload is restored so it survives
+// refreshes.
 document.addEventListener('DOMContentLoaded', function () {
-  sortCharts(); applyFilter(); initMetricsDnD(); loadDash();
+  try { setEditMode(localStorage.getItem('golens.editmode') === '1'); } catch (e) { setEditMode(false); }
+  initSectionsUI();
+  sortCharts(); applyFilter(); initMetricsDnD(); loadDash(); renderPinned();
   try {
     if (sessionStorage.getItem('golens.paused') === '1') {
       setPaused(true);
@@ -589,20 +977,23 @@ function setPaused(p) {
 }
 
 // resetLayout clears the dashboard layout everywhere: an empty server
-// document, the localStorage fallback keys, and the in-memory state.
+// document, the localStorage fallback keys, and the in-memory state. The
+// section bands return to the server-rendered effective layout; collapse
+// state resets with the layout (edit mode is a UI mode, not layout, and
+// survives).
 function resetLayout() {
-  dashCfg = { version: 1, panels: [], order: { all_metrics: [], hooks: [], endpoints: [] }, http_card_view: '' };
-  ['golens.charts', 'golens.order', 'golens.hooksorder', 'golens.eporder', 'golens.httpview'].forEach(function (k) {
+  dashCfg = { version: 1, panels: [], order: { all_metrics: [], hooks: [], endpoints: [] }, http_card_view: '', sections: bootSections() };
+  ['golens.charts', 'golens.order', 'golens.hooksorder', 'golens.eporder', 'golens.httpview', 'golens.collapsed'].forEach(function (k) {
     try { localStorage.removeItem(k); } catch (e) {}
   });
+  secCollapsed = {};
   if (window.Alpine && Alpine.store('ui')) Alpine.store('ui').charts = [];
   applyDash();
   if (!dashRemote) { showToast('layout reset', 'success'); return; }
-  fetchJSON('/metrics/config', {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(dashCfg)
-  }).then(function () { showToast('layout reset', 'success'); })
+  // DELETE (not an empty PUT): the server drops the saved document, which is
+  // the seed-once reset state — presets re-apply on the next page load.
+  fetchJSON('/metrics/config', { method: 'DELETE' })
+    .then(function () { showToast('layout reset', 'success'); })
     .catch(function () { showToast('layout reset locally'); });
 }
 
@@ -814,6 +1205,7 @@ function runtimeHealth() {
     drag: null,
     init() { this.refresh(); setInterval(() => { if (!document.hidden) this.refresh(); }, POLL_MS); },
     start(e) {
+      if (!editMode()) return;
       var card = e.target.closest('.rt-card');
       if (!card) return;
       this.drag = rtCards().indexOf(card);

@@ -46,10 +46,16 @@ type Registry struct {
 	auth authState
 
 	// Dashboard layout document (pinned panels + section order) and its
-	// optional on-disk persistence path. Guarded by dashMu.
-	dashMu   sync.Mutex
-	dash     *DashboardConfig
-	dashPath string
+	// optional on-disk persistence path. Guarded by dashMu. dashPreset is
+	// the Go-API section preset; per D4 it is registered once at startup
+	// (before the UI mounts). dashSaved marks that
+	// a real document exists (loaded or PUT) — presets seed only before the
+	// first save.
+	dashMu     sync.Mutex
+	dash       *DashboardConfig
+	dashPath   string
+	dashPreset []DashboardSection
+	dashSaved  bool
 
 	include []*regexp.Regexp
 	exclude []*regexp.Regexp
@@ -586,6 +592,27 @@ func (r *Registry) SetEmailNotifier(n EmailNotifier) {
 	if r.alerter != nil {
 		r.alerter.SetEmailNotifier(n)
 	}
+}
+
+// PresetDashboardSections presets the dashboard's section layout from code
+// (the priority preset surface; the YAML ui.dashboard_sections fallback
+// applies only when this has not been called). Call it after New and before
+// the UI mounts. Seeding is seed-once: the preset shapes the layout only
+// while no layout document has been saved (fresh start or after DELETE);
+// once a document is saved it wins on every startup. An invalid preset
+// (duplicate ids, unknown or repeated blocks) is logged and skipped.
+func (r *Registry) PresetDashboardSections(sections ...DashboardSection) {
+	if len(sections) == 0 {
+		return
+	}
+	// Presets run before any panels exist, so they may only place blocks.
+	if err := validateDashboardSections(sections, nil); err != nil {
+		log.Printf("[golens] warning: ignoring invalid dashboard section preset: %v", err)
+		return
+	}
+	r.dashMu.Lock()
+	r.dashPreset = sections
+	r.dashMu.Unlock()
 }
 
 // Alerter returns the alert evaluator, or nil if alerts are disabled.

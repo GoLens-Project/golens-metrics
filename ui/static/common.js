@@ -27,7 +27,8 @@ document.addEventListener('DOMContentLoaded', function () {
 // --- shared fetch wrapper ------------------------------------------------------
 
 // fetchJSON fetches a URL and resolves the parsed JSON body, rejecting with an
-// Error carrying the server's message when the response is not ok.
+// Error carrying the server's message when the response is not ok. A 204 (no
+// content) resolves null instead of failing JSON parsing.
 function fetchJSON(url, options) {
   return fetch(url, options).then(function (r) {
     if (!r.ok) {
@@ -35,7 +36,7 @@ function fetchJSON(url, options) {
         throw new Error((body && body.error) || r.statusText || ('request failed: ' + r.status));
       });
     }
-    return r.json();
+    return r.status === 204 ? null : r.json();
   });
 }
 

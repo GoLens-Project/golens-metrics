@@ -276,6 +276,52 @@ Open `/metrics`. The dashboard is server-side rendered with HTMX polling (defaul
 
 The JSON schema is the stable contract for external consumers. Each metric object carries `name`, `type`, `chart`, and `value`, plus — depending on type — `count`, `sum`, `avg`, and `buckets` (histograms), `gauge_min`/`gauge_max` (gauges), `description`, `labels` (declared label names) with `label_values` as `[{name, value}]` pairs, and `updated_at` (unix nanoseconds). Optional fields are omitted when empty. Histogram buckets are `[{upper_bound, count, overflow}]`; the catch-all bucket above the last bound is the one with `overflow: true`.
 
+#### Dashboard layout, sections, and edit mode
+
+The dashboard's customization lives in one versioned JSON document, persisted atomically to `ui.dashboard_config` and served at `GET`/`PUT`/`DELETE` `/metrics/config`. `DELETE` removes the saved document (the reset state). The document fields:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `version` | int | Always `1`. |
+| `panels` | `[{id, metric, chart_type?, size?}]` | Pinned charts. `chart_type`: `line`, `bars`, `gauge`, `big-number`; `size`: `sm`, `md`, `lg` (grid span presets). Empty values take the per-kind default. |
+| `order` | `{all_metrics, hooks, endpoints}` | Card order *inside* the All Metrics, Hooks, and Endpoint Latency blocks. |
+| `http_card_view` | string | `breakdown` (default) or `totals` — the HTTP status card's column set. |
+| `sections` | `[{id, name?, items}]` | Horizontal bands and what they place, in render order. Omitted means the built-in default layout, so pre-sections documents render unchanged. |
+
+Each section's `items` reference either a well-known block id or a pinned panel id (`panels[].id`); blocks move as whole units between sections, while per-card rearrangement stays inside a block and pinning remains the escape hatch that turns an All Metrics card into a placeable panel. The well-known block ids are `runtime-health`, `histogram`, `hooks`, `all-metrics`, `endpoint-latency`, and `internals`. A section may be unnamed (an untitled band) and may have an empty `items` list (the default `my-charts` band starts empty; pinned charts land there). Every panel should be referenced by some section — the UI places new pins automatically, and on load it appends unreferenced panels to the `my-charts` band, or to the last section when the layout has none.
+
+The `PUT` validator enforces this contract: `version` must be `1`; section ids non-empty and unique; every item a non-empty string; each well-known block id used at most once across all sections; non-block items must reference an existing panel id, and each panel id may appear in at most one section; panel ids and metrics must each be unique within `panels`, and panel ids must not collide with reserved block ids; section `name` is free text, empty allowed.
+
+Editing is gated behind an explicit edit-mode toggle (the ✎ button in the toolbar). On: drag charts/blocks between and within sections, reorder, resize (`sm`/`md`/`lg`), pin/unpin, add/remove charts, rename sections inline (`section name (optional)`). Off: the view is frozen — no drag handlers, no move/action buttons, no edit affordances. Edit mode and per-section collapse (click anywhere on a section's header line) persist in the browser's localStorage only; they are never written to the document.
+
+**Section presets.** An integrator can preset the section layout from code — the priority surface — by calling, after `golens.New` and before the UI mounts:
+
+```go
+registry.PresetDashboardSections(
+    golens.DashboardSection{ID: "overview", Name: "Overview", Items: []string{
+        golens.BlockRuntimeHealth, golens.BlockAllMetrics,
+    }},
+    golens.DashboardSection{ID: "traffic", Name: "Traffic", Items: []string{
+        golens.BlockHistogram, golens.BlockEndpoints,
+    }},
+)
+```
+
+The YAML fallback applies only when no Go-API preset was registered (the Go call wins when both exist):
+
+```yaml
+ui:
+  dashboard_sections:
+    - id: overview
+      name: Overview
+      items: [runtime-health, all-metrics]
+    - id: my-charts
+      name: My Charts
+      items: []             # pinned charts land here
+```
+
+Presets **seed once**: they shape the layout only while no document has been saved (a fresh start, or after `DELETE`). Once a document is saved — by the dashboard's first edit or any `PUT` — the saved document wins on every startup and presets never re-apply over it. `GET /metrics/config` always returns the effective section list (the saved one, or the preset-seeded one while unsaved), so clients see exactly what rendering uses.
+
 ### Production export (OTLP)
 
 Point any OTLP/HTTP receiver (OTel Collector, Grafana Alloy, etc.) at GoLens. GoLens **pushes** batches on a configurable interval (default 10s) and on graceful shutdown:

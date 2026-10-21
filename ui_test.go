@@ -63,10 +63,12 @@ func TestMountUIRegistersRoutes(t *testing.T) {
 	// This test doesn't make HTTP requests, so we just check the basic UI structure
 }
 
-// Every reorderable surface (All Metrics, Hooks, My Charts, Endpoint Latency,
-// Runtime Health) must render keyboard/touch-reachable move buttons and move
-// through the one shared moveCard helper in dashboard.js — not five divergent
-// drag implementations. The cards' pin button is the other header affordance.
+// Every reorderable surface (All Metrics, Hooks, Endpoint Latency, Runtime
+// Health, section blocks, pinned panels) must render keyboard/touch-reachable
+// move buttons and move through the one shared moveCard helper in
+// dashboard.js — not six divergent drag implementations. The cards' pin
+// button is the other header affordance. Pinned-panel slots are client-
+// rendered (makeSlot in dashboard.js), so their buttons are asserted there.
 func TestDashboardSharedReorderPath(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.RuntimeMetrics.Enabled = true // renders the Runtime Health cards
@@ -95,15 +97,19 @@ func TestDashboardSharedReorderPath(t *testing.T) {
 	if !strings.Contains(body, "moveGridCard(this,-1)") || !strings.Contains(body, "moveGridCard(this,1)") {
 		t.Error("All Metrics/Hooks cards missing move buttons")
 	}
-	// My Charts pinned slots.
-	if !strings.Contains(body, `"move(idx,-1)"`) || !strings.Contains(body, `"move(idx,1)"`) {
-		t.Error("My Charts missing move buttons")
+	// Section blocks carry edit-mode move buttons hooked to the section path.
+	if !strings.Contains(body, "moveSectionItem(this,-1)") || !strings.Contains(body, "moveSectionItem(this,1)") {
+		t.Error("section blocks missing move buttons")
 	}
 	// Runtime Health cards (Alpine component scope).
 	if !strings.Contains(body, `"move($event,-1)"`) || !strings.Contains(body, `"move($event,1)"`) {
 		t.Error("Runtime Health cards missing move buttons")
 	}
 	// Endpoint Latency cards render through the same markup family.
+	if !strings.Contains(body, `"move(idx,-1)"`) || !strings.Contains(body, `"move(idx,1)"`) {
+		t.Error("Endpoint Latency missing move buttons")
+	}
+	// Move button group class on every server-rendered surface.
 	if !strings.Contains(body, "move-btns") {
 		t.Error("move button group class missing")
 	}
@@ -122,9 +128,15 @@ func TestDashboardSharedReorderPath(t *testing.T) {
 	if n := strings.Count(script, "function moveCard("); n != 1 {
 		t.Errorf("dashboard.js defines moveCard %d times, want exactly one shared implementation", n)
 	}
-	// One definition plus the four surface entry points calling it.
+	// One definition plus the surface entry points calling it (All
+	// Metrics/Hooks grid, section items, endpoints, runtime).
 	if n := strings.Count(script, "moveCard("); n < 5 {
-		t.Errorf("moveCard referenced %d times, want at least 5 (definition + all-metrics/hooks, my-charts, endpoints, runtime)", n)
+		t.Errorf("moveCard referenced %d times, want at least 5", n)
+	}
+	// Pinned-panel slots (My Charts) are client-rendered; their move buttons
+	// share the section-item path.
+	if !strings.Contains(script, "moveSectionItem(this,-1)") || !strings.Contains(script, "moveSectionItem(this,1)") {
+		t.Error("pinned-panel slots missing move buttons in dashboard.js")
 	}
 }
 
@@ -1168,5 +1180,220 @@ func TestCardinalityEndpointNoData(t *testing.T) {
 		if len(snaps) != 0 {
 			t.Errorf("expected empty, got %d entries", len(snaps))
 		}
+	}
+}
+
+// --- dashboard sections ---------------------------------------------------------
+
+// renderDashboard starts the registry, mounts the UI, and returns the
+// rendered /metrics page.
+func renderDashboard(t *testing.T, r *Registry) string {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	r.Start(ctx)
+	t.Cleanup(func() { cancel(); r.Close() })
+	rec := httptest.NewRecorder()
+	newServer(r).ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	if rec.Code != 200 {
+		t.Fatalf("dashboard status = %d, body %s", rec.Code, rec.Body.String())
+	}
+	return rec.Body.String()
+}
+
+// staticAsset fetches an embedded dashboard asset from /metrics/static.
+func staticAsset(t *testing.T, r *Registry, name string) string {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	newServer(r).ServeHTTP(rec, httptest.NewRequest("GET", "/metrics/static/"+name, nil))
+	if rec.Code != 200 {
+		t.Fatalf("%s status = %d", name, rec.Code)
+	}
+	return rec.Body.String()
+}
+
+// With no saved document and no preset, the dashboard renders the built-in
+// default layout: one band per fixed block in the historical order, with the
+// empty my-charts band for pinned panels. Bands whose content is unavailable
+// (runtime metrics off, no hook metrics, no panels) start hidden.
+func TestDashboardDefaultSectionsRender(t *testing.T) {
+	r := newConfigRegistry(t, DefaultConfig())
+	body := renderDashboard(t, r)
+
+	ids := []string{"runtime-health", "histogram", "hooks", "my-charts", "all-metrics", "endpoint-latency", "internals"}
+	last := -1
+	for _, id := range ids {
+		marker := `data-section="` + id + `"`
+		i := strings.Index(body, marker)
+		if i < 0 {
+			t.Errorf("default band %s missing", id)
+			continue
+		}
+		if i < last {
+			t.Errorf("band %s out of default order", id)
+		}
+		last = i
+	}
+	// Blocks render inside their band: the histogram block sits after the
+	// histogram band opens and before the next band (my-charts) starts.
+	hist := strings.Index(body, `data-section="histogram"`)
+	if hist < 0 || hist > strings.Index(body, `data-block="histogram"`) ||
+		strings.Index(body, `data-block="histogram"`) > strings.Index(body, `data-section="my-charts"`) {
+		t.Error("histogram block not nested inside its band")
+	}
+	// No runtime or hook metrics by default: those blocks are dropped and
+	// their panel-less bands start hidden, as does the empty my-charts band.
+	for _, band := range []struct{ id, name string }{
+		{"runtime-health", "Runtime Health"},
+		{"hooks", "Hooks"},
+		{"my-charts", "My Charts"},
+	} {
+		if !strings.Contains(body, `data-section="`+band.id+`" data-name="`+band.name+`" hidden`) {
+			t.Errorf("band %s should render hidden with no content", band.id)
+		}
+	}
+	// Bands with renderable content are not hidden.
+	for _, band := range []struct{ id, name string }{
+		{"histogram", "Histogram Time-Series"},
+		{"all-metrics", "All Metrics"},
+		{"endpoint-latency", "Endpoint Latency"},
+		{"internals", "Internals"},
+	} {
+		if strings.Contains(body, `data-name="`+band.name+`" hidden`) {
+			t.Errorf("band %s renders content but is hidden", band.id)
+		}
+	}
+	// The client bootstrap carries the same effective list, so the page and
+	// the layout API can never diverge.
+	if !strings.Contains(body, `[{"id":"runtime-health","name":"Runtime Health","items":["runtime-health"]},{"id":"histogram","name":"Histogram Time-Series","items":["histogram"]}`) {
+		t.Error("client bootstrap missing the default section list")
+	}
+}
+
+// A Go preset replaces the whole section list: exactly the preset bands, in
+// order, with their blocks nested inside, server-rendered and bootstrapped to
+// the client.
+func TestDashboardPresetSectionsRender(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.RuntimeMetrics.Enabled = true // the runtime block renders content
+	r := newConfigRegistry(t, cfg)
+	r.PresetDashboardSections(
+		DashboardSection{ID: "ops", Name: "Ops", Items: []string{BlockInternals, BlockRuntimeHealth}},
+		DashboardSection{ID: "tail", Items: []string{BlockAllMetrics}},
+	)
+	body := renderDashboard(t, r)
+
+	ops := strings.Index(body, `data-section="ops"`)
+	tail := strings.Index(body, `data-section="tail"`)
+	internals := strings.Index(body, `data-block="internals"`)
+	runtime := strings.Index(body, `data-block="runtime-health"`)
+	allMetrics := strings.Index(body, `data-block="all-metrics"`)
+	if ops < 0 || tail < 0 || internals < ops || runtime < internals || tail < runtime || allMetrics < tail {
+		t.Errorf("preset bands/blocks out of order: ops=%d internals=%d runtime=%d tail=%d all-metrics=%d",
+			ops, internals, runtime, tail, allMetrics)
+	}
+	if !strings.Contains(body, `data-name="Ops"`) || !strings.Contains(body, `class="sec-name">Ops</span>`) {
+		t.Error("named preset band missing its name")
+	}
+	if !strings.Contains(body, `data-section="tail" data-name=""`) {
+		t.Error("unnamed preset band missing the empty name slot")
+	}
+	// The preset replaces the default list wholesale — no default-only band.
+	if strings.Contains(body, `data-section="histogram"`) {
+		t.Error("default band survived a full-list preset")
+	}
+	if !strings.Contains(body, `[{"id":"ops","name":"Ops","items":["internals","runtime-health"]},{"id":"tail","items":["all-metrics"]}]`) {
+		t.Error("client bootstrap missing the preset section list")
+	}
+}
+
+// View mode is frozen: every edit affordance carries .edit-only and the CSS
+// hides it unless body.edit-mode is on, and every drag/move entry point
+// refuses to run outside edit mode. The edit flag itself persists across
+// reloads in localStorage, and the toggle button announces its state.
+func TestDashboardEditModeGatesEditAffordances(t *testing.T) {
+	r := newConfigRegistry(t, DefaultConfig())
+	body := renderDashboard(t, r)
+
+	for _, affordance := range []string{
+		`onclick="document.body.dataset.add='1'" class="btn edit-only"`, // + Add Chart
+		`onclick="resetLayout()" class="btn edit-only"`,                 // Reset layout
+		`class="sec-rename edit-only"`,                                  // section rename input
+		`class="block-actions edit-only"`,                               // section block moves
+		`class="move-btns edit-only"`,                                   // card move/pin buttons
+	} {
+		if !strings.Contains(body, affordance) {
+			t.Errorf("edit affordance not gated with edit-only: %s", affordance)
+		}
+	}
+	if !strings.Contains(body, `id="edit-toggle"`) || !strings.Contains(body, `aria-pressed="false"`) {
+		t.Error("edit toggle missing or not announcing view mode")
+	}
+
+	js := staticAsset(t, r, "dashboard.js")
+	css := staticAsset(t, r, "styles.css")
+
+	if !strings.Contains(css, "body:not(.edit-mode) .edit-only") {
+		t.Error("styles.css missing the edit-only visibility gate")
+	}
+	// Drag/move handlers refuse to run outside edit mode: All Metrics, Hooks,
+	// Endpoints (drag start + move buttons), Runtime Health, and section
+	// blocks/panels.
+	if n := strings.Count(js, "if (!editMode()) return;"); n < 6 {
+		t.Errorf("drag/move edit-mode gating found %d times, want at least 6", n)
+	}
+	// The flag survives reloads (D5) and drives the body class.
+	if !strings.Contains(js, `localStorage.getItem('golens.editmode') === '1'`) ||
+		!strings.Contains(js, `localStorage.setItem('golens.editmode'`) {
+		t.Error("edit mode not persisted in localStorage")
+	}
+	if !strings.Contains(js, `classList.toggle('edit-mode', !!on)`) {
+		t.Error("edit mode does not drive the body.edit-mode class")
+	}
+}
+
+// The section header (rule + name + chevron) is one collapse click target;
+// the rename input and action buttons opt out. Collapse state lives in
+// localStorage per section id. Renaming goes through the inline input — an
+// empty value keeps the band untitled — and persists the section list.
+func TestDashboardSectionCollapseAndRenameWiring(t *testing.T) {
+	r := newConfigRegistry(t, DefaultConfig())
+	body := renderDashboard(t, r)
+
+	if !strings.Contains(body, `class="sec-head" role="button" tabindex="0" aria-label="Toggle section"`) {
+		t.Error("section header not rendered as one focusable click target")
+	}
+	if !strings.Contains(body, `placeholder="section name (optional)"`) ||
+		!strings.Contains(body, `onchange="renameSection(this)"`) {
+		t.Error("section rename input missing")
+	}
+
+	js := staticAsset(t, r, "dashboard.js")
+	css := staticAsset(t, r, "styles.css")
+
+	// Whole-header click target; interactive children opt out.
+	if !strings.Contains(js, `e.target.closest('.sec-head')`) ||
+		!strings.Contains(js, `e.target.closest('.sec-rename-input, .block-actions, .pin-actions')`) {
+		t.Error("header click delegation missing or missing the interactive opt-out")
+	}
+	// Collapse is keyboard-reachable and persists per section id.
+	if !strings.Contains(js, `e.key !== 'Enter' && e.key !== ' '`) {
+		t.Error("collapse not keyboard-reachable (Enter/Space)")
+	}
+	if !strings.Contains(js, `'golens.collapsed'`) {
+		t.Error("collapse state not persisted in localStorage")
+	}
+	// Rename trims the input and persists the whole section list (an empty
+	// value renames to the untitled band).
+	if !strings.Contains(js, "function renameSection(input)") ||
+		!strings.Contains(js, "input.value.trim()") ||
+		!strings.Contains(js, "function persistSectionsFromDOM()") {
+		t.Error("rename wiring missing trim/persist")
+	}
+	// Collapsed state flips the chevron; hidden bands/bodies beat display rules.
+	if !strings.Contains(css, ".sec-head.sec-collapsed .sec-chev") {
+		t.Error("styles.css missing the collapsed chevron state")
+	}
+	if !strings.Contains(css, "[hidden] { display: none !important; }") {
+		t.Error("styles.css does not enforce the hidden attribute")
 	}
 }
