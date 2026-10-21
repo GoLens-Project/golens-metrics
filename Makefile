@@ -36,7 +36,7 @@ vet:
 ## fmt: format all Go sources
 fmt:
 	gofmt -w .
-	goimports -w -local golens . 2>/dev/null || true
+	goimports -w -local github.com/GoLens-Project/golens-metrics . 2>/dev/null || true
 
 ## lint: run golangci-lint (if installed)
 lint:

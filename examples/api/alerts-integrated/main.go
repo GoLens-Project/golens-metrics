@@ -20,7 +20,7 @@ import (
 	"syscall"
 	"time"
 
-	golens "golens"
+	golens "github.com/GoLens-Project/golens-metrics"
 )
 
 func main() {
