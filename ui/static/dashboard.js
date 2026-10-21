@@ -474,8 +474,16 @@ function itemKey(el) {
   return el.hasAttribute('data-block') ? el.getAttribute('data-block') : el.getAttribute('data-pin-id');
 }
 
+// sectionItemsIn lists a section body child's config item ids (block ids or
+// panel ids). The body is the section's own — the first .sec-body in document
+// order, since nested bands live inside it — so items of nested child bands
+// stay theirs, never the ancestors'.
 function sectionItemsIn(sec) {
-  return Array.from(sec.querySelectorAll('.sec-body > [data-block], .sec-body > .pin-slot')).map(itemKey);
+  var body = sec.querySelector('.sec-body');
+  if (!body) return [];
+  return Array.from(body.children)
+    .filter(function (el) { return el.matches('[data-block], .pin-slot'); })
+    .map(itemKey);
 }
 
 function sectionItems() {
@@ -509,11 +517,13 @@ function renderPinned() {
       }
       if (blocks[id]) nodes.push(blocks[id]);
     });
-    // Rebuild the body order only when it drifted: appending nodes destroys
-    // hover tooltips and text selections even when the order is unchanged.
-    var cur = Array.from(body.children);
+    // Nested child bands share the body grid and render after the band's own
+    // items. Compare and rebuild against the item nodes only, inserting them
+    // ahead of the first child band so a rebuild never reorders the bands.
+    var nested = Array.from(body.children).filter(function (el) { return el.hasAttribute('data-section'); });
+    var cur = Array.from(body.children).filter(function (el) { return el.matches('[data-block], .pin-slot'); });
     var same = cur.length === nodes.length && cur.every(function (el, i) { return el === nodes[i]; });
-    if (!same) nodes.forEach(function (n) { body.appendChild(n); });
+    if (!same) nodes.forEach(function (n) { body.insertBefore(n, nested[0] || null); });
   });
   Object.keys(slots).forEach(function (id) {
     if (!wantSlots[id] && slots[id].parentNode) slots[id].remove();
@@ -563,9 +573,11 @@ function toggleCollapse(sec) {
   refreshSections();
 }
 
-// refreshSections applies the two client-owned visibility rules: an empty
-// band stays hidden in view mode (it is an edit-mode drop target), and a
-// collapsed band hides its body behind the header.
+// refreshSections applies the three client-owned visibility/affordance rules:
+// an empty band stays hidden in view mode (it is an edit-mode drop target),
+// a collapsed band hides its body behind the header, and bands carry the
+// draggable attribute in edit mode only (the re-parent drag handle; in view
+// mode the attribute stays off so normal text selection works).
 function refreshSections() {
   document.querySelectorAll('[data-section]').forEach(function (sec) {
     var body = sec.querySelector('.sec-body');
@@ -575,26 +587,30 @@ function refreshSections() {
     body.hidden = !!secCollapsed[sec.getAttribute('data-section')];
     var head = sec.querySelector('.sec-head');
     if (head) head.classList.toggle('sec-collapsed', body.hidden);
+    sec.setAttribute('draggable', editMode() ? 'true' : 'false');
   });
 }
 
 // --- section persistence ---------------------------------------------------------
 
 // normSections renders a section list in one comparable shape: server
-// documents omit empty name/items, DOM-built bands always carry them.
+// documents omit empty name/items/parent, DOM-built bands always carry them.
 function normSections(list) {
   return JSON.stringify((list || []).map(function (s) {
-    return { id: s.id, name: s.name || '', items: s.items || [] };
+    return { id: s.id, name: s.name || '', items: s.items || [], parent: s.parent || '' };
   }));
 }
 
 // persistSectionsFromDOM serializes the section bands back into
-// dashCfg.sections (the DOM is authoritative for the items it shows) and
-// persists. No-op when nothing moved. Items the server could not render —
-// an unavailable block has no DOM node, and a wholly unavailable band has no
-// DOM section — are carried forward from dashCfg.sections, so an edit-mode
-// persist can never delete them from the saved layout; a carried block
-// re-renders (at the end of its band) once its content becomes available.
+// dashCfg.sections (the DOM is authoritative for the items and the nesting it
+// shows) and persists. No-op when nothing moved. The walk is depth-first in
+// document order: parent = nearest band ancestor, child bands in DOM order.
+// Items the server could not render — an unavailable block has no DOM node,
+// and a wholly unavailable band has no DOM section — are carried forward from
+// dashCfg.sections, so an edit-mode persist can never delete them from the
+// saved layout; a carried block re-renders (at the end of its band) once its
+// content becomes available, and a wholly dropped band is re-appended with
+// its saved subtree intact.
 function persistSectionsFromDOM() {
   var prevById = {};
   (dashCfg.sections || []).forEach(function (s) { prevById[s.id] = s; });
@@ -604,7 +620,8 @@ function persistSectionsFromDOM() {
     domIds[sec.getAttribute('data-section')] = true;
     sectionItemsIn(sec).forEach(function (id) { inDom[id] = true; });
   });
-  var secs = domSecs.map(function (sec) {
+  var secs = [];
+  function emit(sec, parentID) {
     var inp = sec.querySelector('.sec-rename-input');
     var name = inp ? inp.value.trim() : (sec.getAttribute('data-name') || '');
     var items = sectionItemsIn(sec);
@@ -612,11 +629,21 @@ function persistSectionsFromDOM() {
     if (prev && prev.items) {
       prev.items.forEach(function (id) { if (!inDom[id]) items.push(id); });
     }
-    return { id: sec.getAttribute('data-section'), name: name, items: items };
+    var out = { id: sec.getAttribute('data-section'), name: name, items: items };
+    if (parentID) out.parent = parentID;
+    secs.push(out);
+    var body = sec.querySelector('.sec-body');
+    if (!body) return;
+    Array.from(body.children).forEach(function (child) {
+      if (child.hasAttribute('data-section')) emit(child, out.id);
+    });
+  }
+  Array.from(document.querySelectorAll('main > [data-section]')).forEach(function (sec) {
+    emit(sec, null);
   });
-  // Bands the server dropped entirely keep their saved items untouched.
+  // Bands the server dropped entirely keep their saved subtree untouched.
   (dashCfg.sections || []).forEach(function (s) {
-    if (!domIds[s.id]) secs.push({ id: s.id, name: s.name || '', items: (s.items || []).slice() });
+    if (!domIds[s.id]) secs.push({ id: s.id, name: s.name || '', items: (s.items || []).slice(), parent: s.parent || '' });
   });
   if (normSections(secs) === normSections(dashCfg.sections)) return;
   dashCfg.sections = secs;
@@ -662,10 +689,12 @@ function unpinSlot(btn) {
 
 // --- section drag & drop (edit mode only) -----------------------------------------
 
-// Cross-band and within-band moves of blocks and pinned panels: one live-move
-// delegated handler on main. Drags that begin on a nested draggable (metric
-// cards, runtime cards) belong to their own grids and are ignored here.
+// Cross-band and within-band moves of blocks and pinned panels, plus band
+// re-parenting: one live-move delegated handler on main. Drags that begin on
+// a nested draggable (metric cards, runtime cards) belong to their own grids
+// and are ignored here.
 var dragSectionItem = null;
+var dragSection = null;
 function initSectionsDnD() {
   var main = document.querySelector('main');
   if (!main) return;
@@ -673,16 +702,46 @@ function initSectionsDnD() {
     if (!editMode()) return;
     if (e.target.closest('[data-metric]')) return;
     var el = e.target.closest('.sec-body > [data-block], .sec-body > .pin-slot');
-    if (!el) return;
-    if (e.target.closest('[draggable="true"]') !== el) return;
-    dragSectionItem = el;
-    el.classList.add('dragging');
+    if (el) {
+      if (e.target.closest('[draggable="true"]') !== el) return;
+      dragSectionItem = el;
+      el.classList.add('dragging');
+      e.dataTransfer.effectAllowed = 'move';
+      return;
+    }
+    // Band re-parenting: grab the header. Inputs/buttons keep their own
+    // interaction (rename, move buttons).
+    if (e.target.closest('input, select, button')) return;
+    var sec = e.target.closest('[data-section]');
+    if (!sec || sec.getAttribute('draggable') !== 'true') return;
+    dragSection = sec;
+    sec.classList.add('dragging');
     e.dataTransfer.effectAllowed = 'move';
   });
   main.addEventListener('dragover', function (e) {
-    if (!dragSectionItem) return;
+    if (!dragSectionItem && !dragSection) return;
+    if (dragSection && dragSection.contains(e.target)) return; // no drop on the dragged band's own chrome
     var body = e.target.closest('.sec-body');
-    if (!body) return;
+    if (!body) {
+      // Outdent zone: main's gaps and top-level band chrome sit outside
+      // every .sec-body, so a band dragged there returns to top level —
+      // the inverse of nesting, and the only way out of a nest. Item drags
+      // have no top-level form and stay put.
+      if (!dragSection) return;
+      e.preventDefault();
+      main.appendChild(dragSection);
+      return;
+    }
+    if (dragSection) {
+      // Structural guard: a band cannot drop into itself or one of its own
+      // descendants. No preventDefault = no drop indication.
+      var host = body.closest('[data-section]');
+      if (host && dragSection.contains(host)) return;
+      e.preventDefault();
+      // Bands render after a band's own items: a drop lands at the end.
+      body.appendChild(dragSection);
+      return;
+    }
     e.preventDefault();
     var next = null;
     var kids = Array.from(body.children);
@@ -695,12 +754,17 @@ function initSectionsDnD() {
     if (next) body.insertBefore(dragSectionItem, next); else body.appendChild(dragSectionItem);
   });
   main.addEventListener('drop', function (e) {
-    if (dragSectionItem) e.preventDefault();
+    if (dragSectionItem || dragSection) e.preventDefault();
   });
   main.addEventListener('dragend', function () {
-    if (!dragSectionItem) return;
-    dragSectionItem.classList.remove('dragging');
-    dragSectionItem = null;
+    if (dragSection) {
+      dragSection.classList.remove('dragging');
+      dragSection = null;
+    }
+    if (dragSectionItem) {
+      dragSectionItem.classList.remove('dragging');
+      dragSectionItem = null;
+    }
     persistSectionsFromDOM();
   });
 }

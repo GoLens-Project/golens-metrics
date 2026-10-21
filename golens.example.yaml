@@ -40,6 +40,9 @@ ui:
   # has been saved. Each section is a horizontal band; "items" reference
   # well-known blocks (runtime-health, histogram, hooks, all-metrics,
   # endpoint-latency, internals) or pinned panel ids, in render order.
+  # Optional "parent" nests a band under the section with that id, at any
+  # depth; parents must exist, must not be the section itself, and cycles
+  # are rejected (an invalid preset is skipped wholesale).
   # dashboard_sections:
   #   - id: overview
   #     name: Overview
@@ -52,6 +55,10 @@ ui:
   #     items: []             # pinned charts land here
   #   - id: everything
   #     items: [all-metrics, hooks, internals]
+  #   - id: details
+  #     name: Details
+  #     parent: traffic       # nested inside the Traffic band
+  #     items: [internals]
 
 # --- Ingestion & memory ---
 # The hot path enqueues onto a bounded channel and never blocks a request. When

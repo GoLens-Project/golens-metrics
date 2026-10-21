@@ -636,6 +636,16 @@ html.light .cell-danger { color: #b45309; }
 .sec-block { position: relative; min-width: 0; }
 .sec-body > .sec-block { grid-column: 1 / -1; }
 
+/* Nested bands: a section inside a section indents by cascade alone — no
+   per-depth classes or constants — so nesting at any depth renders without
+   depth-aware styling, and spans its parent's item grid. */
+.dash-section .dash-section {
+  grid-column: 1 / -1;
+  margin-top: 0.5rem;
+  border-left: 2px solid var(--border);
+  padding-left: 1rem;
+}
+
 /* --- edit mode ------------------------------------------------------------------ */
 
 /* Every edit affordance carries .edit-only and exists only while the
@@ -647,6 +657,9 @@ body:not(.edit-mode) .card-grab:active { cursor: default; }
 /* Block drag strip + floating move buttons while editing. */
 body.edit-mode .sec-body > .sec-block { cursor: grab; padding-top: 1.25rem; }
 body.edit-mode .sec-body > .sec-block:active { cursor: grabbing; }
+/* Band headers are the re-parent drag affordance while editing. */
+body.edit-mode .dash-section > .sec-head { cursor: grab; }
+body.edit-mode .dash-section > .sec-head:active { cursor: grabbing; }
 .block-actions {
   position: absolute;
   top: 0.25rem;

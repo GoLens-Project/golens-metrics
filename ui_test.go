@@ -1397,3 +1397,120 @@ func TestDashboardSectionCollapseAndRenameWiring(t *testing.T) {
 		t.Error("styles.css does not enforce the hidden attribute")
 	}
 }
+
+// sectionTree links the flat view list into the render tree: each band nests
+// under the band its Parent names in list order, a band whose parent is
+// nonetheless missing renders as a root (the server render and GET can never
+// diverge on the layout), and settleHidden keeps an empty ancestor visible
+// when a nested band below it carries content while an empty leaf stays
+// hidden.
+func TestSectionTreeLinksAndSettlesHidden(t *testing.T) {
+	views := buildSectionViews([]DashboardSection{
+		{ID: "orphan", Parent: "missing"}, // dangling parent: defensive root fallback
+		{ID: "holder"},                    // no own content, content nested below
+		{ID: "nested", Parent: "holder", Items: []string{BlockAllMetrics}},
+		{ID: "tip", Parent: "nested"}, // empty leaf under a content band
+	}, false, nil)
+	roots := sectionTree(views, nil)
+
+	if len(roots) != 2 || roots[0].ID != "orphan" || roots[1].ID != "holder" {
+		t.Fatalf("roots = [%s %s], want [orphan holder]", roots[0].ID, roots[1].ID)
+	}
+	if len(roots[1].Children) != 1 || roots[1].Children[0].ID != "nested" ||
+		len(roots[1].Children[0].Children) != 1 || roots[1].Children[0].Children[0].ID != "tip" {
+		t.Fatal("nested not linked under holder, or tip not linked under nested")
+	}
+	for _, n := range []*secRender{roots[0], roots[1].Children[0].Children[0]} {
+		if !n.Hidden {
+			t.Errorf("band %s has no content anywhere and must render hidden", n.ID)
+		}
+	}
+	for _, n := range []*secRender{roots[1], roots[1].Children[0]} {
+		if n.Hidden {
+			t.Errorf("band %s anchors nested content and must render visible", n.ID)
+		}
+	}
+}
+
+// A nested layout renders the band tree server-side: a parent band opens
+// before its children and its own items render before them, empty ancestors
+// of a content band stay visible while empty leaves and empty top-level bands
+// hide, and the client bootstrap carries the same nesting so the page and the
+// layout API can never diverge.
+func TestDashboardNestedSectionsRender(t *testing.T) {
+	r := newConfigRegistry(t, DefaultConfig())
+	doc := `{"version":1,"order":{},"sections":[
+	        {"id":"holder"},
+	        {"id":"nested","parent":"holder","items":["all-metrics"]},
+	        {"id":"tip","parent":"nested"},
+	        {"id":"spare"}]}`
+	if rec := configRequest(r.dashboardConfigHandler(), http.MethodPut, doc); rec.Code != 200 {
+		t.Fatalf("PUT status = %d, body %s", rec.Code, rec.Body.String())
+	}
+	body := renderDashboard(t, r)
+
+	holder := strings.Index(body, `data-section="holder"`)
+	nested := strings.Index(body, `data-section="nested"`)
+	tip := strings.Index(body, `data-section="tip"`)
+	spare := strings.Index(body, `data-section="spare"`)
+	allMetrics := strings.Index(body, `data-block="all-metrics"`)
+	if holder < 0 || nested < 0 || tip < 0 || spare < 0 || allMetrics < 0 {
+		t.Fatalf("nested bands missing from render: holder=%d nested=%d tip=%d spare=%d block=%d",
+			holder, nested, tip, spare, allMetrics)
+	}
+	// The child band follows its parent, and a band's own items precede the
+	// nested bands inside it (nested carries both the all-metrics item and
+	// the child tip, so this pins items-before-children and the depth-2
+	// recursion in one ordering).
+	if !(holder < nested && nested < allMetrics && allMetrics < tip) {
+		t.Errorf("band tree out of order: holder=%d nested=%d all-metrics=%d tip=%d",
+			holder, nested, allMetrics, tip)
+	}
+	// settleHidden: a band above nested content stays visible; empty leaves
+	// and empty top-level bands hide.
+	if strings.Contains(body, `data-section="holder" data-name="" hidden`) ||
+		strings.Contains(body, `data-section="nested" data-name="" hidden`) {
+		t.Error("band anchoring nested content renders hidden")
+	}
+	for _, hidden := range []string{"tip", "spare"} {
+		if !strings.Contains(body, `data-section="`+hidden+`" data-name="" hidden`) {
+			t.Errorf("band %s has no content anywhere and should render hidden", hidden)
+		}
+	}
+	if !strings.Contains(body, `{"id":"nested","items":["all-metrics"],"parent":"holder"}`) ||
+		!strings.Contains(body, `{"id":"tip","parent":"nested"}`) {
+		t.Error("client bootstrap missing the nested section list")
+	}
+}
+
+// The client honors nesting: the persist walk is depth-first from the
+// top-level bands (parent = nearest band ancestor), the drift check and the
+// carried-forward bands keep their parent, pinned rebuilds insert ahead of
+// nested bands instead of reordering them, band re-parenting drags are gated
+// on edit mode and refuse to drop a band into its own subtree, the outdent
+// zone returns a band to top level, and nested bands indent by cascade alone.
+func TestDashboardNestedSectionsClientWiring(t *testing.T) {
+	r := newConfigRegistry(t, DefaultConfig())
+	js := staticAsset(t, r, "dashboard.js")
+	css := staticAsset(t, r, "styles.css")
+
+	for _, frag := range []string{
+		"querySelectorAll('main > [data-section]')",                    // persist walks top-level roots
+		"if (parentID) out.parent = parentID;",                         // emit records the band ancestor
+		"parent: s.parent || ''",                                       // drift check + carried bands keep parent
+		"body.insertBefore(n, nested[0] || null)",                      // pinned rebuild never reorders nested bands
+		"sec.setAttribute('draggable', editMode() ? 'true' : 'false')", // drag handle is edit-mode only
+		"if (host && dragSection.contains(host)) return;",              // no drop into the band's own subtree
+		"main.appendChild(dragSection)",                                // outdent zone: drop outside any body = top level
+	} {
+		if !strings.Contains(js, frag) {
+			t.Errorf("dashboard.js missing nested-section wiring: %s", frag)
+		}
+	}
+	if !strings.Contains(css, ".dash-section .dash-section {") {
+		t.Error("styles.css missing the nested band cascade rule")
+	}
+	if !strings.Contains(css, "body.edit-mode .dash-section > .sec-head") {
+		t.Error("styles.css missing the band drag affordance")
+	}
+}
