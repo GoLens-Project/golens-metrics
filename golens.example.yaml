@@ -35,6 +35,23 @@ ui:
   # persisted to via GET/PUT/DELETE /metrics/config. Empty = memory only, and
   # browsers fall back to localStorage.
   # dashboard_config: /var/lib/myapp/golens-dashboard.json
+  # Section layout preset (YAML fallback; a PresetDashboardSections Go call
+  # wins when both exist). Seed-once: applied only while no layout document
+  # has been saved. Each section is a horizontal band; "items" reference
+  # well-known blocks (runtime-health, histogram, hooks, all-metrics,
+  # endpoint-latency, internals) or pinned panel ids, in render order.
+  # dashboard_sections:
+  #   - id: overview
+  #     name: Overview
+  #     items: [runtime-health]
+  #   - id: traffic
+  #     name: Traffic
+  #     items: [histogram, endpoint-latency]
+  #   - id: my-charts
+  #     name: My Charts
+  #     items: []             # pinned charts land here
+  #   - id: everything
+  #     items: [all-metrics, hooks, internals]
 
 # --- Ingestion & memory ---
 # The hot path enqueues onto a bounded channel and never blocks a request. When

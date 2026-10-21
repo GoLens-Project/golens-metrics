@@ -3,6 +3,7 @@ package golens
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -86,5 +87,37 @@ func TestLoadConfigInvalidYAML(t *testing.T) {
 	_, err := LoadConfig(path)
 	if err == nil {
 		t.Fatal("expected parse error, got nil")
+	}
+}
+
+// The YAML fallback surface parses ui.dashboard_sections into strongly-typed
+// sections (ids, optional names, item lists). No preset configured leaves the
+// field nil, so seeding falls to the Go API or the built-in default.
+func TestLoadConfigDashboardSections(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "golens.yaml")
+	content := []byte("ui:\n" +
+		"  dashboard_sections:\n" +
+		"    - id: overview\n" +
+		"      name: Overview\n" +
+		"      items: [runtime-health, endpoint-latency]\n" +
+		"    - id: tail\n" +
+		"      items: [internals]\n")
+	if err := os.WriteFile(path, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	want := []DashboardSection{
+		{ID: "overview", Name: "Overview", Items: []string{"runtime-health", "endpoint-latency"}},
+		{ID: "tail", Items: []string{"internals"}},
+	}
+	if !reflect.DeepEqual(c.UI.DashboardSections, want) {
+		t.Errorf("dashboard_sections = %+v, want %+v", c.UI.DashboardSections, want)
+	}
+	if DefaultConfig().UI.DashboardSections != nil {
+		t.Error("default config must not preset dashboard sections")
 	}
 }

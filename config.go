@@ -75,6 +75,11 @@ type UIConfig struct {
 	// document lives in registry memory only (and clients fall back to
 	// localStorage).
 	DashboardConfig string `yaml:"dashboard_config"`
+	// DashboardSections presets the dashboard's section layout (the YAML
+	// fallback surface; a PresetDashboardSections Go call wins when both
+	// exist). Seed-once: applied only while no layout document has been
+	// saved. Items reference well-known blocks or panel ids.
+	DashboardSections []DashboardSection `yaml:"dashboard_sections"`
 }
 
 // LabelsConfig controls label value sanitization and cardinality management.

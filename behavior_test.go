@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -101,5 +102,41 @@ func TestCloseWithoutStart(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("Close without Start hung")
+	}
+}
+
+// Seed-once across restarts: the YAML preset seeds the layout only while no
+// document has been saved. A saved document wins on the next startup, and
+// after DELETE removes it the preset seeds again on the startup after that.
+func TestDashboardSectionsSeedOnceAcrossRestarts(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dash.json")
+	cfg := DefaultConfig()
+	cfg.UI.DashboardConfig = path
+	cfg.UI.DashboardSections = []DashboardSection{{ID: "from-yaml", Items: []string{BlockAllMetrics}}}
+
+	rA := newConfigRegistry(t, cfg)
+	if ids := sectionIDs(getDashboardConfig(t, rA)); !sameStrings(ids, []string{"from-yaml"}) {
+		t.Fatalf("yaml preset did not seed the unsaved layout: %v", ids)
+	}
+	rec := configRequest(rA.dashboardConfigHandler(), http.MethodPut,
+		`{"version":1,"order":{},"sections":[{"id":"saved","items":["internals"]}]}`)
+	if rec.Code != 200 {
+		t.Fatalf("PUT status = %d, body %s", rec.Code, rec.Body.String())
+	}
+	rA.Close()
+
+	rB := newConfigRegistry(t, cfg)
+	if ids := sectionIDs(getDashboardConfig(t, rB)); !sameStrings(ids, []string{"saved"}) {
+		t.Errorf("saved document lost to the preset across restart: %v", ids)
+	}
+	if rec := configRequest(rB.dashboardConfigHandler(), http.MethodDelete, ""); rec.Code != http.StatusNoContent {
+		t.Fatalf("DELETE status = %d, want 204", rec.Code)
+	}
+	rB.Close()
+
+	rC := newConfigRegistry(t, cfg)
+	defer rC.Close()
+	if ids := sectionIDs(getDashboardConfig(t, rC)); !sameStrings(ids, []string{"from-yaml"}) {
+		t.Errorf("preset did not re-seed after the saved document was deleted: %v", ids)
 	}
 }

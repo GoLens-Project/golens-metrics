@@ -580,23 +580,99 @@ html.light .cell-danger { color: #b45309; }
 .stat-sub { font-family: var(--font-mono); font-size: 0.625rem; color: var(--text-ghost); margin-top: 0.25rem; }
 .stat-sub span { color: var(--text-body); }
 
-/* --- collapsible internals section ------------------------------------------- */
+/* --- dashboard sections -------------------------------------------------------
+ *
+ * Every band of the dashboard is a .dash-section rendered from the layout
+ * document's section list. The header (rule + name + chevron) is one collapse
+ * click target; collapsed state and edit mode live client-side only.
+ */
 
-.disclose {
+/* The UA [hidden] style loses to any explicit display rule; bands and their
+   bodies hide via the hidden attribute, so enforce it globally. */
+[hidden] { display: none !important; }
+
+.sec-head {
   display: flex;
   align-items: center;
-  gap: 0.5rem;
-  margin-bottom: 0.75rem;
-  background: none;
-  border: none;
-  padding: 0;
+  gap: 0.75rem;
+  padding: 0.25rem 0;
   cursor: pointer;
+  user-select: none;
   color: inherit;
 }
-.disclose-caret { width: 0.75rem; height: 0.75rem; color: var(--text-faint); transition: transform 0.2s ease; }
-.disclose-caret-open { transform: rotate(90deg); }
-.disclose:hover .section-title { color: var(--text-soft); }
-.disclose .section-title { transition: color 0.15s ease; }
+.sec-rule { flex: 1 1 auto; height: 1px; background: var(--border); }
+.sec-rule-lead { flex: 0 0 2rem; }
+.sec-name {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  font-weight: 400;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+  white-space: nowrap;
+  max-width: 50%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sec-head:hover .sec-name { color: var(--text-soft); }
+.sec-chev { width: 0.875rem; height: 0.875rem; flex-shrink: 0; color: var(--text-faint); transition: transform 0.2s ease; }
+/* Chevron points up while expanded (direction of the collapse action), down
+   once collapsed. */
+.sec-head.sec-collapsed .sec-chev { transform: rotate(180deg); }
+
+/* Edit-mode rename input under the header. */
+.sec-rename { margin-top: 0.375rem; }
+.sec-rename .input { width: auto; min-width: 16rem; max-width: 24rem; padding: 0.25rem 0.5rem; font-size: 0.75rem; }
+
+/* Band body: fixed blocks span the full width, pinned panel slots flow in
+   the responsive card grid (card-md/card-lg span classes apply as-is). */
+.sec-body { display: grid; gap: 1.25rem; grid-template-columns: 1fr; align-items: start; }
+@media (min-width: 768px) {
+  .sec-body { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (min-width: 1024px) {
+  .sec-body { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+.sec-block { position: relative; min-width: 0; }
+.sec-body > .sec-block { grid-column: 1 / -1; }
+
+/* --- edit mode ------------------------------------------------------------------ */
+
+/* Every edit affordance carries .edit-only and exists only while the
+   layout-editing toggle (body.edit-mode) is on. */
+body:not(.edit-mode) .edit-only { display: none !important; }
+body:not(.edit-mode) .card-grab { cursor: default; }
+body:not(.edit-mode) .card-grab:active { cursor: default; }
+
+/* Block drag strip + floating move buttons while editing. */
+body.edit-mode .sec-body > .sec-block { cursor: grab; padding-top: 1.25rem; }
+body.edit-mode .sec-body > .sec-block:active { cursor: grabbing; }
+.block-actions {
+  position: absolute;
+  top: 0.25rem;
+  right: 0.25rem;
+  z-index: 15;
+  display: flex;
+  gap: 0.25rem;
+  padding: 0.125rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 0.375rem;
+}
+
+/* Per-panel size preset (edit mode only). */
+.pin-size {
+  height: 1.5rem;
+  font-family: var(--font-mono);
+  font-size: 0.625rem;
+  padding: 0 0.125rem;
+  border: 1px solid var(--border);
+  border-radius: 0.25rem;
+  background: var(--surface);
+  color: var(--text-muted);
+  cursor: pointer;
+}
+#edit-toggle[aria-pressed="true"] { border-color: rgba(52, 211, 153, 0.4); color: #34d399; }
 
 /* --- modals ------------------------------------------------------------------- */
 
@@ -682,7 +758,7 @@ details.tpl-help summary:hover { color: var(--text-muted); }
 /* Pin-slot actions sit top-right; each pinned clone's own card buttons are
    inert (the clone has no data-metric), so only these show. */
 .pin-actions { position: absolute; top: 0.5rem; right: 0.5rem; z-index: 10; display: flex; gap: 0.25rem; }
-#pinned .move-btns { display: none; }
+.pin-slot .move-btns, .pin-slot .pin-add { display: none !important; }
 .pin-remove, .pin-btn {
   width: 1.5rem;
   height: 1.5rem;
