@@ -286,13 +286,15 @@ The dashboard's customization lives in one versioned JSON document, persisted at
 | `panels` | `[{id, metric, chart_type?, size?}]` | Pinned charts. `chart_type`: `line`, `bars`, `gauge`, `big-number`; `size`: `sm`, `md`, `lg` (grid span presets). Empty values take the per-kind default. |
 | `order` | `{all_metrics, hooks, endpoints}` | Card order *inside* the All Metrics, Hooks, and Endpoint Latency blocks. |
 | `http_card_view` | string | `breakdown` (default) or `totals` — the HTTP status card's column set. |
-| `sections` | `[{id, name?, items}]` | Horizontal bands and what they place, in render order. Omitted means the built-in default layout, so pre-sections documents render unchanged. |
+| `sections` | `[{id, name?, items, parent?}]` | Horizontal bands and what they place, in render order. `parent` optionally nests a band under the section with that id, at unlimited depth (empty/omitted = top-level band); the list itself stays flat — every section is addressed by its single id. Omitted means the built-in default layout, so pre-sections documents render unchanged. |
 
-Each section's `items` reference either a well-known block id or a pinned panel id (`panels[].id`); blocks move as whole units between sections, while per-card rearrangement stays inside a block and pinning remains the escape hatch that turns an All Metrics card into a placeable panel. The well-known block ids are `runtime-health`, `histogram`, `hooks`, `all-metrics`, `endpoint-latency`, and `internals`. A section may be unnamed (an untitled band) and may have an empty `items` list (the default `my-charts` band starts empty; pinned charts land there). Every panel should be referenced by some section — the UI places new pins automatically, and on load it appends unreferenced panels to the `my-charts` band, or to the last section when the layout has none.
+Each section's `items` reference either a well-known block id or a pinned panel id (`panels[].id`); blocks move as whole units between sections, while per-card rearrangement stays inside a block and pinning remains the escape hatch that turns an All Metrics card into a placeable panel. The well-known block ids are `runtime-health`, `histogram`, `hooks`, `all-metrics`, `endpoint-latency`, and `internals`. A section may be unnamed (an untitled band) and may have an empty `items` list (the default `my-charts` band starts empty; pinned charts land there). Every panel should be referenced by some section — the UI places new pins automatically, and on load it appends unreferenced panels to the `my-charts` band, or to the last section when the layout has none. A nested band renders inside its parent's grid and may itself contain bands, with no depth limit; `my-charts` may sit at any depth and keeps receiving new pins wherever it is. Nested bands are a UI-only concern for data: every block and panel still renders exactly once, wherever it sits in the tree.
 
-The `PUT` validator enforces this contract: `version` must be `1`; section ids non-empty and unique; every item a non-empty string; each well-known block id used at most once across all sections; non-block items must reference an existing panel id, and each panel id may appear in at most one section; panel ids and metrics must each be unique within `panels`, and panel ids must not collide with reserved block ids; section `name` is free text, empty allowed.
+The `PUT` validator enforces this contract: `version` must be `1`; section ids non-empty and unique; every item a non-empty string; each well-known block id used at most once across all sections (the flat list makes this tree-wide, whatever the nesting); non-block items must reference an existing panel id, and each panel id may appear in at most one section; panel ids and metrics must each be unique within `panels`, and panel ids must not collide with reserved block ids; section `name` is free text, empty allowed. `parent` values share the section-id namespace and must name another existing section; a self-parent or a parent cycle is rejected with a 400, since the server renders bands recursively and relies on the graph being acyclic.
 
-Editing is gated behind an explicit edit-mode toggle (the ✎ button in the toolbar). On: drag charts/blocks between and within sections, reorder, resize (`sm`/`md`/`lg`), pin/unpin, add/remove charts, rename sections inline (`section name (optional)`). Off: the view is frozen — no drag handlers, no move/action buttons, no edit affordances. Edit mode and per-section collapse (click anywhere on a section's header line) persist in the browser's localStorage only; they are never written to the document.
+A hand-edited document with a broken `parent` — an id that does not exist, a self-parent, or a cycle — is healed when it is loaded: the affected sections are promoted to top level (keeping their items and their own children), one warning is logged, and the file on disk stays as authored, so `GET /metrics/config` always returns the layout that rendering uses. Rolling back to an older golens is safe the same way: older servers ignore the unknown `parent` field and render the layout flat, and a later save persists it flattened.
+
+Editing is gated behind an explicit edit-mode toggle (the ✎ button in the toolbar). On: drag charts/blocks between and within sections, drag a band by its header into another band to nest it (dropping a band into itself or one of its own descendants is refused; dragging it back out — over the gaps between top-level bands or another top-level band's header line — drops it at top level again), reorder, resize (`sm`/`md`/`lg`), pin/unpin, add/remove charts, rename sections inline (`section name (optional)`). Off: the view is frozen — no drag handlers, no move/action buttons, no edit affordances. Edit mode and per-section collapse (click anywhere on a section's header line) persist in the browser's localStorage only; they are never written to the document. Drag re-parenting moves layout positioning only — the section's `parent` and its sibling order — never the charts it places.
 
 **Section presets.** An integrator can preset the section layout from code — the priority surface — by calling, after `golens.New` and before the UI mounts:
 
@@ -303,6 +305,9 @@ registry.PresetDashboardSections(
     }},
     golens.DashboardSection{ID: "traffic", Name: "Traffic", Items: []string{
         golens.BlockHistogram, golens.BlockEndpoints,
+    }},
+    golens.DashboardSection{ID: "deep-dive", Name: "Deep Dive", Parent: "traffic", Items: []string{
+        golens.BlockInternals,
     }},
 )
 ```
@@ -318,6 +323,13 @@ ui:
     - id: my-charts
       name: My Charts
       items: []             # pinned charts land here
+    - id: details
+      name: Details
+      items: [histogram]
+    - id: latency
+      name: Latency
+      parent: details       # nests the Latency band inside Details
+      items: [endpoint-latency]
 ```
 
 Presets **seed once**: they shape the layout only while no document has been saved (a fresh start, or after `DELETE`). Once a document is saved — by the dashboard's first edit or any `PUT` — the saved document wins on every startup and presets never re-apply over it. `GET /metrics/config` always returns the effective section list (the saved one, or the preset-seeded one while unsaved), so clients see exactly what rendering uses.

@@ -219,12 +219,24 @@ func (r *Registry) AlertTemplatesHTTPHandler() http.Handler {
 // sectionView is one rendered dashboard band: its id/name plus the fixed
 // blocks it places, in order. Pinned panels are placed client-side into the
 // band's body (the panel slots never exist in the server render), so panel
-// items are not part of a sectionView.
+// items are not part of a sectionView. Parent carries nesting: a band renders
+// inside the band its Parent names, at unlimited depth.
 type sectionView struct {
-	ID     string
-	Name   string
-	Items  []string // well-known block ids, render order
-	Hidden bool     // nothing to show yet: no rendered blocks and no panel items
+	ID        string
+	Name      string
+	Items     []string // well-known block ids, render order
+	Hidden    bool     // nothing to show yet: no rendered blocks and no panel items
+	Parent    string   // section id this band nests under; empty = top level
+	hasPanels bool     // panel items exist (placed client-side), keeping the band visible
+}
+
+// secRender is one node of the recursive render tree: the band plus the page
+// data its block templates read. A {{template}} invocation rebinds $ to its
+// argument, so the page data must travel down the recursion with the band.
+type secRender struct {
+	Data map[string]interface{}
+	*sectionView
+	Children []*secRender
 }
 
 // buildSectionViews resolves the effective section list into renderable
@@ -234,7 +246,7 @@ type sectionView struct {
 func buildSectionViews(secs []DashboardSection, runtimeEnabled bool, hookCards []metricCard) []sectionView {
 	out := make([]sectionView, 0, len(secs))
 	for _, s := range secs {
-		v := sectionView{ID: s.ID, Name: s.Name}
+		v := sectionView{ID: s.ID, Name: s.Name, Parent: s.Parent}
 		hasPanels := false
 		for _, item := range s.Items {
 			if !wellKnownBlocks[item] {
@@ -249,10 +261,52 @@ func buildSectionViews(secs []DashboardSection, runtimeEnabled bool, hookCards [
 			}
 			v.Items = append(v.Items, item)
 		}
+		v.hasPanels = hasPanels
 		v.Hidden = len(v.Items) == 0 && !hasPanels
 		out = append(out, v)
 	}
 	return out
+}
+
+// sectionTree links the flat view list into renderable roots: each band nests
+// under the band its Parent names, children in list order. The loader heals
+// broken pointers and the validator rejects cycles, so every list reaching
+// this point is acyclic — which is what makes the recursive template safe; a
+// band whose parent is nonetheless missing renders as a root so the server
+// render and GET can never diverge on the layout.
+func sectionTree(views []sectionView, data map[string]interface{}) []*secRender {
+	nodes := make([]*secRender, len(views))
+	byID := make(map[string]*secRender, len(views))
+	for i := range views {
+		nodes[i] = &secRender{Data: data, sectionView: &views[i]}
+		byID[views[i].ID] = nodes[i]
+	}
+	roots := make([]*secRender, 0, len(views))
+	for _, n := range nodes {
+		if p, ok := byID[n.Parent]; ok && n.Parent != "" {
+			p.Children = append(p.Children, n)
+		} else {
+			roots = append(roots, n)
+		}
+	}
+	for _, r := range roots {
+		settleHidden(r)
+	}
+	return roots
+}
+
+// settleHidden recomputes Hidden after linking: a band without rendered
+// blocks or panels of its own still shows when a nested band below it has
+// content. Returns whether the subtree has content.
+func settleHidden(n *secRender) bool {
+	content := len(n.Items) > 0 || n.hasPanels
+	for _, c := range n.Children {
+		if settleHidden(c) {
+			content = true
+		}
+	}
+	n.Hidden = !content
+	return content
 }
 
 // metricsPageHandler renders the full dashboard shell. The card grid is
@@ -279,7 +333,6 @@ func (r *Registry) metricsPageHandler() http.Handler {
 			"PollSec":           intervalMs / 1000,
 			"Cards":             buildCardsOpts(snaps, r.cardOptions()),
 			"HookCards":         hookCards,
-			"Sections":          buildSectionViews(secs, r.cfg.RuntimeMetrics.Enabled, hookCards),
 			"SectionsJSON":      template.JS(secsJSON),
 			"Interval":          r.cfg.UI.PollInterval.String(),
 			"RuntimeEnabled":    r.cfg.RuntimeMetrics.Enabled,
@@ -289,6 +342,9 @@ func (r *Registry) metricsPageHandler() http.Handler {
 			"AlertsEnabled":     r.alerter != nil,
 			"HasNotifier":       r.alerter != nil && r.alerter.HasNotifier(),
 		}
+		// The section tree carries the page data down the recursion, so the
+		// block templates keep reading it as $ at any depth.
+		data["Sections"] = sectionTree(buildSectionViews(secs, r.cfg.RuntimeMetrics.Enabled, hookCards), data)
 		// Render to a buffer first so a template error never produces a
 		// half-written response (which would force a superfluous WriteHeader).
 		var buf bytes.Buffer
@@ -1056,39 +1112,46 @@ const dashboardSrc = `<!DOCTYPE html>
 </header>
 
 <main class="wrap stack">
-  {{range .Sections}}
-  <section class="dash-section" data-section="{{.ID}}" data-name="{{.Name}}"{{if .Hidden}} hidden{{end}}>
-    <!-- Whole header is one collapse click target (rule + name + chevron);
-         the rename input below exists only in edit mode. -->
-    <div class="sec-head" role="button" tabindex="0" aria-label="Toggle section">
-      <span class="sec-rule sec-rule-lead"></span>
-      <span class="sec-name">{{.Name}}</span>
-      <span class="sec-rule"></span>
-      <svg class="sec-chev" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><path fill-rule="evenodd" d="M14.77 12.79a.75.75 0 01-1.06-.02L10 8.832 6.29 12.77a.75.75 0 11-1.08-1.04l4.25-4.5a.75.75 0 011.08 0l4.25 4.5a.75.75 0 01.02 1.06z" clip-rule="evenodd"/></svg>
-    </div>
-    <div class="sec-rename edit-only">
-      <input type="text" class="input sec-rename-input" placeholder="section name (optional)" value="{{.Name}}" maxlength="200" aria-label="Section name" onchange="renameSection(this)">
-    </div>
-    <div class="sec-body">
-      {{range .Items}}
-      <div class="sec-block" data-block="{{.}}" draggable="true">
-        <span class="block-actions edit-only">
-          <button type="button" class="move-btn" title="move earlier" aria-label="Move {{.}} earlier" onclick="moveSectionItem(this,-1)">&larr;</button>
-          <button type="button" class="move-btn" title="move later" aria-label="Move {{.}} later" onclick="moveSectionItem(this,1)">&rarr;</button>
-        </span>
-        {{if eq . "runtime-health"}}{{template "block-runtime" $}}
-        {{else if eq . "histogram"}}{{template "block-histogram" $}}
-        {{else if eq . "hooks"}}{{template "block-hooks" $}}
-        {{else if eq . "all-metrics"}}{{template "block-all-metrics" $}}
-        {{else if eq . "endpoint-latency"}}{{template "block-endpoints" $}}
-        {{else if eq . "internals"}}{{template "block-internals" $}}
-        {{end}}
-      </div>
+  {{range .Sections}}{{template "sec" .}}{{end}}
+</main>
+
+<!-- One band, rendered recursively: items first, then nested child bands.
+     The parent graph is validated acyclic, so the recursion always halts;
+     htmx swap targets key on element ids, which stay globally unique at any
+     depth. -->
+{{define "sec"}}
+<section class="dash-section" data-section="{{.ID}}" data-name="{{.Name}}"{{if .Hidden}} hidden{{end}}>
+  <!-- Whole header is one collapse click target (rule + name + chevron);
+       the rename input below exists only in edit mode. -->
+  <div class="sec-head" role="button" tabindex="0" aria-label="Toggle section">
+    <span class="sec-rule sec-rule-lead"></span>
+    <span class="sec-name">{{.Name}}</span>
+    <span class="sec-rule"></span>
+    <svg class="sec-chev" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><path fill-rule="evenodd" d="M14.77 12.79a.75.75 0 01-1.06-.02L10 8.832 6.29 12.77a.75.75 0 11-1.08-1.04l4.25-4.5a.75.75 0 011.08 0l4.25 4.5a.75.75 0 01.02 1.06z" clip-rule="evenodd"/></svg>
+  </div>
+  <div class="sec-rename edit-only">
+    <input type="text" class="input sec-rename-input" placeholder="section name (optional)" value="{{.Name}}" maxlength="200" aria-label="Section name" onchange="renameSection(this)">
+  </div>
+  <div class="sec-body">
+    {{range .Items}}
+    <div class="sec-block" data-block="{{.}}" draggable="true">
+      <span class="block-actions edit-only">
+        <button type="button" class="move-btn" title="move earlier" aria-label="Move {{.}} earlier" onclick="moveSectionItem(this,-1)">&larr;</button>
+        <button type="button" class="move-btn" title="move later" aria-label="Move {{.}} later" onclick="moveSectionItem(this,1)">&rarr;</button>
+      </span>
+      {{if eq . "runtime-health"}}{{template "block-runtime" $.Data}}
+      {{else if eq . "histogram"}}{{template "block-histogram" $.Data}}
+      {{else if eq . "hooks"}}{{template "block-hooks" $.Data}}
+      {{else if eq . "all-metrics"}}{{template "block-all-metrics" $.Data}}
+      {{else if eq . "endpoint-latency"}}{{template "block-endpoints" $.Data}}
+      {{else if eq . "internals"}}{{template "block-internals" $.Data}}
       {{end}}
     </div>
-  </section>
-  {{end}}
-</main>
+    {{end}}
+    {{range .Children}}{{template "sec" .}}{{end}}
+  </div>
+</section>
+{{end}}
 
 <!-- Add-chart modal (Alpine): lists all currently-available metrics by default,
      filtered live by the search box; refreshes whenever the modal opens.

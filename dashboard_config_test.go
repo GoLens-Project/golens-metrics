@@ -385,7 +385,9 @@ func sameStrings(a, b []string) bool {
 // unique; items non-empty strings; each well-known block id placed at most
 // once across all sections; non-block items must reference an existing
 // panel; panel ids may never collide with a reserved block id (they would be
-// ambiguous in Items).
+// ambiguous in Items). Parent pointers must name an existing section, never
+// the section itself, and never form a cycle — the server's recursive band
+// render halts on exactly that.
 func TestDashboardConfigPutSectionValidation(t *testing.T) {
 	tests := []struct {
 		name string
@@ -397,6 +399,10 @@ func TestDashboardConfigPutSectionValidation(t *testing.T) {
 		{"unknown panel ref", `{"version":1,"sections":[{"id":"a","items":["no_such_panel"]}]}`},
 		{"empty item", `{"version":1,"sections":[{"id":"a","items":[""]}]}`},
 		{"panel id reserved block id", `{"version":1,"panels":[{"id":"hooks","metric":"webhook_calls"}]}`},
+		{"self parent", `{"version":1,"sections":[{"id":"a","parent":"a"}]}`},
+		{"unknown parent", `{"version":1,"sections":[{"id":"a","parent":"ghost"}]}`},
+		{"two-section parent cycle", `{"version":1,"sections":[{"id":"a","parent":"b"},{"id":"b","parent":"a"}]}`},
+		{"three-section parent cycle", `{"version":1,"sections":[{"id":"a","parent":"b"},{"id":"b","parent":"c"},{"id":"c","parent":"a"}]}`},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -564,6 +570,85 @@ func TestDashboardSectionsBackCompat(t *testing.T) {
 			t.Errorf("sections = %v, want default %v", ids, defaultSectionIDs())
 		}
 	})
+}
+
+// Nested sections save and read back with their parent pointers intact, and a
+// parent may be defined later in the list than its children — the flat list
+// is order-free for parent resolution.
+func TestDashboardConfigPutSectionsNestedRoundTrip(t *testing.T) {
+	r := newConfigRegistry(t, DefaultConfig())
+	h := r.dashboardConfigHandler()
+
+	doc := `{"version":1,"order":{},"sections":[
+	        {"id":"inner","parent":"outer","items":["internals"]},
+	        {"id":"outer","items":["all-metrics"]}]}`
+	rec := configRequest(h, http.MethodPut, doc)
+	if rec.Code != 200 {
+		t.Fatalf("PUT status = %d, body %s", rec.Code, rec.Body.String())
+	}
+	if saved := decodeConfig(t, rec); saved.Sections[0].ID != "inner" || saved.Sections[0].Parent != "outer" {
+		t.Errorf("echoed sections = %+v, want inner nested under outer", saved.Sections)
+	}
+
+	byID := map[string]DashboardSection{}
+	for _, s := range getDashboardConfig(t, r).Sections {
+		byID[s.ID] = s
+	}
+	if byID["inner"].Parent != "outer" || byID["outer"].Parent != "" {
+		t.Errorf("GET parents = inner:%q outer:%q, want inner:outer outer:\"\"", byID["inner"].Parent, byID["outer"].Parent)
+	}
+}
+
+// A hand-edited document on disk with broken parent pointers loads healed:
+// dangling, self, and cyclic parents are promoted to top level while a valid
+// nest survives — in memory only, so the file keeps its authored bytes and a
+// later PUT re-persists the healed layout. One warning line names every
+// healed section.
+func TestDashboardConfigHealsBrokenParentsOnLoad(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dash.json")
+	authored := `{"version":1,"order":{},"sections":[` +
+		`{"id":"outer","items":["all-metrics"]},` +
+		`{"id":"inner","parent":"outer","items":["internals"]},` +
+		`{"id":"dangling","parent":"ghost"},` +
+		`{"id":"selfie","parent":"selfie"},` +
+		`{"id":"ca","parent":"cb"},{"id":"cb","parent":"ca"}]}`
+	if err := os.WriteFile(path, []byte(authored), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	redirectLog(t, &logs)
+	cfg := DefaultConfig()
+	cfg.UI.DashboardConfig = path
+	r := newConfigRegistry(t, cfg)
+	defer r.Close()
+
+	byID := map[string]DashboardSection{}
+	for _, s := range getDashboardConfig(t, r).Sections {
+		byID[s.ID] = s
+	}
+	for _, id := range []string{"dangling", "selfie"} {
+		if byID[id].Parent != "" {
+			t.Errorf("%s parent = %q, want cleared to top level", id, byID[id].Parent)
+		}
+	}
+	// A cycle is broken at its first list-order member; the other member
+	// keeps its parent pointer and stays nested under the promoted band (the
+	// heal keeps each band's own children), so the graph is acyclic again.
+	if byID["ca"].Parent != "" {
+		t.Errorf("ca parent = %q, want the cycle broken at the first list-order member", byID["ca"].Parent)
+	}
+	if byID["cb"].Parent != "ca" {
+		t.Errorf("cb parent = %q, want kept as a child of the promoted band", byID["cb"].Parent)
+	}
+	if byID["inner"].Parent != "outer" {
+		t.Errorf("inner parent = %q, want the valid nest preserved", byID["inner"].Parent)
+	}
+	if data, err := os.ReadFile(path); err != nil || string(data) != authored {
+		t.Errorf("healing rewrote %s on disk", path)
+	}
+	if !strings.Contains(logs.String(), "broken parents promoted to top level: dangling, selfie, ca") {
+		t.Errorf("healing warning missing: %s", logs.String())
+	}
 }
 
 // DELETE's contract is "no saved document": the file is removed, not

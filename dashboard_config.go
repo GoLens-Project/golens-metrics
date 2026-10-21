@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 )
 
 // Well-known fixed-block ids placeable in DashboardSection.Items. A block
@@ -58,11 +59,15 @@ type DashboardConfig struct {
 // ids or well-known fixed-block ids; order inside Items is render order.
 // Name is free-text and optional — an unnamed section renders an untitled
 // band. An empty Items list is allowed (a band holding only panels placed
-// later, or an as-yet-empty drop target).
+// later, or an as-yet-empty drop target). Parent optionally nests the band
+// under the section with that id, at unlimited depth; empty = a top-level
+// band. The list itself stays flat: every section is still addressed,
+// validated, and persisted by its single id.
 type DashboardSection struct {
-	ID    string   `json:"id"`
-	Name  string   `json:"name,omitempty"`
-	Items []string `json:"items,omitempty"`
+	ID     string   `json:"id"`
+	Name   string   `json:"name,omitempty"`
+	Items  []string `json:"items,omitempty"`
+	Parent string   `json:"parent,omitempty"`
 }
 
 // DashboardPanel is one pinned dashboard panel. ChartType and Size are the
@@ -121,12 +126,15 @@ func defaultDashboardSections() []DashboardSection {
 // validateDashboardSections enforces the layout document's section contract:
 // section ids non-empty and unique; items non-empty strings; each well-known
 // block id and each panel id used at most once across all sections (a panel
-// slot is a single DOM node, so the client cannot render it twice); any
+// slot is a single DOM node, so the client cannot render it twice) — the flat
+// list makes those once-only checks tree-wide regardless of nesting; any
 // non-block item must reference an existing panel id (panels nil = presets,
 // which cannot know runtime panel ids, so they may only place blocks); panel
 // ids equal to a reserved block id are rejected — they would be ambiguous in
 // Items — and so are duplicate ids or metrics within Panels (the client keys
-// panels on the metric name).
+// panels on the metric name). Parent pointers share the section-id namespace:
+// a parent must name another existing section, and the parent graph must stay
+// acyclic — the server's recursive band render halts on exactly that.
 func validateDashboardSections(sections []DashboardSection, panels []DashboardPanel) error {
 	panelIDs := make(map[string]bool, len(panels))
 	panelMetrics := make(map[string]bool, len(panels))
@@ -174,7 +182,88 @@ func validateDashboardSections(sections []DashboardSection, panels []DashboardPa
 			seenPanel[item] = true
 		}
 	}
+	// Parent-pointer integrity, after all ids are collected (a parent may be
+	// defined later in the list): no self-parent, no dangling id, no cycle.
+	parentOf := make(map[string]string, len(sections))
+	for _, s := range sections {
+		if s.Parent == "" {
+			continue
+		}
+		if s.Parent == s.ID {
+			return fmt.Errorf("section %q cannot be its own parent", s.ID)
+		}
+		if !seenSection[s.Parent] {
+			return fmt.Errorf("section %q references unknown parent %q", s.ID, s.Parent)
+		}
+		parentOf[s.ID] = s.Parent
+	}
+	// Cycle walk over the parent graph, memoized: 1 = on the current chain,
+	// 2 = the chain resolves to a top-level section. Every section gets one
+	// walk regardless of depth, so unbounded nesting costs nothing extra.
+	state := make(map[string]int, len(sections))
+	for _, s := range sections {
+		chain := []string{}
+		cur := s.ID
+		for state[cur] == 0 {
+			state[cur] = 1
+			chain = append(chain, cur)
+			p := parentOf[cur]
+			if p == "" {
+				cur = "" // resolved at a top-level section
+				break
+			}
+			cur = p
+		}
+		// cur was marked 1 by this walk and is not the chain's root: it is
+		// the cycle's entry point.
+		if cur != "" && state[cur] == 1 {
+			return fmt.Errorf("section %q is part of a parent cycle", cur)
+		}
+		for _, id := range chain {
+			state[id] = 2
+		}
+	}
 	return nil
+}
+
+// healDashboardSections repairs a hand-edited document in memory: a section
+// whose parent chain is broken — a dangling parent id, a self-parent, or a
+// cycle — is promoted to top level (parent cleared), keeping its items and
+// its own children. It returns the healed section ids. Orphans cannot
+// originate from the UI or a validated PUT, so this path exists for
+// hand-edited or legacy files; the file on disk stays as authored and a later
+// PUT re-persists the healed layout.
+func healDashboardSections(d *DashboardConfig) []string {
+	byID := make(map[string]int, len(d.Sections))
+	for i, s := range d.Sections {
+		byID[s.ID] = i
+	}
+	var healed []string
+	for i := range d.Sections {
+		if d.Sections[i].Parent == "" {
+			continue
+		}
+		broken := false
+		seen := map[string]bool{d.Sections[i].ID: true}
+		for cur := d.Sections[i].Parent; cur != ""; {
+			if seen[cur] {
+				broken = true // cycle (includes the self-parent case)
+				break
+			}
+			seen[cur] = true
+			j, ok := byID[cur]
+			if !ok {
+				broken = true // dangling parent id
+				break
+			}
+			cur = d.Sections[j].Parent
+		}
+		if broken {
+			d.Sections[i].Parent = ""
+			healed = append(healed, d.Sections[i].ID)
+		}
+	}
+	return healed
 }
 
 // loadDashboardConfig reads the persisted layout document at construction
@@ -182,7 +271,9 @@ func validateDashboardSections(sections []DashboardSection, panels []DashboardPa
 // wrong-version file logs a warning and falls back to defaults — a broken
 // dashboard file must never crash startup. A successfully loaded document
 // marks the registry as "saved" (dashSaved): presets seed only before the
-// first save, never over an existing document.
+// first save, never over an existing document. A loaded document with broken
+// parent pointers is healed in memory (one warning line), so GET always
+// serves the layout rendering uses.
 func (r *Registry) loadDashboardConfig() *DashboardConfig {
 	def := defaultDashboardConfig()
 	if r.dashPath == "" {
@@ -203,6 +294,9 @@ func (r *Registry) loadDashboardConfig() *DashboardConfig {
 	if d.Version != 1 {
 		log.Printf("[golens] warning: dashboard config %s has unsupported version %d (need 1); using defaults", r.dashPath, d.Version)
 		return def
+	}
+	if healed := healDashboardSections(&d); len(healed) > 0 {
+		log.Printf("[golens] warning: dashboard config %s: sections with broken parents promoted to top level: %s", r.dashPath, strings.Join(healed, ", "))
 	}
 	r.dashSaved = true
 	return &d
