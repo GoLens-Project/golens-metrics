@@ -18,13 +18,18 @@ jobs:
       - name: Check for version label
         run: |
           LABELS=$(gh pr view ${{ github.event.pull_request.number }} --json labels --jq '.labels[].name')
-          for label in major minor patch; do
-            if echo "$LABELS" | grep -qx "$label"; then
-              echo "Found version label: $label"
+          PREFIX=$(echo "${{ github.head_ref }}" | cut -d/ -f1)
+          for version in major minor patch; do
+            if echo "$LABELS" | grep -qx "$version"; then
+              echo "Found version label: $version"
+              exit 0
+            fi
+            if [ "$PREFIX" = "$version" ]; then
+              echo "Found version branch prefix: $PREFIX"
               exit 0
             fi
           done
-          echo "::error::No version label (major/minor/patch) on this PR. A maintainer must add one before merging."
+          echo "::error::No version label (major/minor/patch) or branch prefix (major/*, minor/*, patch/*) on this PR. A maintainer must add one before merging."
           exit 1
         env:
           GH_TOKEN: ${{ github.token }}
