@@ -32,7 +32,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	golens "golens"
+	golens "github.com/GoLens-Project/golens-metrics"
 )
 
 func main() {

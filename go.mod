@@ -1,4 +1,4 @@
-module golens
+module github.com/GoLens-Project/golens-metrics
 
 go 1.22
 

@@ -1,8 +1,8 @@
 # GoLens
 
-[![CI](https://github.com/GoLens-Project/golens/actions/workflows/ci.yml/badge.svg)](https://github.com/GoLens-Project/golens/actions/workflows/ci.yml)
-[![Go Reference](https://pkg.go.dev/badge/github.com/GoLens-Project/golens.svg)](https://pkg.go.dev/github.com/GoLens-Project/golens)
-[![Coverage](https://img.shields.io/badge/coverage-94%25-brightgreen)](https://github.com/GoLens-Project/golens/actions/workflows/ci.yml)
+[![CI](https://github.com/GoLens-Project/golens-metrics/actions/workflows/ci.yml/badge.svg)](https://github.com/GoLens-Project/golens-metrics/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/GoLens-Project/golens-metrics.svg)](https://pkg.go.dev/github.com/GoLens-Project/golens-metrics)
+[![Coverage](https://img.shields.io/badge/coverage-94%25-brightgreen)](https://github.com/GoLens-Project/golens-metrics/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Go Version](https://img.shields.io/badge/go-1.22+-007d9c)](https://go.dev/)
 
@@ -102,7 +102,7 @@ This layer handles how the world sees your telemetry. It is designed to be "Swag
 ### Install
 
 ```bash
-go get github.com/GoLens-Project/golens
+go get github.com/GoLens-Project/golens-metrics@latest
 ```
 
 GoLens depends only on two pure-Go libraries at runtime (`gopkg.in/yaml.v3` for config and `modernc.org/sqlite` for optional persistence — no CGo).
@@ -116,7 +116,7 @@ import (
     "context"
     "net/http"
 
-    golens "golens"
+    golens "github.com/GoLens-Project/golens-metrics"
 )
 
 func main() {
