@@ -31,9 +31,15 @@ var dashCfg = {
   panels: lsJSON('golens.charts').map(function (n) { return { id: n, metric: n }; }),
   order: { all_metrics: lsJSON('golens.order'), hooks: lsJSON('golens.hooksorder'), endpoints: lsJSON('golens.eporder') },
   http_card_view: localStorage.getItem('golens.httpview') || '',
+  timeframe: localStorage.getItem('golens.timeframe') || '',
   sections: bootSections()
 };
 var dashRemote = false;
+
+// Custom-start moment (unix seconds) behind the "custom" timeframe choice.
+// Deliberately browser state, not part of the layout document: an absolute
+// timestamp goes stale, so only the choice itself persists server-side.
+var tfStartSec = parseInt(localStorage.getItem('golens.tfstart'), 10) || 0;
 
 // dashHasOrder reports whether a config document carries any section order.
 function dashHasOrder(d) { var o = d.order || {}; return !!((o.all_metrics || []).length || (o.hooks || []).length || (o.endpoints || []).length); }
@@ -72,6 +78,7 @@ function persistDash() {
     localStorage.setItem('golens.hooksorder', JSON.stringify(dashCfg.order.hooks || []));
     localStorage.setItem('golens.eporder', JSON.stringify(dashCfg.order.endpoints || []));
     localStorage.setItem('golens.httpview', dashCfg.http_card_view || '');
+    localStorage.setItem('golens.timeframe', dashCfg.timeframe || '');
   } catch (e) {}
   if (!dashRemote) return;
   fetchJSON('/metrics/config', {
@@ -88,11 +95,117 @@ function persistDash() {
   });
 }
 
+// --- timeframes -----------------------------------------------------------------
+// One dashboard-global timeframe plus a per-band override. The effective
+// timeframe for a chart is the nearest enclosing band with its own selection
+// (so a nested child without one inherits its parent's override), else the
+// global value; resolution happens client-side at fetch time, where every
+// history consumer asks effectiveDuration() just before fetching. "custom"
+// trades the relative window for a start moment (tfStartSec).
+
+var TF_DEFAULT = '1h';
+
+function tfForSection(id) {
+  var secs = dashCfg.sections || [];
+  for (var i = 0; i < secs.length; i++) if (secs[i].id === id) return secs[i].timeframe || '';
+  return '';
+}
+
+function effectiveDuration(el) {
+  var sec = el ? el.closest('[data-section]') : null;
+  while (sec) {
+    var tf = tfForSection(sec.getAttribute('data-section'));
+    if (tf) return tf;
+    sec = sec.parentElement ? sec.parentElement.closest('[data-section]') : null;
+  }
+  return dashCfg.timeframe || TF_DEFAULT;
+}
+
+// historyQS maps a timeframe choice onto /metrics/history query params:
+// presets fetch ?duration=, custom fetches ?start= (unix seconds). A custom
+// choice with no stored moment (doc persisted elsewhere, fresh browser)
+// keeps the default window rather than seeding "now" — an empty window tells
+// the user less than the default; picking a moment in the picker activates it.
+function historyQS(tf) {
+  if (tf === 'custom' && tfStartSec) return 'start=' + tfStartSec;
+  return 'duration=' + (tf && tf !== 'custom' ? tf : TF_DEFAULT);
+}
+
+// applyTimeframeUI syncs the selector controls with the config document.
+function applyTimeframeUI() {
+  var sel = document.getElementById('tf-global');
+  if (sel) sel.value = dashCfg.timeframe || TF_DEFAULT;
+  document.querySelectorAll('[data-section]').forEach(function (sec) {
+    var s = sec.querySelector('.sec-tf');
+    if (s) s.value = tfForSection(sec.getAttribute('data-section'));
+  });
+  var picker = document.getElementById('tf-start');
+  if (picker) {
+    picker.hidden = !(dashCfg.timeframe === 'custom' || (dashCfg.sections || []).some(function (s) { return s.timeframe === 'custom'; }));
+    if (tfStartSec && !picker.value) picker.value = tfLocalInput(tfStartSec);
+  }
+}
+
+// tfLocalInput formats unix seconds for the datetime-local picker (local time).
+function tfLocalInput(sec) {
+  var d = new Date(sec * 1000), p = function (x) { return (x < 10 ? '0' : '') + x; };
+  return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + 'T' + p(d.getHours()) + ':' + p(d.getMinutes());
+}
+
+// refreshTimeframes re-fetches every history consumer under the new
+// resolution: the runtime/histogram components listen for golens-tf, the
+// line-chart canvases redraw here.
+function refreshTimeframes() {
+  window.dispatchEvent(new Event('golens-tf'));
+  drawLineCharts();
+}
+
+function setGlobalTimeframe(v) {
+  dashCfg.timeframe = v;
+  applyTimeframeSettle(v);
+}
+
+function setSectionTimeframe(sel) {
+  var sec = sel.closest('[data-section]');
+  if (!sec) return;
+  var id = sec.getAttribute('data-section');
+  var secs = dashCfg.sections || [];
+  for (var i = 0; i < secs.length; i++) if (secs[i].id === id) { secs[i].timeframe = sel.value; break; }
+  applyTimeframeSettle(sel.value);
+}
+
+function applyTimeframeSettle(v) {
+  if (v === 'custom') ensureCustomStart();
+  applyTimeframeUI();
+  persistDash();
+  refreshTimeframes();
+}
+
+// ensureCustomStart seeds the picker with "now" the first time a selector
+// lands on custom, so ?start= always carries a value.
+function ensureCustomStart() {
+  if (!tfStartSec) tfStartSec = Math.floor(Date.now() / 1000);
+  try { localStorage.setItem('golens.tfstart', String(tfStartSec)); } catch (e) {}
+  var picker = document.getElementById('tf-start');
+  if (picker && !picker.value) picker.value = tfLocalInput(tfStartSec);
+}
+
+// setCustomStart applies the picked moment; datetime-local values parse as
+// local time.
+function setCustomStart(v) {
+  var t = v ? new Date(v).getTime() : NaN;
+  if (isNaN(t)) return;
+  tfStartSec = Math.floor(t / 1000);
+  try { localStorage.setItem('golens.tfstart', String(tfStartSec)); } catch (e) {}
+  refreshTimeframes();
+}
+
 // applyDash re-hydrates the UI from the current config document.
 function applyDash() {
   if (window.Alpine && Alpine.store('ui')) {
     Alpine.store('ui').charts = dashCfg.panels.map(function (p) { return p.metric; });
   }
+  applyTimeframeUI();
   sortCharts(); applyFilter(); renderPinned(); applyHookOrder();
 }
 
@@ -162,11 +275,12 @@ function loadDash() {
       if (!d.panels) d.panels = [];
       if (!d.order) d.order = { all_metrics: [], hooks: [], endpoints: [] };
       if (!d.http_card_view) d.http_card_view = '';
+      if (!d.timeframe) d.timeframe = '';
       // First connect against an empty server doc: promote the localStorage
       // layout (still in dashCfg) so existing pins, section orderings, and the
       // HTTP card view are migrated, even when only orderings exist.
       var promoted = !(d.panels.length || dashHasOrder(d)) && (dashCfg.panels.length || dashHasOrder(dashCfg));
-      if (promoted) { d.panels = dashCfg.panels; d.order = dashCfg.order; d.http_card_view = dashCfg.http_card_view; }
+      if (promoted) { d.panels = dashCfg.panels; d.order = dashCfg.order; d.http_card_view = dashCfg.http_card_view; d.timeframe = dashCfg.timeframe; }
       sanitizeLegacyPanels(d);
       normalizeSections(d);
       dashCfg = d;
@@ -597,7 +711,7 @@ function refreshSections() {
 // documents omit empty name/items/parent, DOM-built bands always carry them.
 function normSections(list) {
   return JSON.stringify((list || []).map(function (s) {
-    return { id: s.id, name: s.name || '', items: s.items || [], parent: s.parent || '' };
+    return { id: s.id, name: s.name || '', items: s.items || [], parent: s.parent || '', timeframe: s.timeframe || '' };
   }));
 }
 
@@ -629,7 +743,8 @@ function persistSectionsFromDOM() {
     if (prev && prev.items) {
       prev.items.forEach(function (id) { if (!inDom[id]) items.push(id); });
     }
-    var out = { id: sec.getAttribute('data-section'), name: name, items: items };
+    var tfs = sec.querySelector('.sec-tf');
+    var out = { id: sec.getAttribute('data-section'), name: name, items: items, timeframe: tfs ? tfs.value : '' };
     if (parentID) out.parent = parentID;
     secs.push(out);
     var body = sec.querySelector('.sec-body');
@@ -643,7 +758,7 @@ function persistSectionsFromDOM() {
   });
   // Bands the server dropped entirely keep their saved subtree untouched.
   (dashCfg.sections || []).forEach(function (s) {
-    if (!domIds[s.id]) secs.push({ id: s.id, name: s.name || '', items: (s.items || []).slice(), parent: s.parent || '' });
+    if (!domIds[s.id]) secs.push({ id: s.id, name: s.name || '', items: (s.items || []).slice(), parent: s.parent || '', timeframe: s.timeframe || '' });
   });
   if (normSections(secs) === normSections(dashCfg.sections)) return;
   dashCfg.sections = secs;
@@ -774,6 +889,7 @@ function initSectionsUI() {
   if (!main) return;
   // Whole header is the collapse click target; interactive children opt out.
   main.addEventListener('click', function (e) {
+    if (e.target.closest('.sec-tf')) return;
     if (e.target.closest('.sec-rename-input, .block-actions, .pin-actions')) return;
     var head = e.target.closest('.sec-head');
     if (head) toggleCollapse(head.closest('[data-section]'));
@@ -799,28 +915,31 @@ function pinSizeClass(name) {
 
 // --- line-chart panels (chart_type "line") -------------------------------------
 
-// Draw every canvas[data-history] on the page: one history fetch per metric
-// name, rendered into each matching canvas (a pinned clone duplicates the
-// #charts canvas, so both must draw). The window is fixed at 1h. htmx swaps
+// Draw every canvas[data-history] on the page: one history fetch per
+// (metric, timeframe) pair, rendered into each matching canvas (a pinned clone
+// duplicates the #charts canvas, so both must draw). The window is each
+// canvas's effective timeframe (band override, else global). htmx swaps
 // recreate the canvases, so this re-runs after every swap via renderPinned.
 var lineInflight = {};
 function drawLineCharts() {
-  var byName = {};
+  var groups = {};
   document.querySelectorAll('canvas[data-history]').forEach(function (c) {
     var n = c.getAttribute('data-history');
-    (byName[n] = byName[n] || []).push(c);
+    var qs = historyQS(effectiveDuration(c));
+    var k = n + '|' + qs;
+    (groups[k] = groups[k] || { name: n, qs: qs, canvases: [] }).canvases.push(c);
   });
-  Object.keys(byName).forEach(function (n) {
-    if (lineInflight[n]) return;
-    lineInflight[n] = true;
-    var canvases = byName[n];
-    fetchJSON('/metrics/history?name=' + encodeURIComponent(n) + '&duration=1h')
+  Object.keys(groups).forEach(function (k) {
+    if (lineInflight[k]) return;
+    lineInflight[k] = true;
+    var g = groups[k];
+    fetchJSON('/metrics/history?name=' + encodeURIComponent(g.name) + '&' + g.qs)
       .then(function (s) {
         var points = (s && s.points) || [];
-        canvases.forEach(function (c) { drawChart(c, [{ points: points }], {}); });
+        g.canvases.forEach(function (c) { drawChart(c, [{ points: points }], {}); });
       })
       .catch(function () {})
-      .then(function () { delete lineInflight[n]; });
+      .then(function () { delete lineInflight[k]; });
   });
 }
 drawLineCharts(); // initial pass for the server-rendered grid (scripts are deferred)
@@ -1046,8 +1165,9 @@ function setPaused(p) {
 // state resets with the layout (edit mode is a UI mode, not layout, and
 // survives).
 function resetLayout() {
-  dashCfg = { version: 1, panels: [], order: { all_metrics: [], hooks: [], endpoints: [] }, http_card_view: '', sections: bootSections() };
-  ['golens.charts', 'golens.order', 'golens.hooksorder', 'golens.eporder', 'golens.httpview', 'golens.collapsed'].forEach(function (k) {
+  dashCfg = { version: 1, panels: [], order: { all_metrics: [], hooks: [], endpoints: [] }, http_card_view: '', timeframe: '', sections: bootSections() };
+  tfStartSec = 0;
+  ['golens.charts', 'golens.order', 'golens.hooksorder', 'golens.eporder', 'golens.httpview', 'golens.timeframe', 'golens.tfstart', 'golens.collapsed'].forEach(function (k) {
     try { localStorage.removeItem(k); } catch (e) {}
   });
   secCollapsed = {};
@@ -1267,7 +1387,7 @@ function runtimeHealth() {
     series: {},
     currentSysBytes: 0, currentHeapInuse: 0, currentMem: 0, currentHeapObj: 0, cpuPct: 0, currentGoro: 0,
     drag: null,
-    init() { this.refresh(); setInterval(() => { if (!document.hidden) this.refresh(); }, POLL_MS); },
+    init() { this.refresh(); setInterval(() => { if (!document.hidden) this.refresh(); }, POLL_MS); window.addEventListener('golens-tf', () => this.refresh()); },
     start(e) {
       if (!editMode()) return;
       var card = e.target.closest('.rt-card');
@@ -1300,8 +1420,12 @@ function runtimeHealth() {
       moveCard(cards, from, neighborIndex(cards, from, d), function () {});
     },
     refresh() {
+      // The charts anchor to their band's runtime block (block ids render at
+      // most once, so the id is unique); re-resolved every pass so selector
+      // changes land on the next refresh without a page reload.
+      this.duration = effectiveDuration(document.getElementById('runtime-charts'));
       metrics.forEach(m => {
-        fetchJSON('/metrics/history?name=' + m.key + '&duration=' + this.duration)
+        fetchJSON('/metrics/history?name=' + m.key + '&' + historyQS(this.duration))
           .then(d => {
             this.series[m.key] = d.points || [];
             // update current values from last point
@@ -1443,9 +1567,13 @@ function histogramTimeSeries() {
     init() {
       this.refresh();
       this.timer = setInterval(() => { if (!document.hidden) this.refresh(); }, POLL_MS);
+      window.addEventListener('golens-tf', () => this.refresh());
     },
 
     async refresh() {
+      // Re-resolve the effective timeframe every pass so selector changes
+      // land on the next refresh without a page reload.
+      this.duration = effectiveDuration(document.getElementById('histogram-timeseries'));
       try {
         // Fetch all histogram metrics from current data
         var metrics = await fetchJSON('/metrics/data?format=json');
@@ -1465,7 +1593,7 @@ function histogramTimeSeries() {
         // One batch request for every histogram series — the N+1 sequential
         // fetches this loop used to make are served by /metrics/history?names=.
         var names = this.histogramMetrics.map(m => m.name).join(',');
-        var histories = await fetchJSON('/metrics/history?names=' + encodeURIComponent(names) + '&duration=' + this.duration);
+        var histories = await fetchJSON('/metrics/history?names=' + encodeURIComponent(names) + '&' + historyQS(this.duration));
 
         for (const metric of this.histogramMetrics) {
           var history = (histories || {})[metric.name] || {};
@@ -1514,6 +1642,7 @@ function histogramTimeSeries() {
       });
       var dm = /^(\d+)([mhdw])$/.exec(this.duration || '');
       var durSec = dm ? dm[1] * { m: 60, h: 3600, d: 86400, w: 604800 }[dm[2]] : 0;
+      if (this.duration === 'custom' && tfStartSec) durSec = Math.max(1, Math.floor(Date.now() / 1000) - tfStartSec);
       if (tMax === tMin) {
         tMin = tMax - (durSec || 1);
       }

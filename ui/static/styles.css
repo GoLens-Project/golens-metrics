@@ -162,6 +162,21 @@ h1, h2, h3 { margin: 0; font-weight: 600; }
 }
 .btn-link:hover { color: var(--text-soft); }
 
+/* Timeframe selectors: the topbar's global control (+ its custom-start
+   picker) and the per-band override in each section header. */
+.tf-select, .sec-tf, .tf-start {
+  width: auto;
+  font-family: var(--font-mono);
+  font-size: 0.625rem;
+  padding: 0.25rem 0.4rem;
+  border-radius: 0.25rem;
+  border: 1px solid var(--border);
+  background: var(--surface-deep);
+  color: var(--text-body);
+}
+.tf-start { color: var(--text-muted); }
+.sec-tf { flex-shrink: 0; }
+
 /* Duration pills (runtime / histogram sections) */
 .pill {
   font-family: var(--font-mono);

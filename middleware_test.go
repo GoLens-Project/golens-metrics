@@ -203,3 +203,49 @@ func TestMiddlewareFuncEquivalent(t *testing.T) {
 		t.Errorf("MiddlewareFunc did not record: %v", s.Value)
 	}
 }
+
+// flushTracker counts Flush calls; the ResponseWriter embedding keeps it a
+// valid writer while adding http.Flusher.
+type flushTracker struct {
+	http.ResponseWriter
+	flushes int
+}
+
+func (w *flushTracker) Flush() { w.flushes++ }
+
+// flushlessWriter never implements http.Flusher, so a recorder wrapping it
+// must carry a nil Flusher and no-op its own Flush.
+type flushlessWriter struct {
+	http.ResponseWriter
+}
+
+// Streaming handlers (SSE, chunked) wrapped by the RED middleware must keep
+// flushing: the status recorder forwards Flush when the underlying writer
+// supports it and no-ops — never panics — when it does not.
+func TestStatusRecorderFlushForwarding(t *testing.T) {
+	r, cleanup := startTestRegistry(t)
+	defer cleanup()
+
+	stream := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.Write([]byte("chunk"))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		w.Write([]byte(" more"))
+	})
+
+	t.Run("forwarded when the writer flushes", func(t *testing.T) {
+		ft := &flushTracker{ResponseWriter: httptest.NewRecorder()}
+		r.Middleware(stream).ServeHTTP(ft, httptest.NewRequest("GET", "/stream", nil))
+		if ft.flushes != 1 {
+			t.Errorf("flushes = %d, want 1 forwarded to the underlying writer", ft.flushes)
+		}
+	})
+	t.Run("no-op when the writer cannot flush", func(t *testing.T) {
+		rr := httptest.NewRecorder()
+		r.Middleware(stream).ServeHTTP(&flushlessWriter{rr}, httptest.NewRequest("GET", "/stream", nil))
+		if rr.Body.String() != "chunk more" {
+			t.Errorf("body = %q, want both writes delivered", rr.Body.String())
+		}
+	})
+}

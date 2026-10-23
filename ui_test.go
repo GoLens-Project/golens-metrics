@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestMountUIRegistersRoutes(t *testing.T) {
@@ -948,6 +950,77 @@ func TestHistoryHTTPHandlerDisabled(t *testing.T) {
 	}
 }
 
+// The dashboard's custom timeframe choice fetches with an absolute ?start=
+// (unix seconds) instead of a ?duration= preset. The window it produces must
+// match the equivalent preset's window (a roll-up 90 minutes old falls inside
+// the 4h window and outside the 1h one), and malformed start values are
+// rejected.
+func TestHistoryHTTPHandlerCustomStart(t *testing.T) {
+	r := newTestRegistry(t, DefaultConfig())
+	ctx, cancel := context.WithCancel(context.Background())
+	r.Start(ctx)
+	defer func() { cancel(); r.Close() }()
+
+	// Seeded directly so its age is known; nothing is ever recorded through
+	// the registry, so the in-flight partial window stays empty.
+	now := time.Now()
+	if err := r.storage.Store(context.Background(), AggregatedMetric{
+		Name:        "tf_metric",
+		Count:       2,
+		Sum:         7,
+		WindowStart: now.Add(-2 * time.Hour),
+		WindowEnd:   now.Add(-90 * time.Minute),
+	}); err != nil {
+		t.Fatalf("seed storage: %v", err)
+	}
+
+	fetch := func(query string) (*httptest.ResponseRecorder, HistorySeries) {
+		t.Helper()
+		req := httptest.NewRequest("GET", "/history?"+query, nil)
+		rec := httptest.NewRecorder()
+		r.HistoryHTTPHandler().ServeHTTP(rec, req)
+		if rec.Code != 200 {
+			return rec, HistorySeries{}
+		}
+		var s HistorySeries
+		if err := json.Unmarshal(rec.Body.Bytes(), &s); err != nil {
+			t.Fatalf("decode %q: %v", rec.Body.String(), err)
+		}
+		return rec, s
+	}
+	startAt := func(d time.Duration) string {
+		return strconv.FormatInt(now.Add(d).Unix(), 10)
+	}
+
+	rec, wide := fetch("name=tf_metric&start=" + startAt(-4*time.Hour))
+	if rec.Code != 200 || wide.Name != "tf_metric" || len(wide.Points) != 1 {
+		t.Fatalf("start 4h: status = %d, series = %+v", rec.Code, wide)
+	}
+	rec, narrow := fetch("name=tf_metric&start=" + startAt(-time.Hour))
+	if rec.Code != 200 {
+		t.Fatalf("start 1h: status = %d, want 200", rec.Code)
+	}
+	if len(narrow.Points) != 0 {
+		t.Errorf("start 1h: got %d points, want the 90-minute-old roll-up excluded", len(narrow.Points))
+	}
+	rec, preset := fetch("name=tf_metric&duration=4h")
+	if rec.Code != 200 || len(preset.Points) != 1 {
+		t.Fatalf("duration 4h: status = %d, points = %d, want 1", rec.Code, len(preset.Points))
+	}
+	if preset.Points[0].V != wide.Points[0].V {
+		t.Errorf("start and duration windows diverge: %+v vs %+v", wide.Points, preset.Points)
+	}
+
+	for _, bad := range []string{"abc", "-5", "0", "1.5"} {
+		req := httptest.NewRequest("GET", "/history?name=tf_metric&start="+bad, nil)
+		rec := httptest.NewRecorder()
+		r.HistoryHTTPHandler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("start=%q: status = %d, want 400", bad, rec.Code)
+		}
+	}
+}
+
 func TestEndpointsHTTPHandlerDisabled(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.UI.Enabled = false
@@ -1200,6 +1273,21 @@ func renderDashboard(t *testing.T, r *Registry) string {
 	return rec.Body.String()
 }
 
+// markupWindow returns the body slice from the first marker occurrence to the
+// first end marker after it — the local window one rendered control occupies,
+// so option assertions stay scoped to that control.
+func markupWindow(body, marker, end string) string {
+	i := strings.Index(body, marker)
+	if i < 0 {
+		return ""
+	}
+	j := strings.Index(body[i:], end)
+	if j < 0 {
+		return ""
+	}
+	return body[i : i+j]
+}
+
 // staticAsset fetches an embedded dashboard asset from /metrics/static.
 func staticAsset(t *testing.T, r *Registry, name string) string {
 	t.Helper()
@@ -1304,6 +1392,64 @@ func TestDashboardPresetSectionsRender(t *testing.T) {
 	if !strings.Contains(body, `[{"id":"ops","name":"Ops","items":["internals","runtime-health"]},{"id":"tail","items":["all-metrics"]}]`) {
 		t.Error("client bootstrap missing the preset section list")
 	}
+}
+
+// The timeframe selectors are server-rendered: one dashboard-global select
+// (preset choices with custom last; the saved choice preselected, defaulting
+// to 1h), the datetime-local picker for the custom start, and a per-band
+// select with the band's override — or "global" — preselected. The client
+// bootstrap carries the band overrides so the page and the layout API cannot
+// diverge.
+func TestDashboardTimeframeSelectorsRender(t *testing.T) {
+	t.Run("defaults", func(t *testing.T) {
+		r := newConfigRegistry(t, DefaultConfig())
+		body := renderDashboard(t, r)
+
+		global := markupWindow(body, `id="tf-global"`, "</select>")
+		if global == "" {
+			t.Fatal("global timeframe select missing")
+		}
+		if !strings.Contains(global, `<option value="1h" selected>`) {
+			t.Error("global select does not default to 1h")
+		}
+		if !strings.Contains(global, `<option value="5m">`) {
+			t.Error("global select missing the preset choices")
+		}
+		if custom, lastPreset := strings.Index(global, `value="custom"`), strings.Index(global, `value="1w"`); custom < 0 || custom < lastPreset {
+			t.Errorf("custom choice at %d, want present after the presets (1w at %d)", custom, lastPreset)
+		}
+		if !strings.Contains(body, `id="tf-start"`) {
+			t.Error("custom start picker missing")
+		}
+		if !strings.Contains(body, `<option value="" selected>global</option>`) {
+			t.Error("band selects do not default to global")
+		}
+	})
+	t.Run("saved choices preselect", func(t *testing.T) {
+		r := newConfigRegistry(t, DefaultConfig())
+		doc := `{"version":1,"timeframe":"4h","order":{},"sections":[` +
+			`{"id":"main","items":["all-metrics"],"timeframe":"5m"},` +
+			`{"id":"spare","items":[]}]}`
+		if rec := configRequest(r.dashboardConfigHandler(), http.MethodPut, doc); rec.Code != 200 {
+			t.Fatalf("PUT status = %d, body %s", rec.Code, rec.Body.String())
+		}
+		body := renderDashboard(t, r)
+
+		if global := markupWindow(body, `id="tf-global"`, "</select>"); !strings.Contains(global, `<option value="4h" selected>`) {
+			t.Error("saved global timeframe not preselected")
+		}
+		main := markupWindow(body, `data-section="main"`, "</select>")
+		if !strings.Contains(main, `<option value="5m" selected>`) {
+			t.Error("band override not preselected in its own select")
+		}
+		spare := markupWindow(body, `data-section="spare"`, "</select>")
+		if !strings.Contains(spare, `<option value="" selected>`) {
+			t.Error("untouched band should keep global selected")
+		}
+		if !strings.Contains(body, `"timeframe":"5m"`) {
+			t.Error("client bootstrap missing the band override")
+		}
+	})
 }
 
 // View mode is frozen: every edit affordance carries .edit-only and the CSS

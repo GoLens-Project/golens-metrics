@@ -106,6 +106,8 @@ func TestDashboardConfigPutValidation(t *testing.T) {
 		{"bad chart type", `{"version":1,"panels":[{"id":"p1","metric":"m","chart_type":"pyramid"}]}`},
 		{"bad size", `{"version":1,"panels":[{"id":"p1","metric":"m","size":"xxl"}]}`},
 		{"bad http card view", `{"version":1,"http_card_view":"mega"}`},
+		{"bad timeframe", `{"version":1,"timeframe":"2h"}`},
+		{"bad section timeframe", `{"version":1,"sections":[{"id":"a","timeframe":"fortnight"}]}`},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -452,6 +454,117 @@ func TestDashboardConfigPutSectionsRoundTrip(t *testing.T) {
 	if !sameStrings(sectionIDs(got), []string{"main", "spare"}) {
 		t.Errorf("GET sections = %v, want [main spare]", sectionIDs(got))
 	}
+}
+
+// The dashboard-global timeframe and per-band overrides persist like the rest
+// of the document: every accepted vocabulary value (relative preset, custom)
+// round-trips PUT → GET, and a document omitting the fields clears them.
+func TestDashboardConfigTimeframeRoundTrip(t *testing.T) {
+	r := newConfigRegistry(t, DefaultConfig())
+	h := r.dashboardConfigHandler()
+
+	doc := `{"version":1,"timeframe":"4h","order":{},"sections":[` +
+		`{"id":"main","items":["all-metrics"],"timeframe":"5m"},` +
+		`{"id":"spare","items":[],"timeframe":"custom"}]}`
+	rec := configRequest(h, http.MethodPut, doc)
+	if rec.Code != 200 {
+		t.Fatalf("PUT status = %d, body %s", rec.Code, rec.Body.String())
+	}
+	saved := decodeConfig(t, rec)
+	if saved.Timeframe != "4h" {
+		t.Errorf("echoed timeframe = %q, want 4h", saved.Timeframe)
+	}
+	if len(saved.Sections) != 2 || saved.Sections[0].Timeframe != "5m" || saved.Sections[1].Timeframe != "custom" {
+		t.Errorf("echoed section timeframes = %+v", saved.Sections)
+	}
+
+	got := getDashboardConfig(t, r)
+	if got.Timeframe != "4h" || len(got.Sections) != 2 ||
+		got.Sections[0].Timeframe != "5m" || got.Sections[1].Timeframe != "custom" {
+		t.Errorf("GET after PUT = %+v", got)
+	}
+
+	// PUT replaces the whole document, so omitted timeframes clear again.
+	rec = configRequest(h, http.MethodPut, `{"version":1,"order":{},"sections":[{"id":"main","items":["all-metrics"]}]}`)
+	if rec.Code != 200 {
+		t.Fatalf("second PUT status = %d, body %s", rec.Code, rec.Body.String())
+	}
+	if got := getDashboardConfig(t, r); got.Timeframe != "" || got.Sections[0].Timeframe != "" {
+		t.Errorf("omitted timeframes must clear: %+v", got)
+	}
+}
+
+// A hand-edited document carries no validation guarantee: unsupported
+// timeframe values — global and per-band — are healed to "follow global" on
+// load, in memory; the file on disk stays untouched, matching the
+// broken-parent heal. An unhealed value would 400 every history fetch under
+// it and brick layout persistence once the band is PUT back.
+func TestDashboardConfigHealsTimeframesOnLoad(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dash.json")
+	authored := `{"version":1,"timeframe":"2h","order":{},"sections":[` +
+		`{"id":"a","items":[],"timeframe":"fortnight"},` +
+		`{"id":"b","items":[],"timeframe":"5m"}]}`
+	if err := os.WriteFile(path, []byte(authored), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := DefaultConfig()
+	cfg.UI.DashboardConfig = path
+	r := newConfigRegistry(t, cfg)
+	defer r.Close()
+
+	got := getDashboardConfig(t, r)
+	if got.Timeframe != "" {
+		t.Errorf("global timeframe = %q, want healed to empty", got.Timeframe)
+	}
+	byID := map[string]DashboardSection{}
+	for _, s := range got.Sections {
+		byID[s.ID] = s
+	}
+	if byID["a"].Timeframe != "" {
+		t.Errorf("section a timeframe = %q, want healed to empty", byID["a"].Timeframe)
+	}
+	if byID["b"].Timeframe != "5m" {
+		t.Errorf("section b timeframe = %q, want kept", byID["b"].Timeframe)
+	}
+	if data, err := os.ReadFile(path); err != nil || string(data) != authored {
+		t.Errorf("healing rewrote %s on disk", path)
+	}
+}
+
+// Presets reach the layout through neither the loader heal nor the PUT
+// validator, so seeding heals them too: an invalid band timeframe must not
+// survive into the served document, and healing must not mutate the caller's
+// preset slice, which may alias shared config state.
+func TestDashboardSectionsSeedHealsTimeframes(t *testing.T) {
+	t.Run("go preset", func(t *testing.T) {
+		r := newConfigRegistry(t, DefaultConfig())
+		r.PresetDashboardSections(
+			DashboardSection{ID: "a", Items: []string{BlockAllMetrics}, Timeframe: "fortnight"},
+			DashboardSection{ID: "b", Items: []string{BlockInternals}, Timeframe: "5m"},
+		)
+		byID := map[string]DashboardSection{}
+		for _, s := range getDashboardConfig(t, r).Sections {
+			byID[s.ID] = s
+		}
+		if byID["a"].Timeframe != "" {
+			t.Errorf("go preset timeframe = %q, want healed to empty", byID["a"].Timeframe)
+		}
+		if byID["b"].Timeframe != "5m" {
+			t.Errorf("valid preset timeframe = %q, want kept", byID["b"].Timeframe)
+		}
+	})
+	t.Run("yaml preset", func(t *testing.T) {
+		yamlPreset := []DashboardSection{{ID: "y", Items: []string{BlockInternals}, Timeframe: "fortnight"}}
+		cfg := DefaultConfig()
+		cfg.UI.DashboardSections = yamlPreset
+		r := newConfigRegistry(t, cfg)
+		if secs := getDashboardConfig(t, r).Sections; len(secs) != 1 || secs[0].Timeframe != "" {
+			t.Errorf("yaml preset sections = %+v, want the invalid timeframe healed to empty", secs)
+		}
+		if yamlPreset[0].Timeframe != "fortnight" {
+			t.Errorf("healing mutated the caller's preset: %+v", yamlPreset)
+		}
+	})
 }
 
 // Seed priority while no document has been saved: Go preset > YAML fallback >

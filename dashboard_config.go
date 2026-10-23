@@ -48,6 +48,10 @@ type DashboardConfig struct {
 	// HTTPCardView selects the HTTP status card's column set:
 	// "breakdown" (2xx-5xx + total, default) or "totals" (total + errors).
 	HTTPCardView string `json:"http_card_view,omitempty"`
+	// Timeframe is the dashboard-global chart window: a relative preset
+	// (5m,30m,1h,4h,12h,24h,1w) or "custom" (start-moment driven, the moment
+	// itself stays client-side). Empty = the client default (1h).
+	Timeframe string `json:"timeframe,omitempty"`
 	// Sections places dashboard content into named horizontal bands. Items
 	// are well-known block ids or pinned-panel ids; order inside Items is
 	// render order. Absent (or empty) Sections renders the built-in default
@@ -68,6 +72,10 @@ type DashboardSection struct {
 	Name   string   `json:"name,omitempty"`
 	Items  []string `json:"items,omitempty"`
 	Parent string   `json:"parent,omitempty"`
+	// Timeframe overrides the global chart window for the charts in this
+	// band; nested bands inherit the nearest ancestor's override. Empty =
+	// follow the global value.
+	Timeframe string `json:"timeframe,omitempty"`
 }
 
 // DashboardPanel is one pinned dashboard panel. ChartType and Size are the
@@ -91,6 +99,17 @@ var (
 	validPanelSizes      = map[string]bool{"": true, "sm": true, "md": true, "lg": true}
 	validHTTPCardViews   = map[string]bool{"": true, httpViewBreakdown: true, httpViewTotals: true}
 )
+
+// validTimeframes is the accepted timeframe vocabulary: empty (= follow the
+// global value), the relative presets (the defaultDurations keys), and
+// "custom". PUT rejects anything else; load heals anything else to empty.
+var validTimeframes = func() map[string]bool {
+	m := map[string]bool{"": true}
+	for _, tf := range timeframeChoices {
+		m[tf] = true
+	}
+	return m
+}()
 
 // DashboardOrder holds the user's drag-reorder arrangement per section.
 type DashboardOrder struct {
@@ -266,6 +285,24 @@ func healDashboardSections(d *DashboardConfig) []string {
 	return healed
 }
 
+// healTimeframes copies secs with unsupported timeframe values cleared.
+// loadDashboardConfig applies it to saved documents; seedSections applies it
+// to presets, which reach the client through neither the loader heal nor the
+// PUT validator — the two ingestion paths an invalid value must not survive,
+// or it 400s every history fetch in the band and bricks layout persistence
+// (persistDash retries forever) once the band is PUT back. The input may
+// alias shared config/preset state, so healing happens on a copy.
+func healTimeframes(secs []DashboardSection) []DashboardSection {
+	out := make([]DashboardSection, len(secs))
+	for i, s := range secs {
+		if !validTimeframes[s.Timeframe] {
+			s.Timeframe = ""
+		}
+		out[i] = s
+	}
+	return out
+}
+
 // loadDashboardConfig reads the persisted layout document at construction
 // time. A missing file or empty path yields defaults; a corrupt or
 // wrong-version file logs a warning and falls back to defaults — a broken
@@ -298,6 +335,14 @@ func (r *Registry) loadDashboardConfig() *DashboardConfig {
 	if healed := healDashboardSections(&d); len(healed) > 0 {
 		log.Printf("[golens] warning: dashboard config %s: sections with broken parents promoted to top level: %s", r.dashPath, strings.Join(healed, ", "))
 	}
+	// Heal unsupported timeframes (hand-edited files, or presets — which
+	// bypass both this loader and the PUT validator; see healTimeframes): an
+	// invalid value would otherwise poison every history fetch with a
+	// 400-ing duration and brick layout persistence on the next PUT.
+	if !validTimeframes[d.Timeframe] {
+		d.Timeframe = ""
+	}
+	d.Sections = healTimeframes(d.Sections)
 	r.dashSaved = true
 	return &d
 }
@@ -308,7 +353,7 @@ func (r *Registry) loadDashboardConfig() *DashboardConfig {
 // half-applied, falling through to the next surface.
 func (r *Registry) seedSections() []DashboardSection {
 	if len(r.dashPreset) > 0 {
-		return r.dashPreset
+		return healTimeframes(r.dashPreset)
 	}
 	if len(r.cfg.UI.DashboardSections) > 0 {
 		// Presets run before any panels exist, so they may only place blocks —
@@ -317,7 +362,7 @@ func (r *Registry) seedSections() []DashboardSection {
 		if err := validateDashboardSections(r.cfg.UI.DashboardSections, nil); err != nil {
 			log.Printf("[golens] warning: ignoring invalid dashboard_sections preset: %v", err)
 		} else {
-			return r.cfg.UI.DashboardSections
+			return healTimeframes(r.cfg.UI.DashboardSections)
 		}
 	}
 	return defaultDashboardSections()
@@ -418,6 +463,16 @@ func (r *Registry) dashboardConfigHandler() http.HandlerFunc {
 			if !validHTTPCardViews[d.HTTPCardView] {
 				writeJSONError(w, "http_card_view must be breakdown or totals", http.StatusBadRequest)
 				return
+			}
+			if !validTimeframes[d.Timeframe] {
+				writeJSONError(w, "timeframe must be a preset (5m,30m,1h,4h,12h,24h,1w), custom, or empty", http.StatusBadRequest)
+				return
+			}
+			for _, s := range d.Sections {
+				if !validTimeframes[s.Timeframe] {
+					writeJSONError(w, "section timeframe must be a preset (5m,30m,1h,4h,12h,24h,1w), custom, or empty", http.StatusBadRequest)
+					return
+				}
 			}
 			if err := validateDashboardSections(d.Sections, d.Panels); err != nil {
 				writeJSONError(w, err.Error(), http.StatusBadRequest)
