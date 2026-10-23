@@ -19,10 +19,11 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Determine version bump from PR label
+      - name: Determine version bump from PR label or branch prefix
         id: bump
         run: |
           LABELS=$(gh pr view ${{ github.event.pull_request.number }} --json labels --jq '.labels[].name')
+          PREFIX=$(echo "${{ github.event.pull_request.head.ref }}" | cut -d/ -f1)
 
           BUMP=""
           for label in $LABELS; do
@@ -34,7 +35,16 @@ jobs:
           done
 
           if [ -z "$BUMP" ]; then
-            echo "::error::No version label (major/minor/patch) found on PR. Add one before merging."
+            for version in major minor patch; do
+              if [ "$PREFIX" = "$version" ]; then
+                BUMP="$version"
+                break
+              fi
+            done
+          fi
+
+          if [ -z "$BUMP" ]; then
+            echo "::error::No version label (major/minor/patch) or branch prefix (major/*, minor/*, patch/*) found on PR. Add one before merging."
             exit 1
           fi
 
