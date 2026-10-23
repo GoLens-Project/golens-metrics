@@ -278,7 +278,7 @@ The JSON schema is the stable contract for external consumers. Each metric objec
 
 #### Dashboard layout, sections, and edit mode
 
-The dashboard's customization lives in one versioned JSON document, persisted atomically to `ui.dashboard_config` and served at `GET`/`PUT`/`DELETE` `/metrics/config`. `DELETE` removes the saved document (the reset state). The document fields:
+The dashboard's customization lives in one versioned JSON document, persisted atomically to the configured store — the `ui.dashboard_config_db` sqlite database (a single-row document; may name the same database as `storage.path`) when set, else the `ui.dashboard_config` file — and served at `GET`/`PUT`/`DELETE` `/metrics/config`. When the sqlite option is set it wins: the file path is ignored. `DELETE` removes the saved document (the reset state). The document fields:
 
 | Field | Type | Meaning |
 |---|---|---|

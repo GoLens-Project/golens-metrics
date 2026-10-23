@@ -46,7 +46,9 @@ type Registry struct {
 	auth authState
 
 	// Dashboard layout document (pinned panels + section order) and its
-	// optional on-disk persistence path. Guarded by dashMu. dashPreset is
+	// optional persistence store: dashPath (the ui.dashboard_config file) or
+	// dashDB (the ui.dashboard_config_db sqlite database) — exactly one is
+	// active, neither means memory-only. Guarded by dashMu. dashPreset is
 	// the Go-API section preset; per D4 it is registered once at startup
 	// (before the UI mounts). dashSaved marks that
 	// a real document exists (loaded or PUT) — presets seed only before the
@@ -54,6 +56,7 @@ type Registry struct {
 	dashMu     sync.Mutex
 	dash       *DashboardConfig
 	dashPath   string
+	dashDB     *sql.DB
 	dashPreset []DashboardSection
 	dashSaved  bool
 
@@ -171,9 +174,22 @@ func New(cfg Config) (*Registry, error) {
 		r.exporter = newOTLPExporter(cfg.OTLP)
 	}
 
-	// Dashboard layout persistence: load the saved document, falling back to
-	// defaults when unset or unreadable.
-	r.dashPath = cfg.UI.DashboardConfig
+	// Dashboard layout persistence: the sqlite store wins when configured
+	// (the file path is then not consulted), else the file path applies.
+	// Load the saved document, falling back to defaults when unset or
+	// unreadable.
+	if cfg.UI.DashboardConfigDB != "" {
+		db, err := newDashConfigDB(cfg.UI.DashboardConfigDB)
+		if err != nil {
+			return nil, err
+		}
+		r.dashDB = db
+		if cfg.UI.DashboardConfig != "" {
+			log.Printf("[golens] warning: ui.dashboard_config %q ignored; ui.dashboard_config_db takes precedence", cfg.UI.DashboardConfig)
+		}
+	} else {
+		r.dashPath = cfg.UI.DashboardConfig
+	}
 	r.dash = r.loadDashboardConfig()
 
 	// Pre-register the canonical RED metrics so they always exist.
@@ -391,6 +407,9 @@ func (r *Registry) finalFlush() {
 	}
 	if r.alertStore != nil {
 		_ = r.alertStore.Close()
+	}
+	if r.dashDB != nil {
+		_ = r.dashDB.Close()
 	}
 	_ = r.storage.Close()
 }

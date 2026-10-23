@@ -35,6 +35,10 @@ ui:
   # persisted to via GET/PUT/DELETE /metrics/config. Empty = memory only, and
   # browsers fall back to localStorage.
   # dashboard_config: /var/lib/myapp/golens-dashboard.json
+  # SQLite database the dashboard layout is persisted to instead of a file
+  # (single-row JSON document; may name the same database as storage.path).
+  # When set it wins over dashboard_config, whose path is then ignored.
+  # dashboard_config_db: /var/lib/myapp/golens.db
   # Section layout preset (YAML fallback; a PresetDashboardSections Go call
   # wins when both exist). Seed-once: applied only while no layout document
   # has been saved. Each section is a horizontal band; "items" reference

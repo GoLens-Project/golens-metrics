@@ -75,6 +75,12 @@ type UIConfig struct {
 	// document lives in registry memory only (and clients fall back to
 	// localStorage).
 	DashboardConfig string `yaml:"dashboard_config"`
+	// DashboardConfigDB is the sqlite database the dashboard layout document
+	// is persisted to instead of a file (single-row JSON document; may name
+	// the same database as storage.path). When set it wins over
+	// DashboardConfig: the file path is ignored (with a startup warning).
+	// Empty keeps the file/memory behavior above.
+	DashboardConfigDB string `yaml:"dashboard_config_db"`
 	// DashboardSections presets the dashboard's section layout (the YAML
 	// fallback surface; a PresetDashboardSections Go call wins when both
 	// exist). Seed-once: applied only while no layout document has been
