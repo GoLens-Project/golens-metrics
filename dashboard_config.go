@@ -38,9 +38,10 @@ var wellKnownBlocks = map[string]bool{
 // for the dashboard's client-side layout; localStorage acts only as a
 // write-through cache/fallback.
 //
-// A single versioned JSON document is persisted atomically (temp file +
-// rename) to cfg.UI.DashboardConfig. An empty path keeps the document in
-// registry memory only.
+// A single versioned JSON document is persisted atomically to the configured
+// store: the ui.dashboard_config_db sqlite database (single-row upsert) when
+// set, else the ui.dashboard_config file (temp file + rename). Neither set
+// keeps the document in registry memory only.
 type DashboardConfig struct {
 	Version int              `json:"version"`
 	Panels  []DashboardPanel `json:"panels"`
@@ -303,37 +304,61 @@ func healTimeframes(secs []DashboardSection) []DashboardSection {
 	return out
 }
 
-// loadDashboardConfig reads the persisted layout document at construction
-// time. A missing file or empty path yields defaults; a corrupt or
-// wrong-version file logs a warning and falls back to defaults — a broken
-// dashboard file must never crash startup. A successfully loaded document
-// marks the registry as "saved" (dashSaved): presets seed only before the
-// first save, never over an existing document. A loaded document with broken
-// parent pointers is healed in memory (one warning line), so GET always
-// serves the layout rendering uses.
+// dashStoreName is the persistence location named in dashboard-config log
+// lines: the sqlite database path when that backend is active, else the file
+// path (empty in memory-only mode).
+func (r *Registry) dashStoreName() string {
+	if r.dashDB != nil {
+		return r.cfg.UI.DashboardConfigDB
+	}
+	return r.dashPath
+}
+
+// loadDashboardConfig reads the persisted layout document from the active
+// store at construction time. A missing document or empty store yields
+// defaults; a corrupt or wrong-version document logs a warning and falls back
+// to defaults — a broken dashboard document must never crash startup. A
+// successfully loaded document marks the registry as "saved" (dashSaved):
+// presets seed only before the first save, never over an existing document. A
+// loaded document with broken parent pointers is healed in memory (one
+// warning line), so GET always serves the layout rendering uses.
 func (r *Registry) loadDashboardConfig() *DashboardConfig {
 	def := defaultDashboardConfig()
-	if r.dashPath == "" {
-		return def
-	}
-	data, err := os.ReadFile(r.dashPath)
-	if err != nil {
-		if !os.IsNotExist(err) {
-			log.Printf("[golens] warning: cannot read dashboard config %s: %v; using defaults", r.dashPath, err)
+	var data []byte
+	switch {
+	case r.dashDB != nil:
+		d, exists, err := dashConfigLoad(r.dashDB)
+		if err != nil {
+			log.Printf("[golens] warning: cannot read dashboard config from %s: %v; using defaults", r.dashStoreName(), err)
+			return def
 		}
+		if !exists {
+			return def
+		}
+		data = d
+	case r.dashPath != "":
+		d, err := os.ReadFile(r.dashPath)
+		if err != nil {
+			if !os.IsNotExist(err) {
+				log.Printf("[golens] warning: cannot read dashboard config %s: %v; using defaults", r.dashStoreName(), err)
+			}
+			return def
+		}
+		data = d
+	default:
 		return def
 	}
 	var d DashboardConfig
 	if err := json.Unmarshal(data, &d); err != nil {
-		log.Printf("[golens] warning: corrupt dashboard config %s: %v; using defaults", r.dashPath, err)
+		log.Printf("[golens] warning: corrupt dashboard config %s: %v; using defaults", r.dashStoreName(), err)
 		return def
 	}
 	if d.Version != 1 {
-		log.Printf("[golens] warning: dashboard config %s has unsupported version %d (need 1); using defaults", r.dashPath, d.Version)
+		log.Printf("[golens] warning: dashboard config %s has unsupported version %d (need 1); using defaults", r.dashStoreName(), d.Version)
 		return def
 	}
 	if healed := healDashboardSections(&d); len(healed) > 0 {
-		log.Printf("[golens] warning: dashboard config %s: sections with broken parents promoted to top level: %s", r.dashPath, strings.Join(healed, ", "))
+		log.Printf("[golens] warning: dashboard config %s: sections with broken parents promoted to top level: %s", r.dashStoreName(), strings.Join(healed, ", "))
 	}
 	// Heal unsupported timeframes (hand-edited files, or presets — which
 	// bypass both this loader and the PUT validator; see healTimeframes): an
@@ -383,15 +408,20 @@ func (r *Registry) effectiveSections(d *DashboardConfig) []DashboardSection {
 	return defaultDashboardSections()
 }
 
-// persistDashboardConfig atomically writes the layout document. Caller holds
-// dashMu. A no-op when no path is configured (memory-only mode).
+// persistDashboardConfig atomically writes the layout document to the active
+// store: a single-row upsert when the sqlite backend is configured, else a
+// temp-file write + rename. Caller holds dashMu. A no-op when no store is
+// configured (memory-only mode).
 func (r *Registry) persistDashboardConfig(d *DashboardConfig) error {
-	if r.dashPath == "" {
+	if r.dashPath == "" && r.dashDB == nil {
 		return nil
 	}
 	data, err := json.MarshalIndent(d, "", "  ")
 	if err != nil {
 		return err
+	}
+	if r.dashDB != nil {
+		return dashConfigPersist(r.dashDB, data)
 	}
 	tmp := r.dashPath + ".tmp"
 	// Best-effort cleanup: a failed write (partial file) or a failed rename
@@ -511,10 +541,16 @@ func (r *Registry) dashboardConfigHandler() http.HandlerFunc {
 			r.dashMu.Lock()
 			defer r.dashMu.Unlock()
 			// Remove the persisted document instead of writing defaults: a
-			// missing file is the "no saved document" state, so presets
+			// missing document is the "no saved document" state, so presets
 			// re-seed after a reset (seed-once). The in-memory document
 			// falls back to defaults either way.
-			if r.dashPath != "" {
+			switch {
+			case r.dashDB != nil:
+				if err := dashConfigDelete(r.dashDB); err != nil {
+					writeJSONError(w, err.Error(), http.StatusInternalServerError)
+					return
+				}
+			case r.dashPath != "":
 				if err := os.Remove(r.dashPath); err != nil && !os.IsNotExist(err) {
 					writeJSONError(w, err.Error(), http.StatusInternalServerError)
 					return
