@@ -227,6 +227,7 @@ type sectionView struct {
 	Items     []string // well-known block ids, render order
 	Hidden    bool     // nothing to show yet: no rendered blocks and no panel items
 	Parent    string   // section id this band nests under; empty = top level
+	Timeframe string   // chart-window override for this band; empty = follow global
 	hasPanels bool     // panel items exist (placed client-side), keeping the band visible
 }
 
@@ -246,7 +247,7 @@ type secRender struct {
 func buildSectionViews(secs []DashboardSection, runtimeEnabled bool, hookCards []metricCard) []sectionView {
 	out := make([]sectionView, 0, len(secs))
 	for _, s := range secs {
-		v := sectionView{ID: s.ID, Name: s.Name, Parent: s.Parent}
+		v := sectionView{ID: s.ID, Name: s.Name, Parent: s.Parent, Timeframe: s.Timeframe}
 		hasPanels := false
 		for _, item := range s.Items {
 			if !wellKnownBlocks[item] {
@@ -323,6 +324,7 @@ func (r *Registry) metricsPageHandler() http.Handler {
 		// client bootstrap, so the two can never diverge.
 		r.dashMu.Lock()
 		secs := r.effectiveSections(r.dash)
+		tf := r.dash.Timeframe
 		r.dashMu.Unlock()
 		secsJSON, err := json.Marshal(secs)
 		if err != nil {
@@ -334,6 +336,8 @@ func (r *Registry) metricsPageHandler() http.Handler {
 			"Cards":             buildCardsOpts(snaps, r.cardOptions()),
 			"HookCards":         hookCards,
 			"SectionsJSON":      template.JS(secsJSON),
+			"Timeframe":         tf,
+			"Timeframes":        timeframeChoices,
 			"Interval":          r.cfg.UI.PollInterval.String(),
 			"RuntimeEnabled":    r.cfg.RuntimeMetrics.Enabled,
 			"ProjectName":       r.cfg.ProjectName,
@@ -390,17 +394,36 @@ var defaultDurations = map[string]time.Duration{
 	"1w":  7 * 24 * time.Hour,
 }
 
+// timeframeChoices is the dashboard selector's ordered choice list: the
+// relative presets (keys of defaultDurations, in display order) with the
+// custom start last. The custom choice fetches with ?start= instead of a
+// ?duration= preset.
+var timeframeChoices = []string{"5m", "30m", "1h", "4h", "12h", "24h", "1w", "custom"}
+
 func (r *Registry) metricsHistoryHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, req *http.Request) {
 		q := req.URL.Query()
-		durStr := q.Get("duration")
-		if durStr == "" {
-			durStr = "1h"
-		}
-		dur, ok := defaultDurations[durStr]
-		if !ok {
-			http.Error(w, "invalid duration; use 5m,30m,1h,4h,12h,24h,1w", http.StatusBadRequest)
-			return
+		var dur time.Duration
+		if startStr := q.Get("start"); startStr != "" {
+			// Custom start: an absolute unix-seconds "from" overriding the
+			// relative presets (the dashboard's custom timeframe choice).
+			sec, err := strconv.ParseInt(startStr, 10, 64)
+			if err != nil || sec <= 0 {
+				http.Error(w, "invalid start; use unix seconds", http.StatusBadRequest)
+				return
+			}
+			dur = time.Since(time.Unix(sec, 0))
+		} else {
+			durStr := q.Get("duration")
+			if durStr == "" {
+				durStr = "1h"
+			}
+			d, ok := defaultDurations[durStr]
+			if !ok {
+				http.Error(w, "invalid duration; use 5m,30m,1h,4h,12h,24h,1w", http.StatusBadRequest)
+				return
+			}
+			dur = d
 		}
 		// Batch form: /metrics/history?names=a,b,c returns {name: HistorySeries}
 		// so a panel grid costs one request per refresh.
@@ -1093,6 +1116,13 @@ const dashboardSrc = `<!DOCTYPE html>
     <span id="alert-count" class="status-pill status-pill-alert" hidden></span>
     <button onclick="document.body.dataset.alertAdd='1'" class="btn">+ Add Alert</button>
     {{end}}
+    <!-- Dashboard timeframe: one global choice; a band's own selector
+         (template "sec") overrides it for that band's charts. "custom" swaps
+         the relative window for a start moment picked below. -->
+    <select id="tf-global" class="input tf-select" title="Dashboard timeframe" aria-label="Dashboard timeframe" onchange="setGlobalTimeframe(this.value)">
+      {{$cur := .Timeframe}}{{if not $cur}}{{$cur = "1h"}}{{end}}{{range .Timeframes}}<option value="{{.}}"{{if eq $cur .}} selected{{end}}>{{.}}</option>{{end}}
+    </select>
+    <input id="tf-start" type="datetime-local" class="input tf-start" title="Custom start time" aria-label="Custom start time" hidden onchange="setCustomStart(this.value)">
     <label class="pause-toggle">
       <input type="checkbox" class="check" id="pause-check" onchange="setPaused(this.checked)"> pause
     </label>
@@ -1126,6 +1156,11 @@ const dashboardSrc = `<!DOCTYPE html>
   <div class="sec-head" role="button" tabindex="0" aria-label="Toggle section">
     <span class="sec-rule sec-rule-lead"></span>
     <span class="sec-name">{{.Name}}</span>
+    <!-- Band timeframe override: empty = follow the dashboard-global choice. -->
+    <select class="sec-tf" title="Section timeframe" aria-label="Timeframe for {{.Name}}" onchange="setSectionTimeframe(this)">
+      <option value=""{{if not .Timeframe}} selected{{end}}>global</option>
+      {{range $tf := $.Data.Timeframes}}<option value="{{$tf}}"{{if eq $tf $.Timeframe}} selected{{end}}>{{$tf}}</option>{{end}}
+    </select>
     <span class="sec-rule"></span>
     <svg class="sec-chev" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><path fill-rule="evenodd" d="M14.77 12.79a.75.75 0 01-1.06-.02L10 8.832 6.29 12.77a.75.75 0 11-1.08-1.04l4.25-4.5a.75.75 0 011.08 0l4.25 4.5a.75.75 0 01.02 1.06z" clip-rule="evenodd"/></svg>
   </div>
@@ -1335,15 +1370,11 @@ const dashboardSrc = `<!DOCTYPE html>
 </html>
 
 {{define "block-runtime"}}
-<!-- Runtime Health: time-series charts for memory, CPU, goroutines -->
+<!-- Runtime Health: time-series charts for memory, CPU, goroutines.
+     The charts fetch with the band's effective timeframe (the band header
+     selector, else the dashboard-global one); the per-block pill row this
+     block used to carry was superseded by those selectors. -->
 <div x-data="runtimeHealth()" x-cloak>
-  <div class="row">
-    <div class="row-tight">
-      <template x-for="d in ['5m','30m','1h','4h','12h','24h','1w']" :key="d">
-        <button @click="duration=d; refresh()" class="pill" :class="duration===d ? 'active' : ''" x-text="d"></button>
-      </template>
-    </div>
-  </div>
 
   <!-- Runtime charts container for drag-to-reorder. Cards carry the
        rt-card class so the drop handler selects exactly the card elements
@@ -1419,15 +1450,9 @@ const dashboardSrc = `<!DOCTYPE html>
 {{end}}
 
 {{define "block-histogram"}}
-<!-- Histogram Time-Series: bucket distribution evolution over time -->
+<!-- Histogram Time-Series: bucket distribution evolution over time, fetched
+     with the band's effective timeframe (band header selector, else global). -->
 <div x-data="histogramTimeSeries()" class="section-histogram" x-cloak>
-  <div class="row">
-    <div class="row-tight">
-      <template x-for="d in ['5m','30m','1h','4h','12h','24h','1w']" :key="d">
-        <button @click="duration=d; refresh()" class="pill" :class="duration===d ? 'active' : ''" x-text="d"></button>
-      </template>
-    </div>
-  </div>
 
   <!-- Histogram charts grid -->
   <div id="histogram-timeseries" class="grid grid-half-lg">

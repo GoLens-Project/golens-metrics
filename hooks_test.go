@@ -96,6 +96,112 @@ func TestRequestCountMiddleware(t *testing.T) {
 	}
 }
 
+// The dashboard's HTTP status card reads fixed per-class child counters by
+// exact name; a mount of the convenience chain that fed only the labeled
+// parent rendered a live total over zeroed 2xx-5xx columns. The chain must
+// record the same children the canonical middleware does, so the card's
+// breakdown populates (this failed before RequestCountMiddleware wrapped the
+// writer and recorded the class counters), and the columns must sum to the
+// parent total.
+func TestRequestCountMiddlewareFeedsHTTPCardBreakdown(t *testing.T) {
+	r, cleanup := startTestRegistry(t)
+	defer cleanup()
+
+	statuses := map[string]int{"/ok": 200, "/moved": 301, "/missing": 404, "/boom": 500}
+	h := r.RequestCountMiddleware(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.WriteHeader(statuses[req.URL.Path])
+	}))
+	for path := range statuses {
+		h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", path, nil))
+	}
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/ok", nil)) // second 2xx
+	waitForDrain(r)
+
+	s, _ := r.Snapshot("http_requests_total")
+	if s.Value != 5 {
+		t.Fatalf("count = %v, want 5", s.Value)
+	}
+	want := map[string]float64{
+		"http_requests_total_2xx": 2,
+		"http_requests_total_3xx": 1,
+		"http_requests_total_4xx": 1,
+		"http_requests_total_5xx": 1,
+	}
+	for name, wantN := range want {
+		if got, _ := r.Snapshot(name); got.Value != wantN {
+			t.Errorf("%s = %v, want %v", name, got.Value, wantN)
+		}
+	}
+
+	cards := buildHTTPCard(r.Snapshots())
+	if len(cards) != 1 {
+		t.Fatalf("cards = %d, want 1", len(cards))
+	}
+	colMap := map[string]float64{}
+	var classSum float64
+	for _, col := range cards[0].HTTPColumns {
+		colMap[col.Label] = col.Value
+		if col.Label != "total" {
+			classSum += col.Value
+		}
+	}
+	for label, wantN := range map[string]float64{"2xx": 2, "3xx": 1, "4xx": 1, "5xx": 1, "total": 5} {
+		if colMap[label] != wantN {
+			t.Errorf("column %s = %v, want %v", label, colMap[label], wantN)
+		}
+	}
+	if classSum != colMap["total"] {
+		t.Errorf("class columns sum to %v, want the parent total %v", classSum, colMap["total"])
+	}
+}
+
+// The three-piece chain must record exactly what the canonical Middleware
+// records — counts plus per-class children here, duration plus the endpoint
+// histogram in the latency member, errors in the error member — so nothing is
+// double-counted across members.
+func TestConvenienceChainMatchesCanonicalMiddleware(t *testing.T) {
+	r, cleanup := startTestRegistry(t)
+	defer cleanup()
+
+	next := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path == "/missing" {
+			w.WriteHeader(404)
+			return
+		}
+		w.WriteHeader(200)
+	})
+	h := r.RequestCountMiddleware(r.LatencyMiddleware(r.ErrorRateMiddleware(next)))
+
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/ok", nil))
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/ok", nil))
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/missing", nil))
+	waitForDrain(r)
+
+	want := map[string]float64{
+		"http_requests_total":       3,
+		"http_requests_total_2xx":   2,
+		"http_requests_total_4xx":   1,
+		"http_request_errors_total": 1,
+	}
+	for name, wantN := range want {
+		if got, _ := r.Snapshot(name); got.Value != wantN {
+			t.Errorf("%s = %v, want %v", name, got.Value, wantN)
+		}
+	}
+	if dur, _ := r.Snapshot("http_request_duration_seconds"); dur.Count != 3 {
+		t.Errorf("duration count = %d, want 3", dur.Count)
+	}
+	// One latency sample per request across the whole chain: the endpoint
+	// histogram must not be observed twice.
+	var observed int64
+	for _, e := range r.endpoints.Snapshots() {
+		observed += e.Count
+	}
+	if observed != 3 {
+		t.Errorf("endpoint observations = %d, want 3", observed)
+	}
+}
+
 func TestLatencyMiddleware(t *testing.T) {
 	r, cleanup := startTestRegistry(t)
 	defer cleanup()

@@ -98,16 +98,27 @@ func (h *HookBuilder) Extract(fn ExtractFunc) func(http.Handler) http.Handler {
 	}
 }
 
-// Convenience chain middlewares (the "middleware chain" style).
+// Convenience chain middlewares (the "middleware chain" style). Together the
+// three record every series the canonical Middleware records — counts plus
+// per-class children here, duration plus the endpoint histogram in
+// LatencyMiddleware, errors in ErrorRateMiddleware — so any mount of the
+// chain feeds the dashboard's HTTP status breakdown. The chain's labeled
+// parent omits the status label the canonical one carries.
 func (r *Registry) RequestCountMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		if r.shouldTrack(req.URL.Path) {
-			r.Record("http_requests_total", 1,
-				Label{Name: "method", Value: req.Method},
-				Label{Name: "path", Value: req.URL.Path},
-			)
+		if !r.shouldTrack(req.URL.Path) {
+			next.ServeHTTP(w, req)
+			return
 		}
-		next.ServeHTTP(w, req)
+		rec := newStatusRecorder(w)
+		next.ServeHTTP(rec, req)
+		r.Record("http_requests_total", 1,
+			Label{Name: "method", Value: req.Method},
+			Label{Name: "path", Value: req.URL.Path},
+		)
+		if class := statusClassName(rec.status); class != "" {
+			r.Record("http_requests_total_"+class, 1)
+		}
 	})
 }
 
@@ -116,17 +127,19 @@ func (r *Registry) LatencyMiddleware(next http.Handler) http.Handler {
 		start := time.Now()
 		next.ServeHTTP(w, req)
 		if r.shouldTrack(req.URL.Path) {
-			r.Record("http_request_duration_seconds", time.Since(start).Seconds(),
+			duration := time.Since(start).Seconds()
+			r.Record("http_request_duration_seconds", duration,
 				Label{Name: "method", Value: req.Method},
 				Label{Name: "path", Value: req.URL.Path},
 			)
+			r.endpoints.Observe(req.Method, req.URL.Path, duration)
 		}
 	})
 }
 
 func (r *Registry) ErrorRateMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		rec := &statusRecorder{ResponseWriter: w, status: 200}
+		rec := newStatusRecorder(w)
 		next.ServeHTTP(rec, req)
 		if rec.status >= 400 && r.shouldTrack(req.URL.Path) {
 			r.Record("http_request_errors_total", 1,

@@ -6,15 +6,35 @@ import (
 	"time"
 )
 
-// statusRecorder captures the response status code for RED collection.
+// statusRecorder captures the response status code for RED collection. Flush
+// is forwarded when the underlying writer supports it, so streaming handlers
+// (SSE, chunked responses) wrapped by the RED middleware keep working; when
+// it doesn't, the carried Flusher stays nil and Flush is a no-op.
 type statusRecorder struct {
 	http.ResponseWriter
-	status int
+	status  int
+	flusher http.Flusher // non-nil when ResponseWriter implements http.Flusher
 }
 
 func (s *statusRecorder) WriteHeader(code int) {
 	s.status = code
 	s.ResponseWriter.WriteHeader(code)
+}
+
+func (s *statusRecorder) Flush() {
+	if s.flusher != nil {
+		s.flusher.Flush()
+	}
+}
+
+// newStatusRecorder wraps w. The only constructor, so the Flusher carry is
+// never forgotten at a call site.
+func newStatusRecorder(w http.ResponseWriter) *statusRecorder {
+	rec := &statusRecorder{ResponseWriter: w, status: 200}
+	if f, ok := w.(http.Flusher); ok {
+		rec.flusher = f
+	}
+	return rec
 }
 
 // Middleware is the canonical HTTP middleware. It records RED metrics for
@@ -28,7 +48,7 @@ func (r *Registry) Middleware(next http.Handler) http.Handler {
 			return
 		}
 
-		rec := &statusRecorder{ResponseWriter: w, status: 200}
+		rec := newStatusRecorder(w)
 		start := time.Now()
 		next.ServeHTTP(rec, req)
 		duration := time.Since(start).Seconds()
