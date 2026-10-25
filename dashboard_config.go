@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -89,17 +90,54 @@ type DashboardPanel struct {
 	// ChartType overrides the rendered chart: line | bars | gauge |
 	// big-number. Empty = default derived from metric kind.
 	ChartType string `json:"chart_type,omitempty"`
-	// Size selects the grid span preset: sm | md | lg. Empty = the chart's
-	// default span. Full free-form resize stays out of scope.
+	// Size selects the chart-grid span as an explicit width×height value
+	// ("WxH": width 4/6/8/10/12 of 12 columns, height 2/4/6 row units, e.g.
+	// "8x4"). Documents saved before the grid system may still carry the
+	// legacy single-axis presets (sm | md | lg); gridSize maps those onto
+	// their nearest span on read. Empty = the chart's default span.
 	Size string `json:"size,omitempty"`
 }
 
 // Panel field vocabularies, shared by the PUT validator and the renderer.
 var (
 	validPanelChartTypes = map[string]bool{"": true, "line": true, "bars": true, "gauge": true, "big-number": true}
-	validPanelSizes      = map[string]bool{"": true, "sm": true, "md": true, "lg": true}
-	validHTTPCardViews   = map[string]bool{"": true, httpViewBreakdown: true, httpViewTotals: true}
+	// validPanelSizes is the canonical panel-size vocabulary: the stepped
+	// width×height chart-grid spans. The legacy sm/md/lg presets are accepted
+	// at the edges (PUT, load) and mapped by gridSize, never stored.
+	validPanelSizes = func() map[string]bool {
+		m := map[string]bool{}
+		for _, w := range []int{4, 6, 8, 10, 12} {
+			for _, h := range []int{2, 4, 6} {
+				m[strconv.Itoa(w)+"x"+strconv.Itoa(h)] = true
+			}
+		}
+		return m
+	}()
+	validHTTPCardViews = map[string]bool{"": true, httpViewBreakdown: true, httpViewTotals: true}
 )
+
+// gridSize maps a persisted panel size onto the canonical chart-grid
+// vocabulary: width×height spans pass through, the legacy single-axis
+// presets read as the spans the old size classes actually rendered (sm one
+// cell, md two of three columns, lg the full row; all four rows tall), and
+// anything else is rejected.
+func gridSize(s string) (string, bool) {
+	if s == "" {
+		return "", true
+	}
+	if validPanelSizes[s] {
+		return s, true
+	}
+	switch s {
+	case "sm":
+		return "4x4", true
+	case "md":
+		return "8x4", true
+	case "lg":
+		return "12x4", true
+	}
+	return "", false
+}
 
 // validTimeframes is the accepted timeframe vocabulary: empty (= follow the
 // global value), the relative presets (the defaultDurations keys), and
@@ -145,15 +183,21 @@ func defaultDashboardSections() []DashboardSection {
 
 // validateDashboardSections enforces the layout document's section contract:
 // section ids non-empty and unique; items non-empty strings; each well-known
-// block id and each panel id used at most once across all sections (a panel
-// slot is a single DOM node, so the client cannot render it twice) — the flat
-// list makes those once-only checks tree-wide regardless of nesting; any
-// non-block item must reference an existing panel id (panels nil = presets,
-// which cannot know runtime panel ids, so they may only place blocks); panel
-// ids equal to a reserved block id are rejected — they would be ambiguous in
-// Items — and so are duplicate ids or metrics within Panels (the client keys
-// panels on the metric name). Parent pointers share the section-id namespace:
-// a parent must name another existing section, and the parent graph must stay
+// block id used at most once across all sections — a block is one
+// server-rendered self-polling element keyed by unique ids, so a copy would
+// either be a second poller of the same endpoint or need a fan-out the
+// document cannot express; a panel id may repeat across sections — each band
+// renders its own copy of the same panel, cloned from one source on one
+// cadence so copies can never disagree — but at most once within any single
+// section (the same pixels twice in one band carries no information and is
+// indistinguishable from a drag accident); the flat list makes the
+// once-tree-wide block check nesting-independent; any non-block item must
+// reference an existing panel id (panels nil = presets, which cannot know
+// runtime panel ids, so they may only place blocks); panel ids equal to a
+// reserved block id are rejected — they would be ambiguous in Items — and so
+// are duplicate ids or metrics within Panels (the client keys panels on the
+// metric name). Parent pointers share the section-id namespace: a parent
+// must name another existing section, and the parent graph must stay
 // acyclic — the server's recursive band render halts on exactly that.
 func validateDashboardSections(sections []DashboardSection, panels []DashboardPanel) error {
 	panelIDs := make(map[string]bool, len(panels))
@@ -173,7 +217,6 @@ func validateDashboardSections(sections []DashboardSection, panels []DashboardPa
 	}
 	seenSection := make(map[string]bool, len(sections))
 	seenBlock := make(map[string]bool, len(sections))
-	seenPanel := make(map[string]bool, len(panels))
 	for _, s := range sections {
 		if s.ID == "" {
 			return fmt.Errorf("section id is required")
@@ -182,6 +225,7 @@ func validateDashboardSections(sections []DashboardSection, panels []DashboardPa
 			return fmt.Errorf("duplicate section id %q", s.ID)
 		}
 		seenSection[s.ID] = true
+		seenPanel := make(map[string]bool, len(s.Items))
 		for _, item := range s.Items {
 			if item == "" {
 				return fmt.Errorf("section %q has an empty item", s.ID)
@@ -197,7 +241,7 @@ func validateDashboardSections(sections []DashboardSection, panels []DashboardPa
 				return fmt.Errorf("section %q references unknown panel %q", s.ID, item)
 			}
 			if seenPanel[item] {
-				return fmt.Errorf("panel %q appears in more than one place", item)
+				return fmt.Errorf("panel %q appears twice in section %q", item, s.ID)
 			}
 			seenPanel[item] = true
 		}
@@ -368,6 +412,17 @@ func (r *Registry) loadDashboardConfig() *DashboardConfig {
 		d.Timeframe = ""
 	}
 	d.Sections = healTimeframes(d.Sections)
+	// Heal panel sizes onto the chart-grid vocabulary: legacy sm/md/lg map
+	// to their nearest span, unknown values fall back to the default. The
+	// file keeps the authored names, so a rollback to an older golens still
+	// reads them.
+	for i := range d.Panels {
+		if s, ok := gridSize(d.Panels[i].Size); ok {
+			d.Panels[i].Size = s
+		} else {
+			d.Panels[i].Size = ""
+		}
+	}
 	r.dashSaved = true
 	return &d
 }
@@ -472,7 +527,8 @@ func (r *Registry) dashboardConfigHandler() http.HandlerFunc {
 				writeJSONError(w, "too many panels", http.StatusBadRequest)
 				return
 			}
-			for _, p := range d.Panels {
+			for i := range d.Panels {
+				p := &d.Panels[i]
 				if p.ID == "" {
 					writeJSONError(w, "panel id is required", http.StatusBadRequest)
 					return
@@ -485,10 +541,15 @@ func (r *Registry) dashboardConfigHandler() http.HandlerFunc {
 					writeJSONError(w, "panel chart_type must be one of: line, bars, gauge, big-number", http.StatusBadRequest)
 					return
 				}
-				if !validPanelSizes[p.Size] {
-					writeJSONError(w, "panel size must be one of: sm, md, lg", http.StatusBadRequest)
+				// Sizes are normalized here, so the stored document always
+				// carries the canonical width×height vocabulary; the legacy
+				// presets are read, never written.
+				s, ok := gridSize(p.Size)
+				if !ok {
+					writeJSONError(w, "panel size must be a width×height span (width 4,6,8,10,12; height 2,4,6 — e.g. 8x4) or a legacy preset (sm, md, lg)", http.StatusBadRequest)
 					return
 				}
+				p.Size = s
 			}
 			if !validHTTPCardViews[d.HTTPCardView] {
 				writeJSONError(w, "http_card_view must be breakdown or totals", http.StatusBadRequest)

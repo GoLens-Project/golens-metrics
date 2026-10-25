@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -1354,6 +1355,108 @@ func TestDashboardDefaultSectionsRender(t *testing.T) {
 	// the layout API can never diverge.
 	if !strings.Contains(body, `[{"id":"runtime-health","name":"Runtime Health","items":["runtime-health"]},{"id":"histogram","name":"Histogram Time-Series","items":["histogram"]}`) {
 		t.Error("client bootstrap missing the default section list")
+	}
+}
+
+// Chart-grid spans reach the rendered markup: the cards container renders as
+// the 12-column chart grid, the HTTP status card spans the full row (12x4),
+// and a histogram card carries the widened default span (8x4) its bar rows
+// need.
+func TestDashboardCardsRenderChartGridSpans(t *testing.T) {
+	r := newTestRegistry(t, DefaultConfig())
+	r.Register("job_duration_seconds", HistogramType, "job duration", nil, DefaultHistogramBounds, 0, 0)
+	ctx, cancel := context.WithCancel(context.Background())
+	r.Start(ctx)
+	defer func() { cancel(); r.Close() }()
+	r.Record("job_duration_seconds", 0.5)
+	r.Record("http_requests_total_2xx", 3)
+	waitForDrain(r)
+
+	// Fetch the page directly rather than through renderDashboard: the
+	// registry is already running, and renderDashboard's Start would write
+	// r.ctx while the loop goroutine reads it on flush ticks (go test -race).
+	rec := httptest.NewRecorder()
+	newServer(r).ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	if rec.Code != 200 {
+		t.Fatalf("dashboard status = %d, body %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `class="grid grid-charts"`) {
+		t.Error("cards container missing the grid-charts class")
+	}
+	for _, tc := range []struct{ metric, span string }{
+		{"job_duration_seconds", "card-8x4"},
+		{"http_requests_total", "card-12x4"},
+	} {
+		w := markupWindow(body, `data-metric="`+tc.metric+`"`, "card-head")
+		if w == "" {
+			t.Errorf("card %s missing from the rendered dashboard", tc.metric)
+			continue
+		}
+		if !strings.Contains(w, tc.span) {
+			t.Errorf("card %s renders %q, want span class %s", tc.metric, w, tc.span)
+		}
+	}
+}
+
+// The add-chart modal's size options are the client half of the size
+// vocabulary: every offered value must be a span the server's PUT validator
+// accepts, or saving a chart with that size would 400 every layout PUT and
+// retry forever.
+func TestAddChartSizeOptionsMatchServerVocabulary(t *testing.T) {
+	r := newConfigRegistry(t, DefaultConfig())
+	body := renderDashboard(t, r)
+
+	selectHTML := markupWindow(body, `id="add-chart-size"`, "</select>")
+	if selectHTML == "" {
+		t.Fatal("add-chart size select missing from the dashboard")
+	}
+	values := regexp.MustCompile(`value="([^"]*)"`).FindAllStringSubmatch(selectHTML, -1)
+	spans := map[string]bool{}
+	for _, v := range values {
+		if v[1] == "" {
+			continue // the "default" option: empty size, not a span
+		}
+		spans[v[1]] = true
+		if _, ok := gridSize(v[1]); !ok {
+			t.Errorf("modal offers size %q, which the server rejects", v[1])
+		}
+	}
+	// The whole stepped 5-width × 3-height vocabulary must be offered, so a
+	// size the server accepts is never unreachable from the UI.
+	if len(spans) != 15 {
+		t.Errorf("modal offers %d spans (%v), want all 15 width×height sizes", len(spans), spans)
+	}
+}
+
+// The pin-slot size select is built client-side from dashboard.js's
+// PANEL_SIZES array — the primary size-editing surface. If it drifts from
+// the server's vocabulary, setPanelSize writes a size the layout PUT rejects
+// and persistDash retries forever. The served JS must carry exactly the
+// spans gridSize accepts.
+func TestClientPanelSizesMatchServerVocabulary(t *testing.T) {
+	r := newConfigRegistry(t, DefaultConfig())
+	js := staticAsset(t, r, "dashboard.js")
+
+	m := regexp.MustCompile(`PANEL_SIZES = \[([^\]]*)\]`).FindStringSubmatch(js)
+	if m == nil {
+		t.Fatal("PANEL_SIZES array missing from dashboard.js")
+	}
+	client := map[string]bool{}
+	for _, s := range strings.Split(m[1], ",") {
+		if s = strings.Trim(strings.TrimSpace(s), "'"); s != "" {
+			client[s] = true
+		}
+	}
+	for s := range client {
+		if !validPanelSizes[s] {
+			t.Errorf("dashboard.js offers size %q, which the server rejects", s)
+		}
+	}
+	for s := range validPanelSizes {
+		if !client[s] {
+			t.Errorf("server size %q missing from dashboard.js PANEL_SIZES", s)
+		}
 	}
 }
 
