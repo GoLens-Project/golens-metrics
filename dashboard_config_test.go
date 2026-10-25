@@ -62,7 +62,10 @@ func TestDashboardConfigDefaults(t *testing.T) {
 	}
 }
 
-// PUT saves the document and GET serves it back.
+// PUT saves the document and GET serves it back. Sizes are normalized at
+// the edge: a legacy preset in the PUT body is stored and echoed as the
+// width×height span it renders as, so the saved document only ever carries
+// the canonical vocabulary.
 func TestDashboardConfigPutGetRoundTrip(t *testing.T) {
 	r := newConfigRegistry(t, DefaultConfig())
 	h := r.dashboardConfigHandler()
@@ -76,7 +79,7 @@ func TestDashboardConfigPutGetRoundTrip(t *testing.T) {
 	}
 	saved := decodeConfig(t, rec)
 	if len(saved.Panels) != 1 || saved.Panels[0].Metric != "queue_depth" ||
-		saved.Panels[0].ChartType != "line" || saved.Panels[0].Size != "lg" {
+		saved.Panels[0].ChartType != "line" || saved.Panels[0].Size != "12x4" {
 		t.Errorf("echoed panels = %+v", saved.Panels)
 	}
 	if saved.Order.AllMetrics[0] != "queue_depth" {
@@ -87,7 +90,8 @@ func TestDashboardConfigPutGetRoundTrip(t *testing.T) {
 	}
 
 	rec = configRequest(h, http.MethodGet, "")
-	if got := decodeConfig(t, rec); len(got.Panels) != 1 || got.Panels[0].Metric != "queue_depth" {
+	if got := decodeConfig(t, rec); len(got.Panels) != 1 || got.Panels[0].Metric != "queue_depth" ||
+		got.Panels[0].Size != "12x4" {
 		t.Errorf("GET after PUT = %+v", got)
 	}
 }
@@ -124,6 +128,66 @@ func TestDashboardConfigPutValidation(t *testing.T) {
 				t.Error("error body missing error message")
 			}
 		})
+	}
+}
+
+// gridSize is the single size vocabulary shared by the PUT validator and the
+// loader: canonical width×height spans pass through, the legacy single-axis
+// presets map onto the spans the old size classes rendered, the empty size
+// stays empty, and everything else is rejected so the loader can fall back
+// to the default cell.
+func TestGridSizeMapsSpansAndLegacyPresets(t *testing.T) {
+	tests := []struct {
+		in  string
+		out string
+		ok  bool
+	}{
+		{"", "", true},
+		{"8x4", "8x4", true},   // canonical spans pass through
+		{"4x2", "4x2", true},   // smallest span
+		{"12x6", "12x6", true}, // largest span
+		{"sm", "4x4", true},
+		{"md", "8x4", true},
+		{"lg", "12x4", true},
+		{"xxl", "", false},  // legacy test's unknown value
+		{"13x2", "", false}, // width outside the 12-column grid
+		{"8x8", "", false},  // height outside the 2/4/6 rows
+		{"8X4", "", false},  // uppercase separator is not vocabulary
+		{"8", "", false},    // height missing
+		{"x4", "", false},   // width missing
+	}
+	for _, tc := range tests {
+		out, ok := gridSize(tc.in)
+		if out != tc.out || ok != tc.ok {
+			t.Errorf("gridSize(%q) = %q,%v; want %q,%v", tc.in, out, ok, tc.out, tc.ok)
+		}
+	}
+}
+
+// PUT accepts the legacy sm/md/lg presets and stores their width×height
+// mappings, so every saved document carries the canonical vocabulary and
+// legacy names are read-only (a rollback to an older golens still reads its
+// own files).
+func TestDashboardConfigPutNormalizesPanelSizes(t *testing.T) {
+	r := newConfigRegistry(t, DefaultConfig())
+	doc := `{"version":1,"panels":[
+		{"id":"p1","metric":"m1","size":"sm"},
+		{"id":"p2","metric":"m2","size":"md"},
+		{"id":"p3","metric":"m3","size":"lg"},
+		{"id":"p4","metric":"m4","size":"6x2"}]}`
+	rec := configRequest(r.dashboardConfigHandler(), http.MethodPut, doc)
+	if rec.Code != 200 {
+		t.Fatalf("PUT status = %d, body %s", rec.Code, rec.Body.String())
+	}
+	want := map[string]string{"m1": "4x4", "m2": "8x4", "m3": "12x4", "m4": "6x2"}
+	saved := decodeConfig(t, rec)
+	if len(saved.Panels) != len(want) {
+		t.Fatalf("echoed %d panels, want %d", len(saved.Panels), len(want))
+	}
+	for _, p := range saved.Panels {
+		if p.Size != want[p.Metric] {
+			t.Errorf("panel %s size = %q, want %q", p.Metric, p.Size, want[p.Metric])
+		}
 	}
 }
 
@@ -307,14 +371,16 @@ func TestDashboardConfigPersistFailureQuotedErrorBody(t *testing.T) {
 
 // The saved document drives the card builders: a panel's chart_type and size
 // override the per-kind default, an unhonorable saved chart falls back to the
-// default view, and the HTTP card view selects the column set.
+// default view, and the HTTP card view selects the column set. Builders only
+// ever see the canonical width×height vocabulary — the PUT and the loader
+// normalize sizes before a document is served (TestDashboardConfigPutGetRoundTrip).
 func TestCardOptionsHonorDashboardConfig(t *testing.T) {
 	o := cardOptions{
 		HTTPView: "totals",
 		panels: map[string]DashboardPanel{
-			"m_line":     {ID: "1", Metric: "m_line", ChartType: "line", Size: "lg"},
+			"m_line":     {ID: "1", Metric: "m_line", ChartType: "line", Size: "12x4"},
 			"m_nobars":   {ID: "2", Metric: "m_nobars", ChartType: "bars"},
-			"queue_hist": {ID: "3", Metric: "queue_hist", Size: "sm"},
+			"queue_hist": {ID: "3", Metric: "queue_hist"},
 		},
 	}
 	snaps := []MetricSnapshot{
@@ -329,21 +395,25 @@ func TestCardOptionsHonorDashboardConfig(t *testing.T) {
 	for _, c := range cards {
 		byName[c.Snapshot.Name] = c
 	}
-	if c := byName["m_line"]; c.View != "line" || c.Size != "lg" {
-		t.Errorf("m_line view/size = %q/%q, want line/lg", c.View, c.Size)
+	if c := byName["m_line"]; c.View != "line" || c.Size != "12x4" {
+		t.Errorf("m_line view/size = %q/%q, want line/12x4", c.View, c.Size)
 	}
 	// A saved bars chart on a bucket-less counter cannot be honored: number
 	// fallback instead of an empty chart.
 	if c := byName["m_nobars"]; c.View != "number" {
 		t.Errorf("m_nobars view = %q, want number fallback", c.View)
 	}
-	// Size sm maps to the single-cell span ("" preset).
-	if c := byName["queue_hist"]; c.View != "bars" || c.Size != "" {
-		t.Errorf("queue_hist view/size = %q/%q, want bars/\"\"", c.View, c.Size)
+	// Histograms default to the widened span their bar rows need.
+	if c := byName["queue_hist"]; c.View != "bars" || c.Size != "8x4" {
+		t.Errorf("queue_hist view/size = %q/%q, want bars/8x4", c.View, c.Size)
 	}
-	// The HTTP card leads the grid with the configured view.
+	// The HTTP card leads the grid with the configured view and the
+	// full-row span.
 	if cards[0].Snapshot.Name != "http_requests_total" || cards[0].HTTPView != "totals" {
 		t.Errorf("http card = %+v, want totals view", cards[0].Snapshot)
+	}
+	if cards[0].Size != "12x4" {
+		t.Errorf("http card size = %q, want the full-row 12x4 span", cards[0].Size)
 	}
 }
 
@@ -386,10 +456,12 @@ func sameStrings(a, b []string) bool {
 // The PUT validator enforces the section contract: section ids required and
 // unique; items non-empty strings; each well-known block id placed at most
 // once across all sections; non-block items must reference an existing
-// panel; panel ids may never collide with a reserved block id (they would be
-// ambiguous in Items). Parent pointers must name an existing section, never
-// the section itself, and never form a cycle — the server's recursive band
-// render halts on exactly that.
+// panel, at most once per band (copies across bands are legal — see
+// TestDashboardConfigPutPanelCopiesRoundTrip); panel ids may never collide
+// with a reserved block id (they would be ambiguous in Items). Parent
+// pointers must name an existing section, never the section itself, and
+// never form a cycle — the server's recursive band render halts on exactly
+// that.
 func TestDashboardConfigPutSectionValidation(t *testing.T) {
 	tests := []struct {
 		name string
@@ -399,6 +471,7 @@ func TestDashboardConfigPutSectionValidation(t *testing.T) {
 		{"duplicate section id", `{"version":1,"sections":[{"id":"a"},{"id":"a"}]}`},
 		{"block in two sections", `{"version":1,"sections":[{"id":"a","items":["hooks"]},{"id":"b","items":["hooks"]}]}`},
 		{"unknown panel ref", `{"version":1,"sections":[{"id":"a","items":["no_such_panel"]}]}`},
+		{"panel twice in one section", `{"version":1,"panels":[{"id":"p1","metric":"m"}],"sections":[{"id":"a","items":["p1","p1"]}]}`},
 		{"empty item", `{"version":1,"sections":[{"id":"a","items":[""]}]}`},
 		{"panel id reserved block id", `{"version":1,"panels":[{"id":"hooks","metric":"webhook_calls"}]}`},
 		{"self parent", `{"version":1,"sections":[{"id":"a","parent":"a"}]}`},
@@ -453,6 +526,36 @@ func TestDashboardConfigPutSectionsRoundTrip(t *testing.T) {
 	got := getDashboardConfig(t, r)
 	if !sameStrings(sectionIDs(got), []string{"main", "spare"}) {
 		t.Errorf("GET sections = %v, want [main spare]", sectionIDs(got))
+	}
+}
+
+// The same panel may be placed once per band — each band renders its own
+// copy of the chart — while a band showing it twice stays a 400 (see
+// TestDashboardConfigPutSectionValidation). Copies survive the round trip:
+// the layout client re-PUTs the whole document on every edit, so a dropped
+// placement would silently un-copy a chart.
+func TestDashboardConfigPutPanelCopiesRoundTrip(t *testing.T) {
+	r := newConfigRegistry(t, DefaultConfig())
+	h := r.dashboardConfigHandler()
+
+	doc := `{"version":1,"panels":[{"id":"p1","metric":"my_metric"}],"order":{},
+	        "sections":[{"id":"main","items":["p1"]},{"id":"spare","items":["p1"]}]}`
+	rec := configRequest(h, http.MethodPut, doc)
+	if rec.Code != 200 {
+		t.Fatalf("PUT status = %d, body %s", rec.Code, rec.Body.String())
+	}
+	saved := decodeConfig(t, rec)
+	if len(saved.Sections) != 2 ||
+		!sameStrings(saved.Sections[0].Items, []string{"p1"}) ||
+		!sameStrings(saved.Sections[1].Items, []string{"p1"}) {
+		t.Fatalf("echoed sections = %+v, want p1 in both bands", saved.Sections)
+	}
+
+	got := getDashboardConfig(t, r)
+	for _, s := range got.Sections {
+		if !sameStrings(s.Items, []string{"p1"}) {
+			t.Errorf("GET section %s items = %v, want [p1]", s.ID, s.Items)
+		}
 	}
 }
 
@@ -525,6 +628,41 @@ func TestDashboardConfigHealsTimeframesOnLoad(t *testing.T) {
 	}
 	if byID["b"].Timeframe != "5m" {
 		t.Errorf("section b timeframe = %q, want kept", byID["b"].Timeframe)
+	}
+	if data, err := os.ReadFile(path); err != nil || string(data) != authored {
+		t.Errorf("healing rewrote %s on disk", path)
+	}
+}
+
+// Panel sizes heal on load exactly like timeframes: documents saved before
+// the grid system carry legacy presets (mapped onto their spans) or junk
+// (default cell), and an unhealed value must not survive into the served
+// document — the client renders span classes straight from it. Healing is
+// in-memory only; the file keeps the authored names so an older golens can
+// still read them.
+func TestDashboardConfigHealsPanelSizesOnLoad(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dash.json")
+	authored := `{"version":1,"panels":[
+		{"id":"p1","metric":"m1","size":"md"},
+		{"id":"p2","metric":"m2","size":"6x6"},
+		{"id":"p3","metric":"m3","size":"bogus"}],"order":{},"sections":[]}`
+	if err := os.WriteFile(path, []byte(authored), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := DefaultConfig()
+	cfg.UI.DashboardConfig = path
+	r := newConfigRegistry(t, cfg)
+	defer r.Close()
+
+	got := getDashboardConfig(t, r)
+	want := map[string]string{"m1": "8x4", "m2": "6x6", "m3": ""}
+	if len(got.Panels) != len(want) {
+		t.Fatalf("GET panels = %+v, want %d", got.Panels, len(want))
+	}
+	for _, p := range got.Panels {
+		if p.Size != want[p.Metric] {
+			t.Errorf("panel %s size = %q, want %q", p.Metric, p.Size, want[p.Metric])
+		}
 	}
 	if data, err := os.ReadFile(path); err != nil || string(data) != authored {
 		t.Errorf("healing rewrote %s on disk", path)

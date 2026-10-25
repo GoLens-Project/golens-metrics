@@ -43,7 +43,10 @@ ui:
   # wins when both exist). Seed-once: applied only while no layout document
   # has been saved. Each section is a horizontal band; "items" reference
   # well-known blocks (runtime-health, histogram, hooks, all-metrics,
-  # endpoint-latency, internals) or pinned panel ids, in render order.
+  # endpoint-latency, internals) or pinned panel ids, in render order. A
+  # pinned panel may be placed in several bands at once (each band renders
+  # its own copy of the same chart, sharing the panel's config) but at most
+  # once per band; blocks exist exactly once tree-wide.
   # Optional "parent" nests a band under the section with that id, at any
   # depth; parents must exist, must not be the section itself, and cycles
   # are rejected (an invalid preset is skipped wholesale).

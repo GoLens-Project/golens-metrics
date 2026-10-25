@@ -240,6 +240,19 @@ function normalizeSections(d) {
   (d.sections || []).forEach(function (s) {
     if (s.items && s.items.length) s.items = s.items.filter(function (id) { return !droppedIDs[id]; });
   });
+  // A panel id may repeat across sections (multi-band copies) but never
+  // twice within one band: the PUT validator rejects that and a rejected
+  // PUT retries forever, so a hand-edited document is healed before it can
+  // ever be re-PUT.
+  (d.sections || []).forEach(function (s) {
+    if (!s.items || !s.items.length) return;
+    var seenItem = {};
+    s.items = s.items.filter(function (id) {
+      if (seenItem[id]) return false;
+      seenItem[id] = true;
+      return true;
+    });
+  });
   var placed = {};
   d.sections.forEach(function (s) { (s.items || []).forEach(function (id) { placed[id] = true; }); });
   var host = null;
@@ -312,14 +325,15 @@ document.addEventListener('alpine:init', function () {
     charts: dashCfg.panels.map(function (p) { return p.metric; }),
     has: function (n) { return this.charts.indexOf(n) >= 0; },
     pin: function (n) {
+      if (!n) return;
       // A panel's id is its metric name, and a metric sharing a reserved
       // block id would make every layout PUT fail validation — reject the
       // pin instead of bricking persistence.
-      if (n && RESERVED_BLOCK_IDS.indexOf(n) >= 0 && !this.has(n)) {
+      if (RESERVED_BLOCK_IDS.indexOf(n) >= 0 && !this.has(n)) {
         showToast('metric "' + n + '" is a reserved section block id and cannot be pinned', 'error');
         return;
       }
-      if (n && !this.has(n)) {
+      if (!this.has(n)) {
         this.charts.push(n);
         dashCfg.panels = chartsToPanels(this.charts);
         var sel = addChartSelection();
@@ -335,7 +349,19 @@ document.addEventListener('alpine:init', function () {
         }
         persistDash();
         renderPinned();
+        return;
       }
+      // Already pinned: another placement of the same panel. Copies render
+      // from one metric pipeline and share the panel's config — only the
+      // document gains an item.
+      var id = null;
+      dashCfg.panels.forEach(function (p) { if (p.metric === n) id = p.id; });
+      if (id && placePanel(id)) {
+        persistDash();
+        renderPinned();
+        return;
+      }
+      showToast('chart "' + n + '" is already placed in every band', 'error');
     },
     remove: function (n) {
       var id = null;
@@ -523,6 +549,20 @@ function cssEsc(s) { return (window.CSS && CSS.escape) ? CSS.escape(s) : s.repla
 // validateDashboardSections); pin() refuses metrics with these names.
 var RESERVED_BLOCK_IDS = ['runtime-health', 'histogram', 'hooks', 'all-metrics', 'endpoint-latency', 'internals'];
 
+// PANEL_SIZES is the stepped width×height chart-grid vocabulary (width of 12
+// columns, height in 4rem row units) — the same set the server's size
+// validation and the add-chart modal's options accept. A size renders as the
+// card-<cols>x<rows> span class; anything else (legacy sm/md/lg, unknown)
+// falls back to the default 4×4 cell.
+var PANEL_SIZES = ['4x2', '6x2', '8x2', '10x2', '12x2', '4x4', '6x4', '8x4', '10x4', '12x4', '4x6', '6x6', '8x6', '10x6', '12x6'];
+
+// placementCount counts a panel id's placements across all bands.
+function placementCount(id) {
+  var n = 0;
+  (dashCfg.sections || []).forEach(function (s) { (s.items || []).forEach(function (x) { if (x === id) n++; }); });
+  return n;
+}
+
 function panelByID(id) {
   for (var i = 0; i < dashCfg.panels.length; i++) {
     if (dashCfg.panels[i].id === id) return dashCfg.panels[i];
@@ -541,11 +581,25 @@ function sectionForPanels() {
   return s;
 }
 
+// placePanel adds one more placement of a panel: the my-charts band when it
+// does not already show it, else the first band that does not — a panel may
+// repeat across bands, never twice in one (the PUT validator rejects that,
+// and a rejected PUT retries forever). Returns false when every band already
+// shows the panel and no placement is possible.
 function placePanel(id) {
   var s = sectionForPanels();
-  if (!s) return;
+  if (!s) return false;
   if (!s.items) s.items = [];
-  if (s.items.indexOf(id) < 0) s.items.push(id);
+  if (s.items.indexOf(id) >= 0) {
+    s = null;
+    for (var i = 0; i < dashCfg.sections.length && !s; i++) {
+      if (!dashCfg.sections[i].items || dashCfg.sections[i].items.indexOf(id) < 0) s = dashCfg.sections[i];
+    }
+    if (!s) return false;
+    if (!s.items) s.items = [];
+  }
+  s.items.push(id);
+  return true;
 }
 
 function unplacePanel(id) {
@@ -573,7 +627,8 @@ function makeSlot(p) {
     '<button type="button" class="pin-btn" title="move earlier" aria-label="Move ' + label + ' earlier" onclick="moveSectionItem(this,-1)">&larr;</button>' +
     '<button type="button" class="pin-btn" title="move later" aria-label="Move ' + label + ' later" onclick="moveSectionItem(this,1)">&rarr;</button>' +
     '<select class="pin-size" title="panel size" aria-label="Panel size" onchange="setPanelSize(this)">' +
-    '<option value="">default</option><option value="sm">small</option><option value="md">medium</option><option value="lg">large</option>' +
+    '<option value="">default</option>' +
+    PANEL_SIZES.map(function (s) { return '<option value="' + s + '">' + s.replace('x', '×') + '</option>'; }).join('') +
     '</select>' +
     '<button type="button" class="pin-remove" title="remove" aria-label="Remove ' + label + '" onclick="unpinSlot(this)">&times;</button>' +
     '</div>' +
@@ -614,9 +669,16 @@ function renderPinned() {
   document.querySelectorAll('[data-section]').forEach(function (sec) {
     bodies[sec.getAttribute('data-section')] = sec.querySelector('.sec-body');
   });
-  var blocks = {}, slots = {}, wantSlots = {};
+  var blocks = {}, slots = {}, seen = {};
   document.querySelectorAll('.sec-body > [data-block]').forEach(function (b) { blocks[b.getAttribute('data-block')] = b; });
-  document.querySelectorAll('.sec-body > .pin-slot').forEach(function (s) { slots[s.getAttribute('data-pin-id')] = s; });
+  // Slot identity is per placement: a panel id may occur once per band (the
+  // same chart in several sections), so each id owns the list of its slot
+  // nodes — the k-th occurrence reuses the k-th node, fresh occurrences
+  // create fresh slots, and surplus nodes are removed below.
+  document.querySelectorAll('.sec-body > .pin-slot').forEach(function (s) {
+    var id = s.getAttribute('data-pin-id');
+    (slots[id] = slots[id] || []).push(s);
+  });
   (dashCfg.sections || []).forEach(function (s) {
     var body = bodies[s.id];
     if (!body) return;
@@ -624,9 +686,11 @@ function renderPinned() {
     (s.items || []).forEach(function (id) {
       var p = panelByID(id);
       if (p) {
-        wantSlots[id] = true;
-        if (!slots[id]) { slots[id] = makeSlot(p); }
-        nodes.push(slots[id]);
+        var list = slots[id] || (slots[id] = []);
+        var k = seen[id] || 0;
+        seen[id] = k + 1;
+        if (!list[k]) list[k] = makeSlot(p);
+        nodes.push(list[k]);
         return;
       }
       if (blocks[id]) nodes.push(blocks[id]);
@@ -640,7 +704,10 @@ function renderPinned() {
     if (!same) nodes.forEach(function (n) { body.insertBefore(n, nested[0] || null); });
   });
   Object.keys(slots).forEach(function (id) {
-    if (!wantSlots[id] && slots[id].parentNode) slots[id].remove();
+    var want = seen[id] || 0;
+    slots[id].forEach(function (slot, i) {
+      if (i >= want && slot.parentNode) slot.remove();
+    });
   });
   document.querySelectorAll('.pin-slot').forEach(function (slot) {
     var name = slot.getAttribute('data-pin');
@@ -773,7 +840,16 @@ function moveSectionItem(btn, dir) {
   if (!el) return;
   var items = sectionItems();
   var from = items.indexOf(el);
-  moveCard(items, from, neighborIndex(items, from, dir), persistSectionsFromDOM);
+  var to = neighborIndex(items, from, dir);
+  // A panel copy cannot move into a band that already shows the same panel
+  // (the PUT validator rejects the duplicate and a rejected PUT retries
+  // forever): the ←/→ buttons refuse the move the same way the drag does.
+  if (to >= 0 && el.classList.contains('pin-slot') &&
+      items[to].closest('[data-section]') !== el.closest('[data-section]')) {
+    var dup = items[to].closest('.sec-body').querySelector('.pin-slot[data-pin-id="' + cssEsc(el.getAttribute('data-pin-id')) + '"]');
+    if (dup) return;
+  }
+  moveCard(items, from, to, persistSectionsFromDOM);
 }
 
 function renameSection(input) {
@@ -793,13 +869,37 @@ function setPanelSize(sel) {
   for (var i = 0; i < dashCfg.panels.length; i++) {
     if (dashCfg.panels[i].metric === metric) dashCfg.panels[i].size = sel.value || undefined;
   }
-  slot.className = 'pin-slot card card-grab ' + pinSizeClass(metric);
+  // Copies share the panel's config: restyle every placement of this metric
+  // now instead of waiting for the next render pass.
+  document.querySelectorAll('.pin-slot').forEach(function (s) {
+    if (s.getAttribute('data-pin') === metric) s.className = 'pin-slot card card-grab ' + pinSizeClass(metric);
+  });
   persistDash();
 }
 
+// unpinSlot removes the one placement the × sits on; only the last
+// placement's removal deletes the panel itself (the chart dies with its
+// last copy).
 function unpinSlot(btn) {
   var slot = btn.closest('.pin-slot');
-  if (slot) Alpine.store('ui').remove(slot.getAttribute('data-pin'));
+  if (!slot) return;
+  var id = slot.getAttribute('data-pin-id');
+  var sec = slot.closest('[data-section]');
+  var s = null;
+  (dashCfg.sections || []).forEach(function (x) {
+    if (sec && x.id === sec.getAttribute('data-section')) s = x;
+  });
+  if (s && s.items) {
+    var i = s.items.indexOf(id);
+    if (i >= 0) s.items.splice(i, 1);
+  }
+  if (placementCount(id)) {
+    persistDash();
+    renderPinned();
+    return;
+  }
+  var p = panelByID(id);
+  if (p) Alpine.store('ui').remove(p.metric);
 }
 
 // --- section drag & drop (edit mode only) -----------------------------------------
@@ -857,6 +957,14 @@ function initSectionsDnD() {
       body.appendChild(dragSection);
       return;
     }
+    // Structural guard, mirroring the band one: a panel copy cannot land in
+    // a band that already shows the same panel — two identical cards in one
+    // band carry no information, and persisting one would 400 every layout
+    // PUT and retry forever. No preventDefault = no drop indication, no move.
+    if (dragSectionItem.classList.contains('pin-slot')) {
+      var dup = body.querySelector('.pin-slot[data-pin-id="' + cssEsc(dragSectionItem.getAttribute('data-pin-id')) + '"]');
+      if (dup && dup !== dragSectionItem) return;
+    }
     e.preventDefault();
     var next = null;
     var kids = Array.from(body.children);
@@ -902,13 +1010,13 @@ function initSectionsUI() {
   initSectionsDnD();
 }
 
-// pinSizeClass returns the grid span class configured for a pinned panel.
-// Mirrors the server's mapping: only md/lg widen the cell; sm (and empty)
-// render as a single cell with no span class.
+// pinSizeClass returns the grid span class configured for a pinned panel:
+// the panel's width×height size ("8x4" → card-8x4). Legacy or unknown sizes
+// (the server heals legacy names on read) render as the default cell.
 function pinSizeClass(name) {
   for (var i = 0; i < dashCfg.panels.length; i++) {
     var p = dashCfg.panels[i];
-    if (p.metric === name && (p.size === 'md' || p.size === 'lg')) return 'card-' + p.size;
+    if (p.metric === name && PANEL_SIZES.indexOf(p.size) >= 0) return 'card-' + p.size;
   }
   return '';
 }

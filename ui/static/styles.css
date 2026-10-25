@@ -93,14 +93,58 @@ h1, h2, h3 { margin: 0; font-weight: 600; }
 
 .stack > * + * { margin-top: 1.25rem; }
 
-.grid { display: grid; gap: 1.25rem; grid-template-columns: 1fr; }
+.grid { display: grid; gap: 1.25rem; grid-template-columns: minmax(0, 1fr); }
 @media (min-width: 768px) {
-  .grid-half { grid-template-columns: repeat(2, 1fr); }
-  .grid-cards { grid-template-columns: repeat(2, 1fr); }
+  .grid-half { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .grid-cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 @media (min-width: 1024px) {
-  .grid-cards { grid-template-columns: repeat(3, 1fr); }
-  .grid-half-lg { grid-template-columns: repeat(2, 1fr); }
+  .grid-cards { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .grid-half-lg { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+/* Chart grid: metric cards and pinned panels size in explicit width×height
+ * spans (card-<cols>x<rows>) over 12 columns. One row unit is 4rem, so a
+ * card spanning 2/4/6 rows renders 9.25/19.75/30.25rem tall; the default
+ * (no span class) is the 4×4 cell. Below 768px the spans drop and cards
+ * stack full-width at natural height. The minmax(0,1fr) tracks and the
+ * cards' min-width:0 are load-bearing: a canvas's attribute size is its
+ * intrinsic size and a plain 1fr track's implicit minimum is min-content,
+ * so unclamped, every hi-dpi redraw (canvas.width = css width × dpr) grows
+ * the track it sits in — the chart-grid blowout. */
+@media (min-width: 768px) {
+  .grid-charts, .sec-body { grid-template-columns: repeat(12, minmax(0, 1fr)); }
+  /* :where() keeps the default cell at zero specificity, so any card-*x*
+     span class overrides it regardless of source order. */
+  :where(.grid-charts > .card, .sec-body > .pin-slot) { grid-column: span 4; height: 19.75rem; }
+  .card-4x2 { grid-column: span 4; height: 9.25rem; }
+  .card-6x2 { grid-column: span 6; height: 9.25rem; }
+  .card-8x2 { grid-column: span 8; height: 9.25rem; }
+  .card-10x2 { grid-column: span 10; height: 9.25rem; }
+  .card-12x2 { grid-column: span 12; height: 9.25rem; }
+  .card-4x4 { grid-column: span 4; height: 19.75rem; }
+  .card-6x4 { grid-column: span 6; height: 19.75rem; }
+  .card-8x4 { grid-column: span 8; height: 19.75rem; }
+  .card-10x4 { grid-column: span 10; height: 19.75rem; }
+  .card-12x4 { grid-column: span 12; height: 19.75rem; }
+  .card-4x6 { grid-column: span 4; height: 30.25rem; }
+  .card-6x6 { grid-column: span 6; height: 30.25rem; }
+  .card-8x6 { grid-column: span 8; height: 30.25rem; }
+  .card-10x6 { grid-column: span 10; height: 30.25rem; }
+  .card-12x6 { grid-column: span 12; height: 30.25rem; }
+  /* A taller row span renders a taller chart: the card's last child absorbs
+     the free height and the canvas fills it. Non-canvas bodies sink to the
+     bottom edge — the stretched-row rhythm they had under equal-height rows. */
+  .grid-charts > .card > div:last-child,
+  .sec-body > .pin-slot > .pin-body,
+  .sec-body > .pin-slot > .pin-body > div:last-child {
+    flex: 1 1 auto;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-end;
+  }
+  .grid-charts .chart-canvas, .sec-body .chart-canvas { flex: 1 1 auto; }
 }
 
 /* Meta text */
@@ -336,6 +380,7 @@ select.input { font-family: var(--font-mono); }
   display: flex;
   flex-direction: column;
   justify-content: space-between;
+  min-width: 0;
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: 0.75rem;
@@ -347,14 +392,6 @@ select.input { font-family: var(--font-mono); }
 .card-flat { padding: 0; overflow: hidden; }
 .card-grab { cursor: grab; }
 .card-grab:active { cursor: grabbing; }
-.card-wide { grid-column: span 1; }
-@media (min-width: 768px) {
-  .card-md { grid-column: span 2; }
-  .card-lg { grid-column: span 2; }
-}
-@media (min-width: 1024px) {
-  .card-lg { grid-column: span 3; }
-}
 .dragging { opacity: 0.4; outline: 2px solid rgba(52, 211, 153, 0.6); outline-offset: -2px; }
 
 /* Card-header reorder buttons: move earlier/later (keyboard- and
@@ -471,7 +508,15 @@ select.input { font-family: var(--font-mono); }
 }
 .bar-stats span { color: var(--text-body); }
 
-.chart-canvas { width: 100%; display: block; }
+/* Canvas layout is CSS-owned: the aspect ratio fixes the height (width /
+ * ratio), so the attribute size the chart code writes only sets drawing
+ * resolution and can never feed back into layout. The zero minimums drop
+ * the replaced-element intrinsic floors that would otherwise leak the
+ * attribute size into flex/grid sizing on hi-dpi. Per-surface ratios match
+ * the height attributes the templates ship (120/300, 100/300, 150/300). */
+.chart-canvas { width: 100%; display: block; min-width: 0; min-height: 0; aspect-ratio: 5 / 2; }
+#rt-mem { aspect-ratio: 3 / 1; }
+#histogram-timeseries .chart-canvas { aspect-ratio: 2 / 1; }
 .chart-legend {
   display: flex;
   justify-content: space-between;
@@ -639,15 +684,10 @@ html.light .cell-danger { color: #b45309; }
 .sec-rename { margin-top: 0.375rem; }
 .sec-rename .input { width: auto; min-width: 16rem; max-width: 24rem; padding: 0.25rem 0.5rem; font-size: 0.75rem; }
 
-/* Band body: fixed blocks span the full width, pinned panel slots flow in
-   the responsive card grid (card-md/card-lg span classes apply as-is). */
-.sec-body { display: grid; gap: 1.25rem; grid-template-columns: 1fr; align-items: start; }
-@media (min-width: 768px) {
-  .sec-body { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-}
-@media (min-width: 1024px) {
-  .sec-body { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-}
+/* Band body: fixed blocks and nested bands span the full width, pinned
+ * panel slots flow in the 12-column chart grid (card-<cols>x<rows> spans,
+ * shared with .grid-charts). Below 768px everything stacks one column. */
+.sec-body { display: grid; gap: 1.25rem; grid-template-columns: minmax(0, 1fr); }
 .sec-block { position: relative; min-width: 0; }
 .sec-body > .sec-block { grid-column: 1 / -1; }
 

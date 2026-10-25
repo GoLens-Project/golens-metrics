@@ -600,7 +600,7 @@ type metricCard struct {
 	Badge        string // COUNTER / GAUGE / HISTOGRAM
 	BadgeTone    string // badge tone token: counter / gauge / histogram / unknown
 	View         string // body view: http / bars / gauge / number
-	Size         string // grid span preset: "" single cell, "md" half width, "lg" full width
+	Size         string // chart-grid span "WxH" (e.g. "8x4": 8 of 12 columns, 4 row units); "" default cell
 	DisplayValue string // formatted numeric value
 	Unit         string // value unit label
 	Hook         bool   // rendered in the Hooks grid (not pinnable — it has no All Metrics card)
@@ -703,15 +703,14 @@ func applyCardDefaults(c *metricCard, s MetricSnapshot, p DashboardPanel) {
 		c.Bars = buildBars(s.Buckets)
 	}
 
-	// Grid span preset: the panel's saved size wins, otherwise histograms get
-	// the half-width span their bar rows need. "" is a single cell.
+	// Grid span preset: the panel's saved width×height span wins, otherwise
+	// histograms get the wider span their bar rows need. "" renders the
+	// default 4×4 cell.
 	switch {
-	case p.Size == "md" || p.Size == "lg":
+	case p.Size != "":
 		c.Size = p.Size
-	case p.Size == "sm":
-		c.Size = ""
 	case c.View == "bars":
-		c.Size = "md"
+		c.Size = "8x4"
 	}
 }
 
@@ -946,7 +945,7 @@ func buildHTTPCardView(snaps []MetricSnapshot, view string) []metricCard {
 		Badge:        "COUNTER",
 		BadgeTone:    "counter",
 		View:         "http",
-		Size:         "lg",
+		Size:         "12x4", // the HTTP card spans the full row
 		DisplayValue: fmtInt(totalHTTP),
 		Unit:         "requests",
 		HTTPColumns:  columns,
@@ -1218,11 +1217,23 @@ const dashboardSrc = `<!DOCTYPE html>
       </div>
       <div class="field field-narrow">
         <label class="field-label" for="add-chart-size">Size</label>
-        <select id="add-chart-size" class="input">
+        <select id="add-chart-size" class="input" title="width×height chart-grid span (12 columns; 4rem rows)">
           <option value="">default</option>
-          <option value="sm">small</option>
-          <option value="md">medium</option>
-          <option value="lg">large</option>
+          <option value="4x2">4×2</option>
+          <option value="6x2">6×2</option>
+          <option value="8x2">8×2</option>
+          <option value="10x2">10×2</option>
+          <option value="12x2">12×2</option>
+          <option value="4x4">4×4</option>
+          <option value="6x4">6×4</option>
+          <option value="8x4">8×4</option>
+          <option value="10x4">10×4</option>
+          <option value="12x4">12×4</option>
+          <option value="4x6">4×6</option>
+          <option value="6x6">6×6</option>
+          <option value="8x6">8×6</option>
+          <option value="10x6">10×6</option>
+          <option value="12x6">12×6</option>
         </select>
       </div>
     </div>
@@ -1615,7 +1626,7 @@ const cardsSrc = `{{define "cards"}}
 {{if not .}}
 <div class="empty-inline">No metrics recorded yet.</div>
 {{end}}
-<div class="grid grid-cards">
+<div class="grid grid-charts">
 {{range .}}
 <div data-metric="{{.Snapshot.Name}}" draggable="true"
      class="card card-grab{{if .Size}} card-{{.Size}}{{end}}">
