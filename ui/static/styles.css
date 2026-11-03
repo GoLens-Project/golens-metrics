@@ -207,8 +207,12 @@ h1, h2, h3 { margin: 0; font-weight: 600; }
 .btn-link:hover { color: var(--text-soft); }
 
 /* Timeframe selectors: the topbar's global control (+ its custom-start
-   picker) and the per-band override in each section header. */
-.tf-select, .sec-tf, .tf-start {
+   picker) and the per-band override in each section header. The topbar
+   controls also carry the .input class (width: 100%, defined later in this
+   file), so these rules win on specificity (.input.tf-* = 0,2,0 beats
+   .input = 0,1,0 regardless of source order) — a width: 100% here wraps
+   the flex topbar onto its own row. */
+.input.tf-select, .sec-tf, .input.tf-start {
   width: auto;
   font-family: var(--font-mono);
   font-size: 0.625rem;
@@ -728,7 +732,7 @@ body.edit-mode .dash-section > .sec-head:active { cursor: grabbing; }
   border-radius: 0.375rem;
 }
 
-/* Per-panel size preset (edit mode only). */
+/* Per-panel size preset (edit mode only): paired width×height selects. */
 .pin-size {
   height: 1.5rem;
   font-family: var(--font-mono);
@@ -740,6 +744,7 @@ body.edit-mode .dash-section > .sec-head:active { cursor: grabbing; }
   color: var(--text-muted);
   cursor: pointer;
 }
+.pin-size-x { align-self: center; font-family: var(--font-mono); font-size: 0.625rem; color: var(--text-muted); }
 #edit-toggle[aria-pressed="true"] { border-color: rgba(52, 211, 153, 0.4); color: #34d399; }
 
 /* --- modals ------------------------------------------------------------------- */
