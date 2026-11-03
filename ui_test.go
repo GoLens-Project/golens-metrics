@@ -536,20 +536,73 @@ func TestBuildBarsZeroFlagOnlyOnEmptyBuckets(t *testing.T) {
 	}
 }
 
+// The All Metrics grid excludes the process's own runtime-health gauges by
+// the single source of truth in runtime_metrics.go: the card builder skips
+// exactly what startRuntimeMetrics registers (runtimeMetricDefs), so a gauge
+// added there can never leak into the grid as a duplicate chart. Every
+// exported runtime constant must sit in that one list — a gauge registered
+// beside the list would squat the user namespace AND the grid — and the
+// list must hold no duplicates and nothing but those constants.
 func TestBuildCardsExcludesRuntimeMetrics(t *testing.T) {
-	snaps := []MetricSnapshot{
-		{Name: "go_memstats_alloc_bytes", Type: "gauge", Value: 1024},
-		{Name: "go_goroutines", Type: "gauge", Value: 5},
-		{Name: "cpu_usage_percent", Type: "gauge", Value: 50},
-		{Name: "custom_counter", Type: "counter", Value: 42},
+	consts := []string{MetricGoAllocBytes, MetricGoSysBytes, MetricGoHeapInuse, MetricGoHeapObjects, MetricGoGoroutines, MetricCPUUsagePercent}
+	constSet := map[string]bool{}
+	for _, c := range consts {
+		constSet[c] = true
+	}
+	seen := map[string]bool{}
+	for _, m := range runtimeMetricDefs {
+		if seen[m.name] {
+			t.Errorf("runtime metric %q listed twice in runtimeMetricDefs", m.name)
+		}
+		seen[m.name] = true
+		if !constSet[m.name] {
+			t.Errorf("runtimeMetricDefs entry %q is not one of the exported runtime constants", m.name)
+		}
+	}
+	for _, c := range consts {
+		if !seen[c] {
+			t.Errorf("runtime constant %q missing from runtimeMetricDefs — it would register into the user registry and leak into the All Metrics grid", c)
+		}
+	}
+
+	snaps := []MetricSnapshot{{Name: "custom_counter", Type: "counter", Value: 42}}
+	for _, m := range runtimeMetricDefs {
+		snaps = append(snaps, MetricSnapshot{Name: m.name, Type: "gauge", Value: 1024})
 	}
 	cards := buildCards(snaps)
-	// Runtime metrics should be excluded, only custom_counter remains
-	if len(cards) != 1 {
-		t.Fatalf("buildCards returned %d cards, want 1", len(cards))
+	var got []string
+	for _, c := range cards {
+		got = append(got, c.Snapshot.Name)
 	}
-	if cards[0].Snapshot.Name != "custom_counter" {
-		t.Errorf("card name = %q, want custom_counter", cards[0].Snapshot.Name)
+	if len(cards) != 1 || cards[0].Snapshot.Name != "custom_counter" {
+		t.Fatalf("buildCards returned %v, want only custom_counter — a runtime gauge leaked into the All Metrics grid", got)
+	}
+}
+
+// Pin-based sizing is the only sizing path (the decided item-6 design): a
+// pinned counter or big-number card is resizable exactly like any other
+// panel — applyCardDefaults applies the panel's saved span for every metric
+// kind and body view, never conditionally on the view.
+func TestPanelSizeAppliesToEveryView(t *testing.T) {
+	snaps := []MetricSnapshot{
+		{Name: "events_total", Type: "counter", Value: 7},
+		{Name: "queue_depth", Type: "gauge", Value: 3},
+		{Name: "job_duration_seconds", Type: "histogram", Count: 10, Buckets: []BucketSnapshot{{UpperBound: 1, Count: 10}}},
+		{Name: "queue_fill", Type: "gauge", Value: 62},
+		{Name: "sessions_started_total", Type: "counter", Value: 991},
+	}
+	o := cardOptions{panels: map[string]DashboardPanel{
+		"events_total":           {ID: "p1", Metric: "events_total", Size: "12x2"},
+		"queue_depth":            {ID: "p2", Metric: "queue_depth", ChartType: "big-number", Size: "4x6"},
+		"job_duration_seconds":   {ID: "p3", Metric: "job_duration_seconds", Size: "12x6"},
+		"queue_fill":             {ID: "p4", Metric: "queue_fill", ChartType: "gauge", Size: "6x4"},
+		"sessions_started_total": {ID: "p5", Metric: "sessions_started_total", ChartType: "line", Size: "10x2"},
+	}}
+	for _, c := range buildCardsOpts(snaps, o) {
+		want := o.panels[c.Snapshot.Name].Size
+		if c.Size != want {
+			t.Errorf("%s (%s view) renders span %q, want the saved panel size %q", c.Snapshot.Name, c.View, c.Size, want)
+		}
 	}
 }
 
@@ -822,21 +875,35 @@ func TestBuildHTTPCardNoHTTPMetrics(t *testing.T) {
 	}
 }
 
-func TestBuildHTTPCardUncategorized(t *testing.T) {
-	// HTTP metric with no status label → goes to "other"
+// A parent-only total — the labeled parent populated while the per-class
+// children never recorded (the item 5 runtime report shape) — must not
+// render as a populated breakdown: five zero columns under a nonzero total
+// present absence as data, so the card collapses to the totals view until
+// the class counters record requests. The labeled parent feeds the total
+// only while no children exist.
+func TestBuildHTTPCardParentOnlyTotalCollapsesToTotals(t *testing.T) {
 	snaps := []MetricSnapshot{
 		{Name: "http_requests_total", Type: "counter", Value: 25},
 	}
-	cards := buildHTTPCard(snaps)
+	cards := buildHTTPCard(snaps) // breakdown requested
 	if len(cards) != 1 {
 		t.Fatalf("got %d cards, want 1", len(cards))
 	}
+	card := cards[0]
+	if card.HTTPView != httpViewTotals {
+		t.Errorf("view = %q, want %q — a parent-only total must collapse to the totals view", card.HTTPView, httpViewTotals)
+	}
 	colMap := map[string]float64{}
-	for _, col := range cards[0].HTTPColumns {
+	for _, col := range card.HTTPColumns {
 		colMap[col.Label] = col.Value
 	}
 	if colMap["total"] != 25 {
-		t.Errorf("total = %v, want 25", colMap["total"])
+		t.Errorf("total = %v, want the parent-only 25", colMap["total"])
+	}
+	for _, class := range httpStatusClasses {
+		if _, ok := colMap[class]; ok {
+			t.Errorf("collapsed card carries a %s column; want the totals columns only", class)
+		}
 	}
 }
 
@@ -1400,62 +1467,110 @@ func TestDashboardCardsRenderChartGridSpans(t *testing.T) {
 }
 
 // The add-chart modal's size options are the client half of the size
-// vocabulary: every offered value must be a span the server's PUT validator
-// accepts, or saving a chart with that size would 400 every layout PUT and
-// retry forever.
+// vocabulary: two independent dropdowns (columns × rows) whose cross-product
+// must be exactly the spans the server's PUT validator accepts. Every
+// offered combination must save (a rejected size would 400 every layout PUT
+// and retry forever), and every server-valid span must be reachable.
 func TestAddChartSizeOptionsMatchServerVocabulary(t *testing.T) {
 	r := newConfigRegistry(t, DefaultConfig())
 	body := renderDashboard(t, r)
 
-	selectHTML := markupWindow(body, `id="add-chart-size"`, "</select>")
-	if selectHTML == "" {
-		t.Fatal("add-chart size select missing from the dashboard")
-	}
-	values := regexp.MustCompile(`value="([^"]*)"`).FindAllStringSubmatch(selectHTML, -1)
+	cols := selectOptionValues(t, body, `id="add-chart-cols"`)
+	rows := selectOptionValues(t, body, `id="add-chart-rows"`)
+
 	spans := map[string]bool{}
-	for _, v := range values {
-		if v[1] == "" {
-			continue // the "default" option: empty size, not a span
-		}
-		spans[v[1]] = true
-		if _, ok := gridSize(v[1]); !ok {
-			t.Errorf("modal offers size %q, which the server rejects", v[1])
+	for _, c := range cols {
+		for _, h := range rows {
+			s := c + "x" + h
+			spans[s] = true
+			if _, ok := gridSize(s); !ok {
+				t.Errorf("modal combination %q is rejected by the server", s)
+			}
 		}
 	}
-	// The whole stepped 5-width × 3-height vocabulary must be offered, so a
+	// The whole stepped 5-width × 3-height vocabulary must be reachable, so a
 	// size the server accepts is never unreachable from the UI.
-	if len(spans) != 15 {
-		t.Errorf("modal offers %d spans (%v), want all 15 width×height sizes", len(spans), spans)
+	if len(spans) != len(validPanelSizes) {
+		t.Errorf("modal dropdowns reach %d distinct spans (%v), want all %d width×height sizes", len(spans), spans, len(validPanelSizes))
+	}
+	for s := range validPanelSizes {
+		if !spans[s] {
+			t.Errorf("server-valid size %q is unreachable from the modal dropdowns", s)
+		}
 	}
 }
 
-// The pin-slot size select is built client-side from dashboard.js's
-// PANEL_SIZES array — the primary size-editing surface. If it drifts from
-// the server's vocabulary, setPanelSize writes a size the layout PUT rejects
-// and persistDash retries forever. The served JS must carry exactly the
-// spans gridSize accepts.
+// selectOptionValues returns the value attributes of a rendered <select>'s
+// options, located by a marker inside its opening tag. Empty values (the
+// unset/placeholder option) are skipped.
+func selectOptionValues(t *testing.T, body, marker string) []string {
+	t.Helper()
+	w := markupWindow(body, marker, "</select>")
+	if w == "" {
+		t.Fatalf("select with %s missing from the dashboard", marker)
+	}
+	var vals []string
+	for _, m := range regexp.MustCompile(`value="([^"]*)"`).FindAllStringSubmatch(w, -1) {
+		if m[1] != "" {
+			vals = append(vals, m[1])
+		}
+	}
+	return vals
+}
+
+// The pin-slot size selects are built client-side from dashboard.js's
+// PANEL_COLS/PANEL_ROWS arrays — the primary size-editing surface. The two
+// axes' cross-product must be exactly the spans the server's size validation
+// accepts, or setPanelSize writes a size the layout PUT rejects and
+// persistDash retries forever. Both editing surfaces must combine the pair
+// into the canonical "WxH" span only when both axes are set.
 func TestClientPanelSizesMatchServerVocabulary(t *testing.T) {
 	r := newConfigRegistry(t, DefaultConfig())
 	js := staticAsset(t, r, "dashboard.js")
 
-	m := regexp.MustCompile(`PANEL_SIZES = \[([^\]]*)\]`).FindStringSubmatch(js)
-	if m == nil {
-		t.Fatal("PANEL_SIZES array missing from dashboard.js")
+	arr := func(name string) []string {
+		t.Helper()
+		m := regexp.MustCompile(regexp.QuoteMeta(name) + ` = \[([^\]]*)\]`).FindStringSubmatch(js)
+		if m == nil {
+			t.Fatalf("%s array missing from dashboard.js", name)
+		}
+		var vals []string
+		for _, s := range strings.Split(m[1], ",") {
+			if s = strings.Trim(strings.TrimSpace(s), "'"); s != "" {
+				vals = append(vals, s)
+			}
+		}
+		return vals
 	}
-	client := map[string]bool{}
-	for _, s := range strings.Split(m[1], ",") {
-		if s = strings.Trim(strings.TrimSpace(s), "'"); s != "" {
-			client[s] = true
+	cols, rows := arr("PANEL_COLS"), arr("PANEL_ROWS")
+
+	spans := map[string]bool{}
+	for _, c := range cols {
+		for _, h := range rows {
+			s := c + "x" + h
+			spans[s] = true
+			if !validPanelSizes[s] {
+				t.Errorf("dashboard.js combination %q is rejected by the server", s)
+			}
 		}
 	}
-	for s := range client {
-		if !validPanelSizes[s] {
-			t.Errorf("dashboard.js offers size %q, which the server rejects", s)
-		}
+	if len(spans) != len(validPanelSizes) {
+		t.Errorf("dashboard.js dropdowns reach %d distinct spans (%v), want all %d width×height sizes", len(spans), spans, len(validPanelSizes))
 	}
 	for s := range validPanelSizes {
-		if !client[s] {
-			t.Errorf("server size %q missing from dashboard.js PANEL_SIZES", s)
+		if !spans[s] {
+			t.Errorf("server size %q missing from dashboard.js PANEL_COLS×PANEL_ROWS", s)
+		}
+	}
+	// The pair becomes a span only when both axes are chosen (either left
+	// unset keeps the chart's default size): the add-chart modal selection
+	// and the pin-slot select both join with the literal "x".
+	for _, join := range []string{
+		"cs.value && rs.value) s = cs.value + 'x' + rs.value",      // add-chart modal
+		"cols.value && rows.value ? cols.value + 'x' + rows.value", // pin-slot select
+	} {
+		if !strings.Contains(js, join) {
+			t.Errorf("dashboard.js missing the WxH combination %q", join)
 		}
 	}
 }
@@ -1500,9 +1615,12 @@ func TestDashboardPresetSectionsRender(t *testing.T) {
 // The timeframe selectors are server-rendered: one dashboard-global select
 // (preset choices with custom last; the saved choice preselected, defaulting
 // to 1h), the datetime-local picker for the custom start, and a per-band
-// select with the band's override — or "global" — preselected. The client
-// bootstrap carries the band overrides so the page and the layout API cannot
-// diverge.
+// select whose empty option ("follow the global choice") is labeled with the
+// effective window (→ <global>) — the band's own override preselected when
+// set, the empty option otherwise. The client bootstrap carries the band
+// overrides so the page and the layout API cannot diverge, and
+// applyTimeframeUI keeps the follow-global label in sync with the global
+// choice.
 func TestDashboardTimeframeSelectorsRender(t *testing.T) {
 	t.Run("defaults", func(t *testing.T) {
 		r := newConfigRegistry(t, DefaultConfig())
@@ -1524,8 +1642,10 @@ func TestDashboardTimeframeSelectorsRender(t *testing.T) {
 		if !strings.Contains(body, `id="tf-start"`) {
 			t.Error("custom start picker missing")
 		}
-		if !strings.Contains(body, `<option value="" selected>global</option>`) {
-			t.Error("band selects do not default to global")
+		// The empty option's label echoes the window it follows (the default
+		// global is 1h), never the literal word "global".
+		if !strings.Contains(body, `<option value="" selected>→ 1h</option>`) {
+			t.Error("band selects do not default to the follow-global option labeled → 1h")
 		}
 	})
 	t.Run("saved choices preselect", func(t *testing.T) {
@@ -1545,14 +1665,193 @@ func TestDashboardTimeframeSelectorsRender(t *testing.T) {
 		if !strings.Contains(main, `<option value="5m" selected>`) {
 			t.Error("band override not preselected in its own select")
 		}
+		// The comparison reads the band's OWN override ($ is the band inside
+		// the sec template): the override is the only selected option, even
+		// though it differs from the global choice.
+		if n := strings.Count(main, " selected"); n != 1 {
+			t.Errorf("override band select carries %d selected options, want exactly 1", n)
+		}
+		if !strings.Contains(main, `<option value="">→ 4h</option>`) {
+			t.Error("override band's empty option missing the → 4h follow-global label")
+		}
 		spare := markupWindow(body, `data-section="spare"`, "</select>")
-		if !strings.Contains(spare, `<option value="" selected>`) {
-			t.Error("untouched band should keep global selected")
+		if !strings.Contains(spare, `<option value="" selected>→ 4h</option>`) {
+			t.Error("untouched band should keep the follow-global option (labeled → 4h) selected")
 		}
 		if !strings.Contains(body, `"timeframe":"5m"`) {
 			t.Error("client bootstrap missing the band override")
 		}
 	})
+	t.Run("client keeps the follow-global label in sync", func(t *testing.T) {
+		r := newConfigRegistry(t, DefaultConfig())
+		js := staticAsset(t, r, "dashboard.js")
+		// applyTimeframeUI relabels every band's empty option with the
+		// effective global value whenever the config document changes.
+		if !strings.Contains(js, "empty.textContent = '→ ' + g") {
+			t.Error("applyTimeframeUI does not relabel the band empty option with the global value")
+		}
+	})
+}
+
+// cssRule is one top-level stylesheet rule: its selector list, declaration
+// block, and byte offset (the cascade's source-order tiebreak).
+type cssRule struct {
+	sel  string
+	body string
+	pos  int
+}
+
+// parseCSSRules scans the top-level rules out of a stylesheet, dropping
+// comments and the contents of at-rules (@media blocks carry none of the
+// timeframe rules).
+func parseCSSRules(css string) []cssRule {
+	css = regexp.MustCompile(`(?s)/\*.*?\*/`).ReplaceAllString(css, " ")
+	var rules []cssRule
+	depth, selStart, bodyStart := 0, 0, 0
+	sel, atRule := "", false
+	for i := 0; i < len(css); i++ {
+		switch css[i] {
+		case '{':
+			if depth == 0 {
+				sel = strings.TrimSpace(css[selStart:i])
+				atRule = strings.HasPrefix(sel, "@")
+				bodyStart = i + 1
+			}
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				if !atRule {
+					rules = append(rules, cssRule{sel: sel, body: css[bodyStart:i], pos: selStart})
+				}
+				selStart = i + 1
+			}
+		}
+	}
+	return rules
+}
+
+// cssSpecificity ranks a selector by its (ids, classes, elements) weights.
+// Attribute selectors and pseudo-classes count at class level — enough to
+// order the simple class selectors the width competition involves.
+func cssSpecificity(sel string) (a, b, c int) {
+	a = strings.Count(sel, "#")
+	b = strings.Count(sel, ".") + strings.Count(sel, "[")
+	for i := 0; i < len(sel); i++ {
+		if sel[i] == ':' && (i == 0 || sel[i-1] != ':') && (i+1 >= len(sel) || sel[i+1] != ':') {
+			b++ // pseudo-class; the ::pseudo-element form stays element-level
+		}
+	}
+	rest := sel
+	for _, re := range []*regexp.Regexp{
+		regexp.MustCompile(`\.[\w-]+`),
+		regexp.MustCompile(`#[\w-]+`),
+		regexp.MustCompile(`\[[^\]]*\]`),
+		regexp.MustCompile(`::?[\w-]+`),
+	} {
+		rest = re.ReplaceAllString(rest, " ")
+	}
+	c = len(regexp.MustCompile(`[A-Za-z][\w-]*`).FindAllString(rest, -1))
+	return a, b, c
+}
+
+// cssWidth returns the value of the declaration block's width property.
+func cssWidth(body string) (string, bool) {
+	m := regexp.MustCompile(`(?:^|[;{])\s*width\s*:\s*([^;}]+)`).FindStringSubmatch(body)
+	if m == nil {
+		return "", false
+	}
+	return strings.TrimSpace(m[1]), true
+}
+
+// The topbar's global timeframe select and custom-start input carry both
+// .input (width: 100%, declared later in the stylesheet) and their tf- class.
+// If the tf- rule loses the cascade — bare .tf-select at 0,1,0 tying .input
+// and losing on source order, exactly the topbar-wrap regression — the
+// 100%-wide flex item takes a full row and wraps the topbar. The served
+// stylesheet must keep a width: auto declaration that outranks .input for
+// each of the two controls, whichever way the rules are ordered.
+func TestStylesheetTimeframeWidthWinsOverInput(t *testing.T) {
+	r := newConfigRegistry(t, DefaultConfig())
+	rules := parseCSSRules(staticAsset(t, r, "styles.css"))
+
+	type widthDecl struct {
+		val, sel string
+		a, b, c  int
+		pos      int
+	}
+	beats := func(d, e widthDecl) bool {
+		if d.a != e.a {
+			return d.a > e.a
+		}
+		if d.b != e.b {
+			return d.b > e.b
+		}
+		if d.c != e.c {
+			return d.c > e.c
+		}
+		return d.pos > e.pos
+	}
+	var decls []widthDecl
+	for _, r := range rules {
+		w, ok := cssWidth(r.body)
+		if !ok {
+			continue
+		}
+		for _, piece := range strings.Split(r.sel, ",") {
+			piece = strings.TrimSpace(piece)
+			a, b, c := cssSpecificity(piece)
+			decls = append(decls, widthDecl{val: w, sel: piece, a: a, b: b, c: c, pos: r.pos})
+		}
+	}
+	// The cascade winner among the declarations whose selector matches:
+	// highest specificity, ties broken by source order.
+	winner := func(match func(string) bool) (string, bool) {
+		var best widthDecl
+		found := false
+		for _, d := range decls {
+			if !match(d.sel) {
+				continue
+			}
+			if !found || beats(d, best) {
+				best, found = d, true
+			}
+		}
+		return best.sel + " { width: " + best.val + " }", found
+	}
+
+	// Premise: the shared input utility both topbar controls carry declares
+	// width: 100% — losing this fight is what wrapped the topbar.
+	w, ok := winner(func(sel string) bool { return sel == ".input" })
+	if !ok {
+		t.Fatalf("no .input width declaration found; the regression premise changed")
+	}
+	if !strings.Contains(w, "width: 100%") {
+		t.Fatalf(".input width declaration = %s, want 100%%; the regression premise changed", w)
+	}
+
+	// The tf- rule must win on each control it shares with .input: matching
+	// selectors plus the .input rule itself (it applies to the element).
+	for cls, control := range map[string]string{
+		"tf-select": "global timeframe select",
+		"tf-start":  "custom start input",
+	} {
+		w, ok := winner(func(sel string) bool {
+			return sel == ".input" || strings.Contains(sel, "."+cls)
+		})
+		if !ok {
+			t.Fatalf("%s: no width declarations found", control)
+		}
+		if !strings.Contains(w, "width: auto") {
+			t.Errorf("%s: width cascade winner is %s, want the tf rule's auto — width: 100%% wraps the topbar onto its own row", control, w)
+		}
+	}
+
+	// The per-band override select never carries .input; its own rule keeps
+	// the narrow width too.
+	if w, ok := winner(func(sel string) bool { return strings.Contains(sel, ".sec-tf") }); !ok || !strings.Contains(w, "width: auto") {
+		t.Errorf("sec-tf width cascade winner is %q (found=%v), want auto", w, ok)
+	}
 }
 
 // View mode is frozen: every edit affordance carries .edit-only and the CSS
