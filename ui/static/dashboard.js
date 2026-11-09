@@ -132,12 +132,18 @@ function historyQS(tf) {
 }
 
 // applyTimeframeUI syncs the selector controls with the config document.
+// Each band's empty ("follow global") option is labeled with the effective
+// global reference, so the header reads "→ 1h" rather than the word "global".
 function applyTimeframeUI() {
+  var g = dashCfg.timeframe || TF_DEFAULT;
   var sel = document.getElementById('tf-global');
-  if (sel) sel.value = dashCfg.timeframe || TF_DEFAULT;
+  if (sel) sel.value = g;
   document.querySelectorAll('[data-section]').forEach(function (sec) {
     var s = sec.querySelector('.sec-tf');
-    if (s) s.value = tfForSection(sec.getAttribute('data-section'));
+    if (!s) return;
+    s.value = tfForSection(sec.getAttribute('data-section'));
+    var empty = s.querySelector('option[value=""]');
+    if (empty) empty.textContent = '→ ' + g;
   });
   var picker = document.getElementById('tf-start');
   if (picker) {
@@ -305,13 +311,16 @@ function loadDash() {
 }
 
 // The add-chart modal's current chart-type/size selection, applied to the
-// panel being added (empty = server defaults).
+// panel being added (empty = server defaults). Size is a paired width×height
+// pick: both axes set combine into the canonical "WxH" span, either left
+// unset stays the default span.
 function addChartSelection() {
   var t = '', s = '';
   var ts = document.getElementById('add-chart-type');
-  var ss = document.getElementById('add-chart-size');
+  var cs = document.getElementById('add-chart-cols');
+  var rs = document.getElementById('add-chart-rows');
   if (ts) t = ts.value;
-  if (ss) s = ss.value;
+  if (cs && rs && cs.value && rs.value) s = cs.value + 'x' + rs.value;
   return { chartType: t, size: s };
 }
 
@@ -549,12 +558,23 @@ function cssEsc(s) { return (window.CSS && CSS.escape) ? CSS.escape(s) : s.repla
 // validateDashboardSections); pin() refuses metrics with these names.
 var RESERVED_BLOCK_IDS = ['runtime-health', 'histogram', 'hooks', 'all-metrics', 'endpoint-latency', 'internals'];
 
-// PANEL_SIZES is the stepped width×height chart-grid vocabulary (width of 12
-// columns, height in 4rem row units) — the same set the server's size
-// validation and the add-chart modal's options accept. A size renders as the
-// card-<cols>x<rows> span class; anything else (legacy sm/md/lg, unknown)
-// falls back to the default 4×4 cell.
-var PANEL_SIZES = ['4x2', '6x2', '8x2', '10x2', '12x2', '4x4', '6x4', '8x4', '10x4', '12x4', '4x6', '6x6', '8x6', '10x6', '12x6'];
+// PANEL_COLS/PANEL_ROWS are the two axes of the stepped width×height
+// chart-grid vocabulary (width of 12 columns, height in 4rem row units) —
+// the same set the server's size validation and the add-chart modal's paired
+// dropdowns accept. A size renders as the card-<cols>x<rows> span class;
+// anything else (legacy sm/md/lg, unknown) falls back to the default 4×4
+// cell.
+var PANEL_COLS = ['4', '6', '8', '10', '12'];
+var PANEL_ROWS = ['2', '4', '6'];
+
+// validPanelSize reports whether s is a canonical "WxH" span with both axes
+// in the vocabulary.
+function validPanelSize(s) {
+  if (!s) return false;
+  var i = s.indexOf('x');
+  if (i < 0) return false;
+  return PANEL_COLS.indexOf(s.slice(0, i)) >= 0 && PANEL_ROWS.indexOf(s.slice(i + 1)) >= 0;
+}
 
 // placementCount counts a panel id's placements across all bands.
 function placementCount(id) {
@@ -626,15 +646,25 @@ function makeSlot(p) {
     '<div class="pin-actions edit-only">' +
     '<button type="button" class="pin-btn" title="move earlier" aria-label="Move ' + label + ' earlier" onclick="moveSectionItem(this,-1)">&larr;</button>' +
     '<button type="button" class="pin-btn" title="move later" aria-label="Move ' + label + ' later" onclick="moveSectionItem(this,1)">&rarr;</button>' +
-    '<select class="pin-size" title="panel size" aria-label="Panel size" onchange="setPanelSize(this)">' +
-    '<option value="">default</option>' +
-    PANEL_SIZES.map(function (s) { return '<option value="' + s + '">' + s.replace('x', '×') + '</option>'; }).join('') +
+    '<select class="pin-size pin-cols" title="panel width: chart-grid columns" aria-label="Panel width" onchange="setPanelSize(this)">' +
+    '<option value="">w</option>' +
+    PANEL_COLS.map(function (c) { return '<option value="' + c + '">' + c + '</option>'; }).join('') +
+    '</select>' +
+    '<span class="pin-size-x" aria-hidden="true">×</span>' +
+    '<select class="pin-size pin-rows" title="panel height: 4rem grid rows" aria-label="Panel height" onchange="setPanelSize(this)">' +
+    '<option value="">h</option>' +
+    PANEL_ROWS.map(function (r) { return '<option value="' + r + '">' + r + '</option>'; }).join('') +
     '</select>' +
     '<button type="button" class="pin-remove" title="remove" aria-label="Remove ' + label + '" onclick="unpinSlot(this)">&times;</button>' +
     '</div>' +
     '<div class="pin-body"></div>';
-  var sel = slot.querySelector('.pin-size');
-  if (sel) sel.value = p.size || '';
+  if (validPanelSize(p.size)) {
+    var i = p.size.indexOf('x');
+    var cols = slot.querySelector('.pin-cols');
+    var rows = slot.querySelector('.pin-rows');
+    if (cols) cols.value = p.size.slice(0, i);
+    if (rows) rows.value = p.size.slice(i + 1);
+  }
   return slot;
 }
 
@@ -844,9 +874,12 @@ function moveSectionItem(btn, dir) {
   // A panel copy cannot move into a band that already shows the same panel
   // (the PUT validator rejects the duplicate and a rejected PUT retries
   // forever): the ←/→ buttons refuse the move the same way the drag does.
+  // The guard is the destination band's OWN slots (:scope >), never its
+  // nested child bands' — a panel may repeat once per band, so a chart shown
+  // in a nested child can still move into the parent.
   if (to >= 0 && el.classList.contains('pin-slot') &&
       items[to].closest('[data-section]') !== el.closest('[data-section]')) {
-    var dup = items[to].closest('.sec-body').querySelector('.pin-slot[data-pin-id="' + cssEsc(el.getAttribute('data-pin-id')) + '"]');
+    var dup = items[to].closest('.sec-body').querySelector(':scope > .pin-slot[data-pin-id="' + cssEsc(el.getAttribute('data-pin-id')) + '"]');
     if (dup) return;
   }
   moveCard(items, from, to, persistSectionsFromDOM);
@@ -865,9 +898,14 @@ function renameSection(input) {
 function setPanelSize(sel) {
   var slot = sel.closest('.pin-slot');
   if (!slot) return;
+  var cols = slot.querySelector('.pin-cols');
+  var rows = slot.querySelector('.pin-rows');
+  // The pair only forms a span when both axes are chosen; anything else
+  // keeps the chart's default size.
+  var size = cols && rows && cols.value && rows.value ? cols.value + 'x' + rows.value : '';
   var metric = slot.getAttribute('data-pin');
   for (var i = 0; i < dashCfg.panels.length; i++) {
-    if (dashCfg.panels[i].metric === metric) dashCfg.panels[i].size = sel.value || undefined;
+    if (dashCfg.panels[i].metric === metric) dashCfg.panels[i].size = size || undefined;
   }
   // Copies share the panel's config: restyle every placement of this metric
   // now instead of waiting for the next render pass.
@@ -960,9 +998,11 @@ function initSectionsDnD() {
     // Structural guard, mirroring the band one: a panel copy cannot land in
     // a band that already shows the same panel — two identical cards in one
     // band carry no information, and persisting one would 400 every layout
-    // PUT and retry forever. No preventDefault = no drop indication, no move.
+    // PUT and retry forever. The guard is the target band's OWN slots
+    // (:scope >), never its nested child bands' — a panel may repeat once
+    // per band. No preventDefault = no drop indication, no move.
     if (dragSectionItem.classList.contains('pin-slot')) {
-      var dup = body.querySelector('.pin-slot[data-pin-id="' + cssEsc(dragSectionItem.getAttribute('data-pin-id')) + '"]');
+      var dup = body.querySelector(':scope > .pin-slot[data-pin-id="' + cssEsc(dragSectionItem.getAttribute('data-pin-id')) + '"]');
       if (dup && dup !== dragSectionItem) return;
     }
     e.preventDefault();
@@ -1016,7 +1056,7 @@ function initSectionsUI() {
 function pinSizeClass(name) {
   for (var i = 0; i < dashCfg.panels.length; i++) {
     var p = dashCfg.panels[i];
-    if (p.metric === name && PANEL_SIZES.indexOf(p.size) >= 0) return 'card-' + p.size;
+    if (p.metric === name && validPanelSize(p.size)) return 'card-' + p.size;
   }
   return '';
 }

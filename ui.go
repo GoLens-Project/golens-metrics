@@ -785,21 +785,12 @@ func buildCards(snaps []MetricSnapshot) []metricCard {
 // buildCardsOpts builds the All Metrics grid, honoring the persisted
 // dashboard customization (HTTP card view, per-panel chart/size overrides).
 func buildCardsOpts(snaps []MetricSnapshot, o cardOptions) []metricCard {
-	// Filter out individual metrics that are shown in Runtime Health charts and hooks
-	excludedMetrics := map[string]bool{
-		"go_memstats_alloc_bytes":      true,
-		"go_memstats_sys_bytes":        true,
-		"go_memstats_heap_inuse_bytes": true,
-		"go_memstats_heap_objects":     true,
-		"cpu_usage_percent":            true,
-		"go_goroutines":                true,
-	}
-
 	cards := make([]metricCard, 0, len(snaps))
 	for _, s := range snaps {
 		// Skip HTTP metrics (they'll be grouped into a single card),
-		// excluded runtime metrics, and hook metrics (hooks section).
-		if isHTTPMetric(s.Name) || excludedMetrics[s.Name] || isHookMetric(s.Name) {
+		// the runtime-health gauges (runtime-health block), and hook
+		// metrics (hooks section).
+		if isHTTPMetric(s.Name) || isRuntimeMetric(s.Name) || isHookMetric(s.Name) {
 			continue
 		}
 		c := metricCard{Snapshot: s}
@@ -873,6 +864,14 @@ func buildHTTPCardView(snaps []MetricSnapshot, view string) []metricCard {
 	for i, class := range httpStatusClasses {
 		classes[i] = byName["http_requests_total_"+class]
 		classSum += classes[i]
+	}
+
+	// Without per-class data the breakdown view would render five zero
+	// columns under a parent-only total — absence styled as a populated
+	// breakdown. Collapse to the totals view until the class counters
+	// record requests.
+	if view != httpViewTotals && classSum == 0 {
+		view = httpViewTotals
 	}
 
 	var sumErrors, sumOther float64
@@ -1155,10 +1154,16 @@ const dashboardSrc = `<!DOCTYPE html>
   <div class="sec-head" role="button" tabindex="0" aria-label="Toggle section">
     <span class="sec-rule sec-rule-lead"></span>
     <span class="sec-name">{{.Name}}</span>
-    <!-- Band timeframe override: empty = follow the dashboard-global choice. -->
+    <!-- Band timeframe override: empty = follow the dashboard-global choice,
+         so the empty option's label echoes that value ("custom" when the
+         global choice is custom; the client keeps it in sync — see
+         applyTimeframeUI). Inside this template $ is the band node — the
+         "sec" invocation rebinds it to its argument, so the band's own
+         override is both .Timeframe and $.Timeframe; the dashboard-global
+         value lives at $.Data.Timeframe. -->
     <select class="sec-tf" title="Section timeframe" aria-label="Timeframe for {{.Name}}" onchange="setSectionTimeframe(this)">
-      <option value=""{{if not .Timeframe}} selected{{end}}>global</option>
-      {{range $tf := $.Data.Timeframes}}<option value="{{$tf}}"{{if eq $tf $.Timeframe}} selected{{end}}>{{$tf}}</option>{{end}}
+      {{$secTf := .Timeframe}}<option value=""{{if not $secTf}} selected{{end}}>→ {{if $.Data.Timeframe}}{{$.Data.Timeframe}}{{else}}1h{{end}}</option>
+      {{range $tf := $.Data.Timeframes}}<option value="{{$tf}}"{{if eq $tf $secTf}} selected{{end}}>{{$tf}}</option>{{end}}
     </select>
     <span class="sec-rule"></span>
     <svg class="sec-chev" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><path fill-rule="evenodd" d="M14.77 12.79a.75.75 0 01-1.06-.02L10 8.832 6.29 12.77a.75.75 0 11-1.08-1.04l4.25-4.5a.75.75 0 011.08 0l4.25 4.5a.75.75 0 01.02 1.06z" clip-rule="evenodd"/></svg>
@@ -1215,26 +1220,28 @@ const dashboardSrc = `<!DOCTYPE html>
           <option value="big-number">big number</option>
         </select>
       </div>
-      <div class="field field-narrow">
-        <label class="field-label" for="add-chart-size">Size</label>
-        <select id="add-chart-size" class="input" title="width×height chart-grid span (12 columns; 4rem rows)">
-          <option value="">default</option>
-          <option value="4x2">4×2</option>
-          <option value="6x2">6×2</option>
-          <option value="8x2">8×2</option>
-          <option value="10x2">10×2</option>
-          <option value="12x2">12×2</option>
-          <option value="4x4">4×4</option>
-          <option value="6x4">6×4</option>
-          <option value="8x4">8×4</option>
-          <option value="10x4">10×4</option>
-          <option value="12x4">12×4</option>
-          <option value="4x6">4×6</option>
-          <option value="6x6">6×6</option>
-          <option value="8x6">8×6</option>
-          <option value="10x6">10×6</option>
-          <option value="12x6">12×6</option>
-        </select>
+      <div class="field">
+        <label class="field-label" for="add-chart-cols">Size</label>
+        <!-- Paired width×height dropdowns: each axis picks independently,
+             both set = a canonical "WxH" span (12-column grid, 4rem rows);
+             either left unset = the chart's default span. -->
+        <div class="row-tight">
+          <select id="add-chart-cols" class="input" title="chart width: columns of the 12-column grid" aria-label="Chart width">
+            <option value="">w</option>
+            <option value="4">4</option>
+            <option value="6">6</option>
+            <option value="8">8</option>
+            <option value="10">10</option>
+            <option value="12">12</option>
+          </select>
+          <span class="pin-size-x" aria-hidden="true">×</span>
+          <select id="add-chart-rows" class="input" title="chart height: 4rem grid rows" aria-label="Chart height">
+            <option value="">h</option>
+            <option value="2">2</option>
+            <option value="4">4</option>
+            <option value="6">6</option>
+          </select>
+        </div>
       </div>
     </div>
     <div class="modal-list">

@@ -16,16 +16,41 @@ const (
 	MetricCPUUsagePercent = "cpu_usage_percent"
 )
 
+// runtimeMetricDefs is the single source of truth for the process's own
+// runtime-health gauges: startRuntimeMetrics registers each into the user
+// registry (the history pipeline and /metrics/data serve them from there),
+// and the dashboard card builder excludes the same list, so a gauge added
+// here can never leak into the All Metrics grid.
+var runtimeMetricDefs = []struct {
+	name, description string
+	min, max          float64
+}{
+	{MetricGoAllocBytes, "currently allocated heap bytes", 0, 0},
+	{MetricGoSysBytes, "bytes obtained from the OS", 0, 0},
+	{MetricGoHeapInuse, "bytes in active heap spans", 0, 0},
+	{MetricGoHeapObjects, "total number of allocated objects", 0, 0},
+	{MetricGoGoroutines, "application goroutines (excludes runtime)", 0, 0},
+	{MetricCPUUsagePercent, "process CPU usage percentage", 0, 100},
+}
+
+// isRuntimeMetric reports whether name is one of the process's own
+// runtime-health gauges (see runtimeMetricDefs).
+func isRuntimeMetric(name string) bool {
+	for _, m := range runtimeMetricDefs {
+		if m.name == name {
+			return true
+		}
+	}
+	return false
+}
+
 // startRuntimeMetrics launches a background goroutine that periodically
 // collects Go runtime stats and records them as gauge metrics.
 // The goroutine exits when ctx is cancelled.
 func startRuntimeMetrics(ctx context.Context, r *Registry, interval time.Duration) {
-	r.Register(MetricGoAllocBytes, GaugeType, "currently allocated heap bytes", nil, nil, 0, 0)
-	r.Register(MetricGoSysBytes, GaugeType, "bytes obtained from the OS", nil, nil, 0, 0)
-	r.Register(MetricGoHeapInuse, GaugeType, "bytes in active heap spans", nil, nil, 0, 0)
-	r.Register(MetricGoHeapObjects, GaugeType, "total number of allocated objects", nil, nil, 0, 0)
-	r.Register(MetricGoGoroutines, GaugeType, "application goroutines (excludes runtime)", nil, nil, 0, 0)
-	r.Register(MetricCPUUsagePercent, GaugeType, "process CPU usage percentage", nil, nil, 0, 100)
+	for _, m := range runtimeMetricDefs {
+		r.Register(m.name, GaugeType, m.description, nil, nil, m.min, m.max)
+	}
 
 	go func() {
 		ticker := time.NewTicker(interval)
